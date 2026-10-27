@@ -6,6 +6,13 @@
 //! It loads the modules the initramfs lists, mounts the root filesystem and the workspace,
 //! switches into the root filesystem, connects to the supervisor over vsock, runs the one
 //! command it is sent while streaming its output back, and reboots, which ends the VM.
+//!
+//! It has its own C `main` rather than Rust's: at startup, Rust's runtime replaces closed
+//! standard descriptors with `/dev/null` and aborts if it cannot, and when init starts neither
+//! `/dev/null` nor, yet, the console exists. The guest's console port appears only once the host
+//! announces it, so init waits for it itself.
+
+#![no_main]
 
 use std::ffi::CString;
 use std::fs::{self, File};
@@ -34,21 +41,65 @@ const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/s
 
 mod workspace;
 
-fn main() {
-    if let Err(e) = run() {
-        eprintln!("peerspan-guest-init: {e}");
+/// How long init waits for the console before running without one.
+const CONSOLE_WAIT: Duration = Duration::from_secs(5);
+
+#[unsafe(no_mangle)]
+extern "C" fn main(_argc: libc::c_int, _argv: *const *const libc::c_char) -> libc::c_int {
+    let result = std::panic::catch_unwind(|| {
+        attach_console();
+        run()
+    });
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("peerspan-guest-init: {e}"),
+        Err(_) => eprintln!("peerspan-guest-init: panicked"),
     }
     // SAFETY: sync takes no arguments and cannot fail.
     unsafe { libc::sync() };
     // PID 1 must not exit, or the kernel panics; rebooting ends the VM instead.
     // SAFETY: reboot with a valid command constant only affects the guest kernel.
     unsafe { libc::reboot(libc::RB_AUTOBOOT) };
+    0
+}
+
+/// Mounts `/dev` and points descriptors 0 to 2 at the console, or at `/dev/null` if the
+/// console does not appear in time.
+fn attach_console() {
+    let _ = mount("devtmpfs", "/dev", "devtmpfs", 0);
+    let deadline = std::time::Instant::now() + CONSOLE_WAIT;
+    let fd = loop {
+        // SAFETY: the path is a valid NUL-terminated string.
+        let fd = unsafe { libc::open(c"/dev/console".as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+        if fd >= 0 || std::time::Instant::now() >= deadline {
+            break fd;
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    let fd = if fd >= 0 {
+        fd
+    } else {
+        // SAFETY: as above.
+        unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) }
+    };
+    if fd < 0 {
+        return;
+    }
+    for target in 0..=2 {
+        if fd != target {
+            // SAFETY: dup2 on descriptors this process owns.
+            unsafe { libc::dup2(fd, target) };
+        }
+    }
+    if fd > 2 {
+        // SAFETY: fd is ours and no longer needed.
+        unsafe { libc::close(fd) };
+    }
 }
 
 fn run() -> io::Result<()> {
     mount("proc", "/proc", "proc", 0)?;
     mount("sysfs", "/sys", "sysfs", 0)?;
-    mount("devtmpfs", "/dev", "devtmpfs", 0)?;
     load_modules()?;
 
     mount(ROOTFS_TAG, NEW_ROOT, "virtiofs", libc::MS_RDONLY)?;
