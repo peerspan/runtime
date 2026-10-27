@@ -11,8 +11,11 @@
 //! standard descriptors with `/dev/null` and aborts if it cannot, and when init starts neither
 //! `/dev/null` nor, yet, the console exists. The guest's console port appears only once the host
 //! announces it, so init waits for it itself.
+//!
+//! Init refuses to run unless it is PID 1: it ends by rebooting, and on a host, as root, that
+//! reboots the host. Tests use the harness's own `main` for the same reason.
 
-#![no_main]
+#![cfg_attr(not(test), no_main)]
 
 use std::ffi::CString;
 use std::fs::{self, File};
@@ -44,8 +47,13 @@ mod workspace;
 /// How long init waits for the console before running without one.
 const CONSOLE_WAIT: Duration = Duration::from_secs(5);
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(test), unsafe(no_mangle))]
 extern "C" fn main(_argc: libc::c_int, _argv: *const *const libc::c_char) -> libc::c_int {
+    // SAFETY: getpid takes no arguments and cannot fail.
+    if unsafe { libc::getpid() } != 1 {
+        eprintln!("peerspan-guest-init: not PID 1; it runs only as a VM's init");
+        return 1;
+    }
     let result = std::panic::catch_unwind(|| {
         attach_console();
         run()
@@ -58,7 +66,7 @@ extern "C" fn main(_argc: libc::c_int, _argv: *const *const libc::c_char) -> lib
     // SAFETY: sync takes no arguments and cannot fail.
     unsafe { libc::sync() };
     // PID 1 must not exit, or the kernel panics; rebooting ends the VM instead.
-    // SAFETY: reboot with a valid command constant only affects the guest kernel.
+    // SAFETY: reboot with a valid command constant; we are PID 1 in the VM, checked above.
     unsafe { libc::reboot(libc::RB_AUTOBOOT) };
     0
 }
