@@ -162,8 +162,10 @@ wait "$run_pid" || fail "confinement: the run failed"
 
 # Network levels (decision 5). Targets: a public address; the metadata address; the host's own
 # addresses (public, Docker's bridge if any, and a veth); a private peer that is not the host
-# (a network namespace behind that veth); the gateway address and host loopback. TCP probes
-# connect; UDP probes send one datagram that the host side counts.
+# (a network namespace behind that veth); the gateway address and host loopback. In IPv6, which
+# neither this host nor CI may have, the peer stands in for a public address too, with one from
+# the documentation prefix. TCP probes connect; UDP probes send one datagram that the host side
+# counts.
 pub=$(hostname -I | awk '{print $1}')
 docker=$(ip -4 -o addr show docker0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
 ns=pscheck$$
@@ -172,10 +174,17 @@ ip link add "${ns}a" type veth peer name "${ns}b"
 ip link set "${ns}b" netns "$ns"
 ip addr add 10.203.0.1/24 dev "${ns}a" && ip link set "${ns}a" up
 ip -n "$ns" addr add 10.203.0.2/24 dev "${ns}b" && ip -n "$ns" link set "${ns}b" up
+for net in fd20:3 2001:db8:203; do
+  ip addr add "$net::1/64" dev "${ns}a" nodad
+  ip -n "$ns" addr add "$net::2/64" dev "${ns}b" nodad
+done
 listen='import socket, sys, time
 kind, host, port, log = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM if kind == "udp" else socket.SOCK_STREAM)
+family = socket.AF_INET6 if ":" in host else socket.AF_INET
+s = socket.socket(family, socket.SOCK_DGRAM if kind == "udp" else socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+if family == socket.AF_INET6:
+    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
 s.bind((host, port))
 if kind == "tcp":
     s.listen(16)
@@ -184,18 +193,24 @@ while True:
     s.recv(64)
     open(log, "a").write("hit\n")'
 python3 -c "$listen" tcp 0.0.0.0 47011 - & listeners=$!
+python3 -c "$listen" tcp :: 47011 - & listeners="$listeners $!"
 python3 -c "$listen" tcp 127.0.0.1 47013 - & listeners="$listeners $!"
+python3 -c "$listen" tcp ::1 47013 - & listeners="$listeners $!"
 python3 -c "$listen" udp 0.0.0.0 47014 "$work/udp-host" & listeners="$listeners $!"
 ip netns exec "$ns" python3 -c "$listen" tcp 10.203.0.2 47012 - & listeners="$listeners $!"
 ip netns exec "$ns" python3 -c "$listen" udp 10.203.0.2 47015 "$work/udp-peer" & listeners="$listeners $!"
+ip netns exec "$ns" python3 -c "$listen" tcp fd20:3::2 47012 - & listeners="$listeners $!"
+ip netns exec "$ns" python3 -c "$listen" tcp 2001:db8:203::2 47016 - & listeners="$listeners $!"
 trap 'kill $listeners 2>/dev/null; ip netns del "$ns"; ip link del "${ns}a" 2>/dev/null; rm -rf "$work"' EXIT
 sleep 0.5
 targets="1.1.1.1:80 169.254.169.254:80 $pub:47011 ${docker:+$docker:47011} 10.203.0.1:47011"
 targets="$targets 10.203.0.2:47012 10.0.2.2:47013 127.0.0.1:47013"
+targets="$targets 2001:db8:203::2:47016 fd20:3::2:47012 2001:db8:203::1:47011 fd20:3::1:47011"
+targets="$targets ::1:47013"
 probe='for t in '$targets'; do
-  nc -w 3 ${t%:*} ${t#*:} </dev/null 2>/dev/null && echo "$t open" || echo "$t refused"
+  nc -w 3 ${t%:*} ${t##*:} </dev/null 2>/dev/null && echo "$t open" || echo "$t refused"
 done
-for t in '$pub':47014 10.203.0.2:47015; do echo hit | nc -u -w 1 ${t%:*} ${t#*:} 2>/dev/null; done
+for t in '$pub':47014 10.203.0.2:47015; do echo hit | nc -u -w 1 ${t%:*} ${t##*:} 2>/dev/null; done
 nslookup example.com >/dev/null 2>&1 && echo "dns open" || echo "dns refused"
 echo "interfaces $(ls /sys/class/net | tr "\n" " ")"'
 # expect LEVEL REACHABLE...: what a guest at LEVEL reaches, everything else refused.
@@ -230,8 +245,8 @@ expect_network() {
   [ -z "$problems" ] && pass "network-$level" || fail "network-$level:$problems"
 }
 expect_network none
-expect_network internet 1.1.1.1:80
-expect_network internet+lan 1.1.1.1:80 10.203.0.2:47012
+expect_network internet 1.1.1.1:80 2001:db8:203::2:47016
+expect_network internet+lan 1.1.1.1:80 10.203.0.2:47012 2001:db8:203::2:47016 fd20:3::2:47012
 
 # Fail closed: a process in the runtime's cgroups with no run chain reaches nothing.
 probe_cg=/sys/fs/cgroup/peerspan-runtime/fail-closed-$$

@@ -31,6 +31,13 @@ pub const GUEST_ADDRESS: [u8; 4] = [10, 0, 2, 15];
 pub const GUEST_PREFIX: u8 = 24;
 pub const GUEST_GATEWAY: [u8; 4] = [10, 0, 2, 2];
 pub const GUEST_DNS: [u8; 4] = [10, 0, 2, 3];
+/// The guest's IPv6 address: unique local, so programs prefer IPv4 for names that have both,
+/// and reach IPv6-only names through the host when it has IPv6. The host translates it, so it
+/// never appears outside the VM.
+pub const GUEST_ADDRESS6: [u16; 8] = [0xfd50, 0x5053, 0, 0, 0, 0, 0, 0x15];
+pub const GUEST_PREFIX6: u8 = 64;
+/// The host's link-local address on the guest's link, the IPv6 default gateway.
+pub const GUEST_GATEWAY6: [u16; 8] = [0xfe80, 0, 0, 0, 0, 0, 0, 1];
 
 /// Largest payload a reader accepts, so a corrupt frame cannot force a huge allocation.
 pub const MAX_PAYLOAD: usize = 16 << 20;

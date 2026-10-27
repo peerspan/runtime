@@ -8,14 +8,21 @@
 use std::fs;
 use std::io;
 use std::mem;
+use std::net::Ipv6Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use peerspan_runtime_protocol::{GUEST_ADDRESS, GUEST_DNS, GUEST_GATEWAY, GUEST_PREFIX};
+use peerspan_runtime_protocol::{
+    GUEST_ADDRESS, GUEST_ADDRESS6, GUEST_DNS, GUEST_GATEWAY, GUEST_GATEWAY6, GUEST_PREFIX,
+    GUEST_PREFIX6,
+};
 
 /// The read-only root filesystem keeps an empty file here for init to bind over.
 const RESOLV_CONF: &str = "/etc/resolv.conf";
 /// Written on the guest's `/run` tmpfs, then bound over [`RESOLV_CONF`].
 const RESOLV_CONF_SOURCE: &str = "/run/resolv.conf";
+/// Off before the address is added, so it is usable at once rather than after duplicate
+/// address detection, which nothing else on the guest's link could fail.
+const ACCEPT_DAD: &str = "/proc/sys/net/ipv6/conf/eth0/accept_dad";
 
 /// `struct rtentry` from `<net/route.h>`, which the libc crate defines only for some targets.
 #[repr(C)]
@@ -37,14 +44,38 @@ struct RtEntry {
     irtt: libc::c_ushort,
 }
 
+/// `struct in6_ifreq` from `<linux/ipv6.h>`, for setting an interface's IPv6 address.
+#[repr(C)]
+struct In6Ifreq {
+    addr: libc::in6_addr,
+    prefix_len: u32,
+    ifindex: libc::c_int,
+}
+
+/// `struct in6_rtmsg` from `<linux/ipv6_route.h>`, for adding an IPv6 route.
+#[repr(C)]
+struct In6Rtmsg {
+    dst: libc::in6_addr,
+    src: libc::in6_addr,
+    gateway: libc::in6_addr,
+    kind: u32,
+    dst_len: u16,
+    src_len: u16,
+    metric: u32,
+    info: libc::c_ulong,
+    flags: u32,
+    ifindex: libc::c_int,
+}
+
 /// Brings up loopback, which the kernel leaves down.
 pub fn loopback_up() -> io::Result<()> {
     let socket = control_socket()?;
     set_up(&socket, "lo")
 }
 
-/// Configures `eth0`, the default route through the host, and the DNS server.
+/// Configures `eth0`, the default routes through the host, and the DNS server.
 pub fn configure() -> io::Result<()> {
+    fs::write(ACCEPT_DAD, "0")?;
     let socket = control_socket()?;
     let netmask = u32::MAX
         .checked_shl(32 - u32::from(GUEST_PREFIX))
@@ -69,14 +100,64 @@ pub fn configure() -> io::Result<()> {
         return Err(context("adding the default route"));
     }
 
+    configure_ipv6()?;
+
     let [a, b, c, d] = GUEST_DNS;
     fs::write(RESOLV_CONF_SOURCE, format!("nameserver {a}.{b}.{c}.{d}\n"))?;
     crate::mount(RESOLV_CONF_SOURCE, RESOLV_CONF, "", libc::MS_BIND)
 }
 
+/// Adds `eth0`'s IPv6 address and the IPv6 default route, through the host's link-local
+/// address on `eth0`.
+fn configure_ipv6() -> io::Result<()> {
+    let socket = socket(libc::AF_INET6)?;
+    let index = interface_ioctl(&socket, "eth0", libc::SIOCGIFINDEX, |_| {})?;
+    // SAFETY: SIOCGIFINDEX filled in the index member.
+    let ifindex = unsafe { index.ifr_ifru.ifru_ifindex };
+
+    let mut address = In6Ifreq {
+        addr: inet6(GUEST_ADDRESS6),
+        prefix_len: u32::from(GUEST_PREFIX6),
+        ifindex,
+    };
+    // SAFETY: SIOCSIFADDR on an IPv6 socket reads one in6_ifreq, which `address` is.
+    if unsafe {
+        libc::ioctl(
+            socket.as_raw_fd(),
+            request(libc::SIOCSIFADDR),
+            &raw mut address,
+        )
+    } != 0
+    {
+        return Err(context("adding eth0's IPv6 address"));
+    }
+
+    let mut route = In6Rtmsg {
+        dst: inet6([0; 8]),
+        src: inet6([0; 8]),
+        gateway: inet6(GUEST_GATEWAY6),
+        kind: 0,
+        dst_len: 0,
+        src_len: 0,
+        metric: 1,
+        info: 0,
+        flags: u32::from(libc::RTF_UP | libc::RTF_GATEWAY),
+        ifindex,
+    };
+    // SAFETY: SIOCADDRT on an IPv6 socket reads one in6_rtmsg, which `route` is.
+    if unsafe { libc::ioctl(socket.as_raw_fd(), request(libc::SIOCADDRT), &raw mut route) } != 0 {
+        return Err(context("adding the IPv6 default route"));
+    }
+    Ok(())
+}
+
 fn control_socket() -> io::Result<OwnedFd> {
+    socket(libc::AF_INET)
+}
+
+fn socket(family: libc::c_int) -> io::Result<OwnedFd> {
     // SAFETY: socket has no memory preconditions.
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    let fd = unsafe { libc::socket(family, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(context("opening a control socket"));
     }
@@ -128,6 +209,12 @@ fn inet(address: [u8; 4]) -> libc::sockaddr {
     // SAFETY: sockaddr_in and sockaddr are both 16 bytes, and every bit pattern is a valid
     // sockaddr.
     unsafe { mem::transmute::<libc::sockaddr_in, libc::sockaddr>(inet) }
+}
+
+fn inet6(address: [u16; 8]) -> libc::in6_addr {
+    libc::in6_addr {
+        s6_addr: Ipv6Addr::from(address).octets(),
+    }
 }
 
 /// The ioctl request type is `c_ulong` on glibc and `c_int` on musl.

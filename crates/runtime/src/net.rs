@@ -15,7 +15,7 @@ use std::env;
 use std::fmt;
 use std::fs;
 use std::io::Write;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -29,15 +29,20 @@ const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
 /// Rejected traffic fails fast in the guest instead of hanging until a timeout.
 const REJECT: &str = "reject with icmpx admin-prohibited";
 /// Never reachable at any level: unspecified, loopback, link-local (including the cloud
-/// metadata service at 169.254.169.254), multicast, reserved and broadcast, and IPv4-mapped
-/// IPv6, which would reach the same IPv4 addresses.
+/// metadata service at 169.254.169.254), multicast, reserved and broadcast. In IPv6 also
+/// IPv4-mapped addresses and the same IPv4 ranges behind the well-known NAT64 prefix
+/// (64:ff9b::/96), which would reach them through the host's IPv4 or a NAT64 gateway.
 const ALWAYS_REJECTED_V4: &str =
     "{ 0.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/4, 240.0.0.0/4 }";
-const ALWAYS_REJECTED_V6: &str = "{ ::/127, fe80::/10, ff00::/8, ::ffff:0:0/96 }";
-/// Private ranges, rejected at `internet`: RFC 1918, shared address space (CGNAT) and unique
-/// local IPv6.
+const ALWAYS_REJECTED_V6: &str = "{ ::/127, fe80::/10, ff00::/8, ::ffff:0:0/96, \
+    64:ff9b::/104, 64:ff9b::7f00:0/104, 64:ff9b::a9fe:0/112, 64:ff9b::e000:0/100, \
+    64:ff9b::f000:0/100 }";
+/// Private ranges, rejected at `internet`: RFC 1918 and shared address space (CGNAT), in IPv6
+/// unique local addresses, those IPv4 ranges behind the well-known NAT64 prefix, and the
+/// local-use NAT64 prefix (64:ff9b:1::/48), which may translate to any of them.
 const PRIVATE_V4: &str = "{ 10.0.0.0/8, 100.64.0.0/10, 172.16.0.0/12, 192.168.0.0/16 }";
-const PRIVATE_V6: &str = "{ fc00::/7 }";
+const PRIVATE_V6: &str = "{ fc00::/7, 64:ff9b:1::/48, 64:ff9b::a00:0/104, \
+    64:ff9b::6440:0/106, 64:ff9b::ac10:0/108, 64:ff9b::c0a8:0/112 }";
 
 /// What a run's guest may reach. Ordered from least to most, so a request can be compared
 /// with the host owner's maximum.
@@ -215,27 +220,35 @@ pub fn bundled_passt() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("passt"))
 }
 
-/// The arguments passt runs with for one guest, after `--fd` and its descriptor: IPv4 only
-/// for now, the fixed guest addresses with no DHCP, DNS queries to the guest's DNS address
-/// forwarded to the host's resolvers, no inbound ports, and no mapping of the gateway address
-/// to the host's loopback.
+/// The arguments passt runs with for one guest, after `--fd` and its descriptor: the fixed
+/// guest addresses with no DHCP, DHCPv6 or router advertisements, DNS queries to the guest's
+/// DNS address forwarded to the host's resolvers, no inbound ports, and no mapping of the
+/// gateway addresses to the host's loopback. passt answers neighbour discovery for the IPv6
+/// gateway, and on a host without IPv6 the guest's IPv6 connections fail at once.
 pub fn passt_args() -> Vec<String> {
-    use peerspan_runtime_protocol::{GUEST_ADDRESS, GUEST_DNS, GUEST_GATEWAY, GUEST_PREFIX};
-    let dotted = |a: [u8; 4]| std::net::Ipv4Addr::from(a).to_string();
+    use peerspan_runtime_protocol::{
+        GUEST_ADDRESS, GUEST_ADDRESS6, GUEST_DNS, GUEST_GATEWAY, GUEST_GATEWAY6, GUEST_PREFIX,
+    };
+    let dotted = |a: [u8; 4]| Ipv4Addr::from(a).to_string();
     [
         "--foreground",
         "--quiet",
-        "--ipv4-only",
         "--address",
         &dotted(GUEST_ADDRESS),
         "--netmask",
         &GUEST_PREFIX.to_string(),
         "--gateway",
         &dotted(GUEST_GATEWAY),
+        "--address",
+        &Ipv6Addr::from(GUEST_ADDRESS6).to_string(),
+        "--gateway",
+        &Ipv6Addr::from(GUEST_GATEWAY6).to_string(),
         "--dns-forward",
         &dotted(GUEST_DNS),
         "--no-map-gw",
         "--no-dhcp",
+        "--no-dhcpv6",
+        "--no-ra",
         "--tcp-ports",
         "none",
         "--udp-ports",
@@ -260,7 +273,9 @@ mod tests {
         let internet = run_chain("run-1", Level::Internet, &[]);
         let lan = run_chain("run-1", Level::InternetLan, &[]);
         assert!(internet.contains(PRIVATE_V4));
+        assert!(internet.contains(PRIVATE_V6));
         assert!(!lan.contains(PRIVATE_V4));
+        assert!(!lan.contains(PRIVATE_V6));
         for chain in [&internet, &lan] {
             assert!(chain.contains("fib daddr type local"));
             assert!(chain.contains(ALWAYS_REJECTED_V4));

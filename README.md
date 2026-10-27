@@ -73,7 +73,11 @@ nftables table (`inet peerspan_runtime`) sends traffic from each run's cgroup to
 its level, and rejects traffic from any other process in the runtime's cgroups, so a missing
 rule fails closed. DNS goes to passt, which forwards it to the host's resolvers, the one local
 address a guest may reach, on port 53 only. The guest's addresses are fixed (10.0.2.15/24,
-gateway 10.0.2.2, DNS 10.0.2.3), so booting needs no DHCP. IPv4 only for now.
+gateway 10.0.2.2, DNS 10.0.2.3; fd50:5053::15/64, gateway fe80::1), so booting needs no DHCP
+or router advertisements. The IPv6 address is unique local, so programs prefer IPv4 for names
+that have both, and reach IPv6-only ones through the host when it has IPv6; on a host without,
+they fail at once. The same limits apply in IPv6, including to IPv4 addresses behind the NAT64
+prefixes.
 
 The runtime ships with its own passt rather than the host's: `scripts/build-passt.sh` builds a
 pinned release, checked against its commit and linked statically, and the runtime looks for it
@@ -85,7 +89,7 @@ GPL-2.0-or-later; its source is the pinned commit at [passt.top](https://passt.t
 `scripts/build-kernel.sh` builds the guest kernel: a pinned kernel.org longterm release,
 checked against its published SHA-256, configured by `guest/kernel.config` on top of
 `allnoconfig`, with everything the guest needs built in (virtio-mmio, the virtio console,
-virtio-fs, vsock, virtio-net, and what programs expect of a kernel) and nothing else. It is cached by
+virtio-fs, vsock, virtio-net, IPv4 and IPv6, and what programs expect of a kernel) and nothing else. It is cached by
 version and config. `build-guest.sh` uses it by default and copies the resolved config into
 the image beside `vmlinux`; `GUEST_ROOT=/` uses a distribution kernel and its modules instead.
 The kernel is GPL-2.0: its source is the pinned release and its configuration is
