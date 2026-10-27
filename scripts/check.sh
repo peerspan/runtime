@@ -4,8 +4,9 @@
 #
 # End-to-end checks: boots real microVMs with `peerspan-runtime run`.
 # Needs root, /dev/kvm, a guest image (scripts/build-guest.sh), PEERSPAN_RUNTIME_GUEST pointing
-# at it, PEERSPAN_LIBKRUN pointing at a libkrun built with `make VHOST_USER=1 NET=1`, and passt,
-# nft and ip on PATH.
+# at it, PEERSPAN_LIBKRUN pointing at a libkrun built with `make VHOST_USER=1 NET=1`, passt
+# from scripts/build-passt.sh beside the runtime binary or named by PEERSPAN_PASST, and nft and
+# ip on PATH.
 # PEERSPAN_RUNTIME_BIN names a built binary; without it the script builds one.
 set -eu
 

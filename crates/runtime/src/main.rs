@@ -84,9 +84,10 @@ struct RunArgs {
     /// What the guest may reach.
     #[arg(long, value_enum, default_value_t = net::Level::Internet)]
     network: net::Level,
-    /// passt binary that carries the guest's network traffic.
-    #[arg(long, env = "PEERSPAN_PASST", default_value = "passt")]
-    passt: PathBuf,
+    /// passt binary that carries the guest's network traffic [default: passt beside this
+    /// binary, from scripts/build-passt.sh].
+    #[arg(long, env = "PEERSPAN_PASST")]
+    passt: Option<PathBuf>,
     /// Virtual CPUs.
     #[arg(long, default_value_t = 2)]
     cpus: u8,
@@ -152,7 +153,7 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
         guest: args.guest,
         libkrun: args.libkrun,
         virtiofsd: args.virtiofsd,
-        passt: args.passt,
+        passt: args.passt.unwrap_or_else(net::bundled_passt),
         network: args.network,
         cpus: args.cpus,
         memory_mib: args.memory_mib,

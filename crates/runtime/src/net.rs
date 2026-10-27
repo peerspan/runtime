@@ -11,11 +11,12 @@
 //! a chain of its own, and traffic from the runtime's cgroups with no chain is rejected, so the
 //! filter fails closed.
 
+use std::env;
 use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, bail};
@@ -203,6 +204,15 @@ fn nft(script: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// The passt the runtime ships with, beside its own binary: a pinned release, built by
+/// `scripts/build-passt.sh`, whose arguments [`passt_args`] is written against.
+pub fn bundled_passt() -> PathBuf {
+    env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("passt")))
+        .unwrap_or_else(|| PathBuf::from("passt"))
 }
 
 /// The arguments passt runs with for one guest, after `--fd` and its descriptor: IPv4 only

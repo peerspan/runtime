@@ -34,7 +34,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang libclang-dev virtiofsd zstd cpio \
-            flex bison bc libelf-dev passt nftables
+            flex bison bc libelf-dev nftables
 
       - name: Add musl target
         run: rustup target add x86_64-unknown-linux-musl
@@ -44,6 +44,11 @@ jobs:
           git clone --depth 1 --branch peerspan https://github.com/peerspan/libkrun "$RUNNER_TEMP/libkrun"
           make -C "$RUNNER_TEMP/libkrun" VHOST_USER=1 NET=1
           echo "PEERSPAN_LIBKRUN=$RUNNER_TEMP/libkrun/target/release/libkrun.so.2.0.0" >> "$GITHUB_ENV"
+
+      - name: Build passt
+        run: |
+          scripts/build-passt.sh "$RUNNER_TEMP/passt"
+          echo "PEERSPAN_PASST=$RUNNER_TEMP/passt/passt" >> "$GITHUB_ENV"
 
       - name: Enable KVM group perms
         run: |
@@ -60,5 +65,5 @@ jobs:
       - name: Run checks
         run: |
           cargo build --release -p peerspan-runtime
-          sudo --preserve-env=PEERSPAN_LIBKRUN,PEERSPAN_RUNTIME_GUEST \
+          sudo --preserve-env=PEERSPAN_LIBKRUN,PEERSPAN_RUNTIME_GUEST,PEERSPAN_PASST \
             PEERSPAN_RUNTIME_BIN="$PWD/target/release/peerspan-runtime" scripts/check.sh

@@ -25,12 +25,13 @@ Linux x86_64 with `/dev/kvm` only, for now, run as root (see Confinement). You n
 build toolchain (`flex`, `bison`, `bc`, `libelf-dev`) for the guest kernel, libkrun built from
 the `peerspan`
 branch of [peerspan/libkrun](https://github.com/peerspan/libkrun) with
-`make VHOST_USER=1 NET=1`, `virtiofsd`, `passt`, `nft` (nftables), and the
+`make VHOST_USER=1 NET=1`, `virtiofsd`, `nft` (nftables), and the
 `x86_64-unknown-linux-musl` Rust target.
 
 ```sh
 scripts/build-guest.sh target/guest
 export PEERSPAN_RUNTIME_GUEST=$PWD/target/guest
+scripts/build-passt.sh target/release
 export PEERSPAN_LIBKRUN=/path/to/libkrun/target/release/libkrun.so.2.0.0
 cargo run --release -p peerspan-runtime -- run --workspace ~/src/project -- make test
 scripts/check.sh   # end-to-end checks
@@ -73,6 +74,11 @@ its level, and rejects traffic from any other process in the runtime's cgroups, 
 rule fails closed. DNS goes to passt, which forwards it to the host's resolvers, the one local
 address a guest may reach, on port 53 only. The guest's addresses are fixed (10.0.2.15/24,
 gateway 10.0.2.2, DNS 10.0.2.3), so booting needs no DHCP. IPv4 only for now.
+
+The runtime ships with its own passt rather than the host's: `scripts/build-passt.sh` builds a
+pinned release, checked against its commit and linked statically, and the runtime looks for it
+beside its own binary (`--passt` or `PEERSPAN_PASST` to use another). passt is
+GPL-2.0-or-later; its source is the pinned commit at [passt.top](https://passt.top/passt).
 
 ## Guest kernel
 

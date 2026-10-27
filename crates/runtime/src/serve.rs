@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tiny_http::{Header, Method, Request, Response, Server};
 
-use crate::net::Level;
+use crate::net::{self, Level};
 use crate::vm::{self, Event, Outcome, VmSpec};
 
 /// Largest request body accepted, as on the daemon's `admin.sock`.
@@ -55,9 +55,10 @@ pub struct ServeArgs {
         default_value = "/usr/libexec/virtiofsd"
     )]
     virtiofsd: PathBuf,
-    /// passt binary that carries guests' network traffic.
-    #[arg(long, env = "PEERSPAN_PASST", default_value = "passt")]
-    passt: PathBuf,
+    /// passt binary that carries guests' network traffic [default: passt beside this binary,
+    /// from scripts/build-passt.sh].
+    #[arg(long, env = "PEERSPAN_PASST")]
+    passt: Option<PathBuf>,
     /// The most network a run may ask for; the host owner's ceiling.
     #[arg(long, value_enum, default_value_t = Level::Internet)]
     max_network: Level,
@@ -358,7 +359,11 @@ fn execute(runtime: &Runtime, run: &Run) {
                 guest: runtime.args.guest.clone(),
                 libkrun: runtime.args.libkrun.clone(),
                 virtiofsd: runtime.args.virtiofsd.clone(),
-                passt: runtime.args.passt.clone(),
+                passt: runtime
+                    .args
+                    .passt
+                    .clone()
+                    .unwrap_or_else(net::bundled_passt),
                 network: request.network,
                 cpus: request.resources.cpus,
                 memory_mib: request.resources.memory_mib,
