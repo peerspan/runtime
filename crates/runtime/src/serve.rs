@@ -75,6 +75,14 @@ pub struct ServeArgs {
     max_cpus: u8,
     #[arg(long, default_value_t = 4096)]
     max_memory_mib: u32,
+    /// Disk bandwidth for each run's processes in MiB/s, for reading and for writing each.
+    #[arg(long, default_value_t = crate::cgroup::DEFAULT_IO_MIBPS,
+          value_parser = clap::value_parser!(u32).range(1..))]
+    io_mibps: u32,
+    /// Disk operations per second for each run's processes, for reading and for writing each.
+    #[arg(long, default_value_t = crate::cgroup::DEFAULT_IO_IOPS,
+          value_parser = clap::value_parser!(u32).range(1..))]
+    io_iops: u32,
     #[arg(long, default_value_t = 3600)]
     max_seconds: u32,
     #[arg(long, default_value_t = 1)]
@@ -369,6 +377,10 @@ fn execute(runtime: &Runtime, run: &Run) {
                 network: request.network,
                 cpus: request.resources.cpus,
                 memory_mib: request.resources.memory_mib,
+                io: crate::cgroup::IoRate {
+                    mib_per_second: runtime.args.io_mibps,
+                    ops_per_second: runtime.args.io_iops,
+                },
                 timeout: Some(Duration::from_secs(u64::from(
                     request.resources.timeout_seconds,
                 ))),

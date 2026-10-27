@@ -129,6 +129,14 @@ else
   fail "hostile-archive: exit $rc, $(cat "$work/err")"
 fi
 
+# Disk I/O is capped: 60 MiB written and synced at 20 MiB/s takes about 3 seconds.
+start=$(date +%s%3N); rc=0
+"$bin" run --workspace "$work/ws" --io-mibps 20 -- \
+  sh -c 'dd if=/dev/zero of=io-check bs=1M count=60 conv=fsync 2>/dev/null; rm io-check' \
+  > /dev/null 2>&1 || rc=$?
+took=$(( $(date +%s%3N) - start ))
+[ "$rc" -eq 0 ] && [ "$took" -ge 2500 ] && pass io-limit || fail "io-limit: exit $rc after ${took}ms"
+
 start=$(date +%s); rc=0
 "$bin" run --workspace "$work/ws" --timeout-seconds 1 -- sleep 60 > /dev/null 2>&1 || rc=$?
 took=$(( $(date +%s) - start ))
@@ -170,7 +178,8 @@ else
   fi
   [ -z "${root_launchers:-}" ] || problems="$problems launcher-as-root:${root_launchers}"
   # Resource limits: the VMM and the workspace server share the run's cgroup, which caps memory
-  # at the guest's 1024 MiB plus 256 MiB, CPU at 2 vCPUs, and processes at 512.
+  # at the guest's 1024 MiB plus 256 MiB, CPU at 2 vCPUs, processes at 512, and disk I/O at
+  # 256 MiB/s and 10000 operations a second each way.
   cg=$(sed -n 's/^0:://p' "/proc/$vmm/cgroup")
   case "$cg" in /peerspan-runtime/run-*) ;; *) problems="$problems cgroup=[$cg]" ;; esac
   [ -n "$vfs" ] && [ "$(sed -n 's/^0:://p' "/proc/$vfs/cgroup")" != "$cg" ] \
@@ -178,6 +187,8 @@ else
   limits="$(cat "/sys/fs/cgroup$cg/memory.max") $(cat "/sys/fs/cgroup$cg/memory.swap.max")"
   limits="$limits $(cat "/sys/fs/cgroup$cg/cpu.max") $(cat "/sys/fs/cgroup$cg/pids.max")"
   [ "$limits" = "1342177280 0 200000 100000 512" ] || problems="$problems limits=[$limits]"
+  grep -q ' rbps=268435456 wbps=268435456 riops=10000 wiops=10000$' "/sys/fs/cgroup$cg/io.max" \
+    || problems="$problems io.max=[$(cat "/sys/fs/cgroup$cg/io.max")]"
   [ -z "$problems" ] && pass confinement || fail "confinement:$problems"
 fi
 wait "$run_pid" || fail "confinement: the run failed"

@@ -95,6 +95,14 @@ struct RunArgs {
     /// Guest memory in MiB.
     #[arg(long, default_value_t = 1024)]
     memory_mib: u32,
+    /// Disk bandwidth for the run's processes in MiB/s, for reading and for writing each.
+    #[arg(long, default_value_t = crate::cgroup::DEFAULT_IO_MIBPS,
+          value_parser = clap::value_parser!(u32).range(1..))]
+    io_mibps: u32,
+    /// Disk operations per second for the run's processes, for reading and for writing each.
+    #[arg(long, default_value_t = crate::cgroup::DEFAULT_IO_IOPS,
+          value_parser = clap::value_parser!(u32).range(1..))]
+    io_iops: u32,
     /// Where to keep the guest console; discarded with the run directory when omitted.
     #[arg(long)]
     console_log: Option<PathBuf>,
@@ -159,6 +167,10 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
         network: args.network,
         cpus: args.cpus,
         memory_mib: args.memory_mib,
+        io: crate::cgroup::IoRate {
+            mib_per_second: args.io_mibps,
+            ops_per_second: args.io_iops,
+        },
         timeout: args.timeout_seconds.map(Duration::from_secs),
         console_log: args.console_log,
         cgroup_root: args.cgroup_root,

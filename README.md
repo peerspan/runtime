@@ -130,8 +130,11 @@ is confined before libkrun sees any guest input:
 Each run also gets its own cgroup v2, under `/sys/fs/cgroup/peerspan-runtime` by default
 (`--cgroup-root`), which the VMM, the workspace server and passt join before they run any code
 of their own. It caps their memory at the guest's plus 256 MiB with no swap, their CPU time at the
-run's vCPUs, and their processes and threads at 512; a run that exceeds its memory is killed
-and reports so. Stopping a run, by cancellation or timeout, kills the whole cgroup, which is
+run's vCPUs, their processes and threads at 512, and their disk I/O on the disks holding the
+workspace and the guest image at 256 MiB/s and 10,000 operations a second, each for reading and
+for writing (`--io-mibps` and `--io-iops`, on `run` and, for every run, on `serve`). A run that
+exceeds its memory is killed and reports so. Disk I/O is capped only where a block device holds
+the files: not on tmpfs, overlayfs or btrfs, whose files report device numbers of their own. Stopping a run, by cancellation or timeout, kills the whole cgroup, which is
 removed afterwards.
 
 A supervisor killed outright cannot tear its run down. Every process of a run dies with it,
@@ -149,7 +152,8 @@ files to other users. `run` serves a project directory as its owner, who must be
 it; `serve` gives each workspace it creates to the run's own user, so its `--state` directory
 must be searchable by other users.
 
-Setting all this up needs root, as Firecracker's jailer does. Not yet: I/O and disk limits.
+Setting all this up needs root, as Firecracker's jailer does. Not yet: a limit on the disk
+space a workspace may take.
 `scripts/check.sh` inspects a running VM from the host to check the confinement above.
 
 ## Layout

@@ -22,7 +22,7 @@ use std::os::unix::process::CommandExt;
 use anyhow::{Context, bail};
 use peerspan_runtime_protocol::{self as protocol, DATA_CHUNK, Message, WORKSPACE_TAG};
 
-use crate::cgroup::{self, Limits, RunCgroup};
+use crate::cgroup::{self, IoRate, Limits, RunCgroup};
 use crate::net::{self, Level, RunFilter};
 use crate::phases;
 use crate::userns::UserNamespace;
@@ -67,6 +67,8 @@ pub struct VmSpec {
     pub network: Level,
     pub cpus: u8,
     pub memory_mib: u32,
+    /// The cap on disk I/O, on the disks holding the workspace and the guest image.
+    pub io: IoRate,
     /// How long the command may run once started.
     pub timeout: Option<Duration>,
     pub console_log: Option<PathBuf>,
@@ -185,9 +187,11 @@ pub fn run(
     let cgroup = RunCgroup::create(
         &options.cgroup_root,
         &format!("run-{id}"),
-        Limits {
+        &Limits {
             cpus: options.cpus,
             guest_memory_mib: options.memory_mib,
+            io: options.io,
+            disks: io_disks(&workspace, &guest),
         },
     )?;
     mark("cgroup");
@@ -653,6 +657,17 @@ fn wait_with_timeout(
         }
         thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// The disks the run reads and writes: the workspace's and the guest image's.
+fn io_disks(workspace: &Path, guest: &GuestImage) -> Vec<(u32, u32)> {
+    let mut disks: Vec<(u32, u32)> = [workspace, &guest.rootfs]
+        .into_iter()
+        .filter_map(cgroup::disk_of)
+        .collect();
+    disks.sort_unstable();
+    disks.dedup();
+    disks
 }
 
 fn console_tail(path: &Path) -> String {

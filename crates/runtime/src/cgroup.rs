@@ -4,8 +4,8 @@
 //! Resource limits for each run, through a cgroup v2 of its own.
 //!
 //! The guest's memory and vCPUs are bounded by libkrun, but the processes behind it (the VMM
-//! and the workspace server) are host processes. Each run's cgroup caps their memory, CPU time
-//! and process count, so a run cannot exhaust its host, and kills them all at teardown.
+//! and the workspace server) are host processes. Each run's cgroup caps their memory, CPU time,
+//! process count and disk I/O, so a run cannot exhaust its host, and kills them all at teardown.
 //!
 //! A supervisor holds an exclusive lock on its run's cgroup directory for as long as the run
 //! lasts, and the kernel releases it when the supervisor dies however it dies. A cgroup whose
@@ -16,7 +16,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,6 +26,11 @@ use anyhow::{Context, bail};
 /// Where runs' cgroups go by default: a child of the root cgroup, which may hold processes
 /// itself, so nothing else has to move.
 pub const DEFAULT_ROOT: &str = "/sys/fs/cgroup/peerspan-runtime";
+/// Disk bandwidth for each run unless set otherwise, in MiB/s each for reading and writing:
+/// enough for builds and tests, and a fraction of what a solid-state disk sustains.
+pub const DEFAULT_IO_MIBPS: u32 = 256;
+/// Disk operations per second for each run unless set otherwise, each for reading and writing.
+pub const DEFAULT_IO_IOPS: u32 = 10_000;
 /// Memory allowed on top of the guest's own, for the VMM process and the workspace server.
 const OVERHEAD_BYTES: u64 = 256 << 20;
 /// Processes and threads allowed per run: vCPU and device threads, and the workspace server's.
@@ -34,13 +39,23 @@ const PIDS_MAX: u32 = 512;
 const CPU_PERIOD_US: u64 = 100_000;
 /// How long teardown waits for killed processes to leave the cgroup.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-const CONTROLLERS: [&str; 3] = ["cpu", "memory", "pids"];
+const CONTROLLERS: [&str; 4] = ["cpu", "io", "memory", "pids"];
 
 /// The limits of one run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
     pub cpus: u8,
     pub guest_memory_mib: u32,
+    pub io: IoRate,
+    /// The disks whose I/O `io` caps, as major and minor device numbers.
+    pub disks: Vec<(u32, u32)>,
+}
+
+/// A cap on disk I/O, applied to reading and to writing separately on each disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoRate {
+    pub mib_per_second: u32,
+    pub ops_per_second: u32,
 }
 
 /// A run's cgroup, removed with everything in it when dropped.
@@ -57,9 +72,9 @@ impl RunCgroup {
     ///
     /// # Errors
     ///
-    /// Fails if cgroup v2 or one of the cpu, memory and pids controllers is unavailable; the
-    /// run must not start without its limits.
-    pub fn create(root: &Path, name: &str, limits: Limits) -> anyhow::Result<RunCgroup> {
+    /// Fails if cgroup v2 or one of the cpu, io, memory and pids controllers is unavailable;
+    /// the run must not start without its limits.
+    pub fn create(root: &Path, name: &str, limits: &Limits) -> anyhow::Result<RunCgroup> {
         prepare_root(root)?;
         let root_lock = lock(root, libc::LOCK_SH)?;
         let path = root.join(name);
@@ -73,6 +88,14 @@ impl RunCgroup {
         cgroup.set("memory.swap.max", "0")?;
         cgroup.set("pids.max", &PIDS_MAX.to_string())?;
         cgroup.set("cpu.max", &format!("{quota} {CPU_PERIOD_US}"))?;
+        let bytes = u64::from(limits.io.mib_per_second) << 20;
+        let ops = limits.io.ops_per_second;
+        for (major, minor) in &limits.disks {
+            cgroup.set(
+                "io.max",
+                &format!("{major}:{minor} rbps={bytes} wbps={bytes} riops={ops} wiops={ops}"),
+            )?;
+        }
         Ok(cgroup)
     }
 
@@ -176,6 +199,27 @@ pub fn stale(root: &Path) -> anyhow::Result<Vec<RunCgroup>> {
         }
     }
     Ok(stale)
+}
+
+/// The disk holding `path`, as major and minor device numbers, for `io.max`, which takes whole
+/// disks rather than partitions. None if no block device holds it, as for tmpfs, overlayfs or
+/// btrfs, whose files report a device number of their own.
+pub fn disk_of(path: &Path) -> Option<(u32, u32)> {
+    let dev = fs::metadata(path).ok()?.dev();
+    let device = fs::canonicalize(format!(
+        "/sys/dev/block/{}:{}",
+        libc::major(dev),
+        libc::minor(dev)
+    ))
+    .ok()?;
+    let disk = if device.join("partition").exists() {
+        device.parent()?
+    } else {
+        &device
+    };
+    let numbers = fs::read_to_string(disk.join("dev")).ok()?;
+    let (major, minor) = numbers.trim().split_once(':')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
 }
 
 /// Opens directory `path` and takes `operation`, a flock(2) operation, on it.
