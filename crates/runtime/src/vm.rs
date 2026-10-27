@@ -8,7 +8,7 @@ use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read};
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -25,11 +25,12 @@ use peerspan_runtime_protocol::{self as protocol, DATA_CHUNK, Message, WORKSPACE
 use crate::cgroup::{self, Limits, RunCgroup};
 use crate::net::{self, Level, RunFilter};
 use crate::phases;
+use crate::userns::UserNamespace;
 
 use crate::launcher::{AGENT_SOCKET, WORKSPACE_SOCKET};
 
-/// How long the workspace server has to create its socket.
-const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a workspace server that may have failed has to exit, when the guest did not connect.
+const SERVER_EXIT_GRACE: Duration = Duration::from_millis(500);
 /// How long the guest has, from launch, to boot and connect.
 const GUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the launcher has to exit after the guest reports the command's exit.
@@ -51,6 +52,10 @@ const WATCH_INTERVAL: Duration = Duration::from_millis(50);
 pub struct VmSpec {
     /// Host directory shared as the guest's workspace. With an archive it must be empty.
     pub workspace: PathBuf,
+    /// Give the workspace directory to the run's own user first. The guest's root acts on the
+    /// host as the directory's owner, so this keeps a workspace the runtime created for the run
+    /// from being served as root.
+    pub own_workspace: bool,
     /// A tar archive, optionally gzip-compressed, unpacked into the workspace inside the VM.
     pub archive: Option<PathBuf>,
     pub guest: PathBuf,
@@ -191,22 +196,53 @@ pub fn run(
         .clone()
         .unwrap_or_else(|| run_dir.path.join("console.log"));
 
+    // The workspace server is root in a user namespace where root is the workspace's owner, so
+    // the guest's root acts on the host as that user and no other. It cannot reach the run's
+    // socket directory, so it listens on a socket created for it.
+    if options.own_workspace {
+        chown(&workspace, id)?;
+    }
+    let owner = fs::metadata(&workspace)?;
+    let server_namespace = UserNamespace::new(owner.uid(), owner.gid())?;
     let workspace_socket = sockets.join(WORKSPACE_SOCKET);
-    let _server = ChildGuard(
-        join_cgroup(&mut Command::new(&options.virtiofsd), &cgroup)
-            .arg(format!("--socket-path={}", workspace_socket.display()))
+    let server_listener = UnixListener::bind(&workspace_socket)
+        .with_context(|| format!("binding {}", workspace_socket.display()))?;
+    chown(&workspace_socket, id)?;
+    let server_log = run_dir.path.join("virtiofsd.log");
+    let mut server_command = Command::new(&options.virtiofsd);
+    join_cgroup(&mut server_command, &cgroup);
+    // Raised here, while still root: inside the namespace the server could not raise it.
+    let open_files = open_files_limit();
+    // SAFETY: the hook only calls setrlimit(2), which is async-signal-safe.
+    unsafe {
+        server_command.pre_exec(move || {
+            let limit = libc::rlimit {
+                rlim_cur: open_files,
+                rlim_max: open_files,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+    }
+    server_namespace.enter(&mut server_command);
+    pass_fd(&mut server_command, server_listener.as_raw_fd(), SERVER_FD);
+    let mut server = ChildGuard(
+        server_command
+            .arg(format!("--fd={SERVER_FD}"))
             .arg(format!("--shared-dir={}", workspace.display()))
             .arg(format!("--tag={WORKSPACE_TAG}"))
             .arg("--cache=auto")
+            .arg("--rlimit-nofile=0")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(File::create(run_dir.path.join("virtiofsd.log"))?)
+            .stderr(File::create(&server_log)?)
             .spawn()
             .with_context(|| format!("starting {}", options.virtiofsd.display()))?,
     );
-    wait_for_path(&workspace_socket, SERVER_READY_TIMEOUT)
-        .context("workspace server did not create its socket")?;
-    chown(&workspace_socket, id)?;
+    drop((server_listener, server_namespace));
     mark("workspace_server");
 
     // Declared after the cgroup and dropped before it: passt first, then the filter, which
@@ -298,7 +334,21 @@ pub fn run(
 
     let stream = match accept_guest(&listener, &mut launcher.0, cancel) {
         Ok(stream) => stream,
-        Err(e) => return Err(e.context(console_tail(&console_path))),
+        Err(e) => {
+            let e = e.context(console_tail(&console_path));
+            // A server that could not start is the likelier cause; its log goes with the run.
+            if let Ok(Some(_)) = wait_with_timeout(&mut server.0, SERVER_EXIT_GRACE) {
+                return Err(e.context(format!(
+                    "the workspace server, which runs as the workspace's owner (user {}, group \
+                     {}) and must be able to reach {}, failed; {}",
+                    owner.uid(),
+                    owner.gid(),
+                    workspace.display(),
+                    log_tail("its log", &server_log)
+                )));
+            }
+            return Err(e);
+        }
     };
     let connect = launched.elapsed();
     mark("connected");
@@ -485,6 +535,20 @@ const PHASES_FD: RawFd = 3;
 const NET_FD: RawFd = 4;
 /// The descriptor number passt receives its end of the guest's network on.
 const PASST_FD: RawFd = 3;
+/// The descriptor number the workspace server receives its listening socket on.
+const SERVER_FD: RawFd = 3;
+
+/// The open files the workspace server may hold, one per file the guest has looked up: what
+/// virtiofsd sets for itself when it runs as root.
+fn open_files_limit() -> libc::rlim_t {
+    const VIRTIOFSD_DEFAULT: libc::rlim_t = 1_000_000;
+    fs::read_to_string("/proc/sys/fs/nr_open")
+        .ok()
+        .and_then(|n| n.trim().parse().ok())
+        .map_or(VIRTIOFSD_DEFAULT, |max: libc::rlim_t| {
+            max.min(VIRTIOFSD_DEFAULT)
+        })
+}
 
 /// Makes `fd` available to `command`'s process as `target`.
 fn pass_fd(command: &mut Command, fd: RawFd, target: RawFd) {
@@ -575,17 +639,6 @@ fn accept_guest(
     }
 }
 
-fn wait_for_path(path: &Path, timeout: Duration) -> anyhow::Result<()> {
-    let deadline = Instant::now() + timeout;
-    while !path.exists() {
-        if Instant::now() >= deadline {
-            bail!("{} did not appear within {timeout:?}", path.display());
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
-    Ok(())
-}
-
 fn wait_with_timeout(
     child: &mut Child,
     timeout: Duration,
@@ -603,12 +656,16 @@ fn wait_with_timeout(
 }
 
 fn console_tail(path: &Path) -> String {
-    let Ok(console) = fs::read_to_string(path) else {
-        return format!("no guest console at {}", path.display());
+    log_tail("guest console", path)
+}
+
+fn log_tail(what: &str, path: &Path) -> String {
+    let Ok(log) = fs::read_to_string(path) else {
+        return format!("no {what} at {}", path.display());
     };
-    let lines: Vec<&str> = console.lines().collect();
+    let lines: Vec<&str> = log.lines().collect();
     let tail = lines[lines.len().saturating_sub(CONSOLE_TAIL_LINES)..].join("\n");
-    format!("guest console (last lines of {}):\n{tail}", path.display())
+    format!("{what} (last lines of {}):\n{tail}", path.display())
 }
 
 /// The files a guest boots from.

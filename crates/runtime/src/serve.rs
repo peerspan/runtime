@@ -173,6 +173,7 @@ pub fn serve(args: ServeArgs) -> anyhow::Result<()> {
             .create(&dir)
             .with_context(|| format!("creating {}", dir.display()))?;
     }
+    reachable_by_runs(&args.state)?;
     let _ = fs::remove_file(&args.socket);
     let server = Server::http_unix(&args.socket)
         .map_err(|e| anyhow::anyhow!("serving on {}: {e}", args.socket.display()))?;
@@ -355,6 +356,7 @@ fn execute(runtime: &Runtime, run: &Run) {
         Ok((workspace, mut results)) => {
             let spec = VmSpec {
                 workspace,
+                own_workspace: true,
                 archive: request.workspace_archive.clone(),
                 guest: runtime.args.guest.clone(),
                 libkrun: runtime.args.libkrun.clone(),
@@ -409,6 +411,24 @@ fn execute(runtime: &Runtime, run: &Run) {
     if run.deleted.load(Ordering::Relaxed) {
         let _ = fs::remove_dir_all(&run.dir);
     }
+}
+
+/// Checks that a run's own user can reach workspaces under `dir`: each run's workspace server
+/// runs as that user, which belongs to no group, so every directory on the way must be
+/// searchable by other users.
+fn reachable_by_runs(dir: &Path) -> anyhow::Result<()> {
+    let dir = fs::canonicalize(dir).with_context(|| format!("{}", dir.display()))?;
+    for ancestor in dir.ancestors() {
+        if fs::metadata(ancestor)?.permissions().mode() & 0o001 == 0 {
+            anyhow::bail!(
+                "{} must be searchable by other users (o+x): each run's workspace server runs as \
+                 the run's own user and must reach its workspace under {}",
+                ancestor.display(),
+                dir.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// A run that ended outside the command: cancelled before the guest connected, or failed.

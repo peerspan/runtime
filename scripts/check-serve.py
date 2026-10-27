@@ -72,6 +72,8 @@ def follow(sock, rid):
 
 def main():
     work = tempfile.mkdtemp()
+    # Each run's workspace server runs as the run's own user, which must reach the state dir.
+    os.chmod(work, 0o711)
     sock = os.path.join(work, "runtime.sock")
     state = os.path.join(work, "state")
     server = subprocess.Popen([os.environ["PEERSPAN_RUNTIME_BIN"], "serve", "--socket", sock,

@@ -38,8 +38,13 @@ check() {
 fail() { echo "FAIL $*"; failures=$((failures + 1)); }
 pass() { echo "ok   $1"; }
 
+# The workspace belongs to a user other than root, as a project directory would, so the checks
+# run with the workspace server as that user. It must be able to reach the workspace.
+owner=4242:4343
+chmod 711 "$work"
 mkdir -p "$work/ws"
 echo "from the host" > "$work/ws/from-host"
+chown -R "$owner" "$work/ws"
 
 if check io 7 -- sh -c 'cat from-host; echo oops >&2; echo made > made-in-vm; exit 7'; then
   [ "$(cat "$work/out")" = "from the host" ] || fail "io: stdout $(cat "$work/out")"
@@ -58,6 +63,17 @@ if check not-found 127 -- no-such-program; then
 fi
 
 check signal 137 -- sh -c 'kill -9 $$' && pass signal
+
+# The guest's root acts on the host as the workspace's owner and no one else: the owner's files
+# are root's, others' are nobody's and not writable, and files cannot be given away.
+touch "$work/ws/roots"
+if check workspace-owner 0 -- sh -c 'stat -c %u from-host roots; echo x > mine
+    chown 1 mine 2>/dev/null && echo gave-away; echo x 2>/dev/null >> roots && echo wrote-roots; true'; then
+  got="$(tr '\n' ' ' < "$work/out")$(stat -c %u:%g "$work/ws/mine")"
+  [ "$got" = "0 65534 $owner" ] && pass workspace-owner || fail "workspace-owner: $got"
+fi
+rm -f "$work/ws/roots" "$work/ws/mine"
+
 
 if "$bin" run --workspace "$work/ws" --cwd /tmp --env GREETING=hi -- sh -c 'echo "$GREETING $(pwd)"' \
     > "$work/out" 2> "$work/err"; then
@@ -129,7 +145,7 @@ for pid in $(pgrep -f "peerspan-runtime launch"); do
   uid=$(awk '/^Uid:/ {print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)
   if [ "$uid" -ge 1879048192 ]; then vmm=$pid; else root_launchers="${root_launchers:-} $pid"; fi
 done
-for pid in $(pgrep -f "virtiofsd --socket-path=.*peerspan-runtime"); do
+for pid in $(pgrep -f "virtiofsd --fd=3 --shared-dir=$work/ws"); do
   [ "$(readlink "/proc/$pid/ns/mnt")" != "$(readlink /proc/self/ns/mnt)" ] && vfs=$pid
 done
 if [ -z "$vmm" ]; then
@@ -146,6 +162,12 @@ else
   [ "$root" = "dev initramfs proc rootfs sockets vmlinux " ] || problems="$problems root=[$root]"
   [ "$(ls "/proc/$vmm/root/proc" | grep -c '^[0-9]')" -eq 1 ] || problems="$problems sees-other-processes"
   [ -n "$vfs" ] || problems="$problems workspace-server-unsandboxed"
+  if [ -n "$vfs" ]; then
+    [ "$(readlink "/proc/$vfs/ns/user")" != "$(readlink /proc/self/ns/user)" ] \
+      || problems="$problems workspace-server-in-host-user-namespace"
+    ids="$(awk '/^Uid:/ {print $3}' "/proc/$vfs/status"):$(awk '/^Gid:/ {print $3}' "/proc/$vfs/status")"
+    [ "$ids" = "$owner" ] || problems="$problems workspace-server-as-$ids"
+  fi
   [ -z "${root_launchers:-}" ] || problems="$problems launcher-as-root:${root_launchers}"
   # Resource limits: the VMM and the workspace server share the run's cgroup, which caps memory
   # at the guest's 1024 MiB plus 256 MiB, CPU at 2 vCPUs, and processes at 512.

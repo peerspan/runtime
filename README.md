@@ -139,11 +139,18 @@ and a supervisor holds a lock on its run's cgroup for as long as the run lasts, 
 run on the host finds runs whose lock is free and removes their cgroups, network filters and
 run directories.
 
-The workspace server runs in `virtiofsd`'s namespace sandbox with its seccomp filter, so its
-file access stays inside the workspace. Setting this up needs root, as Firecracker's jailer
-does. Not yet: I/O and disk limits, and running the workspace server as the run's
-user. `scripts/check.sh` inspects a running VM from the host to
-check the confinement above.
+The workspace server runs in a user namespace of its own in which root is the workspace's
+owner on the host, and no other user exists. There it builds `virtiofsd`'s namespace sandbox
+and seccomp filter as usual, so its file access stays inside the workspace, but it holds no
+privilege on the host and acts only as that user. In the guest, root owns the owner's files,
+and files the guest creates belong to the owner on the host. Files of other users show as
+`nobody` and are writable only as their permissions allow anyone, and the guest cannot give
+files to other users. `run` serves a project directory as its owner, who must be able to reach
+it; `serve` gives each workspace it creates to the run's own user, so its `--state` directory
+must be searchable by other users.
+
+Setting all this up needs root, as Firecracker's jailer does. Not yet: I/O and disk limits.
+`scripts/check.sh` inspects a running VM from the host to check the confinement above.
 
 ## Layout
 

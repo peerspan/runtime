@@ -11,6 +11,7 @@ mod net;
 mod phases;
 mod seccomp;
 mod serve;
+mod userns;
 mod vm;
 
 use std::fs::File;
@@ -149,6 +150,7 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
     };
     let spec = vm::VmSpec {
         workspace: args.workspace,
+        own_workspace: false,
         archive: args.archive,
         guest: args.guest,
         libkrun: args.libkrun,
