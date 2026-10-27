@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright The Peerspan Authors
 
-//! The per-VM child process: confines itself, boots one microVM and never returns.
+//! The per-VM child process: confines itself, installs its seccomp filter, boots one microVM
+//! and never returns.
 
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -11,6 +12,7 @@ use peerspan_runtime_protocol::{AGENT_PORT, ROOTFS_TAG, WORKSPACE_TAG};
 
 use crate::jail::{self, Jail};
 use crate::krun::{Libkrun, VmConfig};
+use crate::seccomp;
 
 /// Kernel command line for runtime guests. `reboot=k` makes the guest's reboot end the VM.
 pub const KERNEL_CMDLINE: &str = "console=hvc0 rdinit=/init panic=-1 reboot=k quiet";
@@ -63,6 +65,7 @@ pub fn launch(args: &LaunchArgs) -> anyhow::Result<Infallible> {
         gid: args.gid,
     }
     .enter()?;
+    seccomp::install()?;
     let workspace_socket = format!("{}/{WORKSPACE_SOCKET}", jail::SOCKETS);
     let agent_socket = format!("{}/{AGENT_SOCKET}", jail::SOCKETS);
     libkrun.boot(&VmConfig {

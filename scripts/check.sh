@@ -136,6 +136,7 @@ else
   for ns in mnt pid net ipc uts; do ns_differs "$ns" || problems="$problems same-$ns-namespace"; done
   grep -q '^NoNewPrivs:[[:space:]]*1' "/proc/$vmm/status" || problems="$problems no_new_privs-unset"
   grep -q '^CapEff:[[:space:]]*0000000000000000' "/proc/$vmm/status" || problems="$problems capabilities-left"
+  grep -q '^Seccomp:[[:space:]]*2' "/proc/$vmm/status" || problems="$problems no-seccomp-filter"
   root=$(ls -A "/proc/$vmm/root" | tr '\n' ' ')
   [ "$root" = "dev initramfs proc rootfs sockets vmlinux " ] || problems="$problems root=[$root]"
   [ "$(ls "/proc/$vmm/root/proc" | grep -c '^[0-9]')" -eq 1 ] || problems="$problems sees-other-processes"

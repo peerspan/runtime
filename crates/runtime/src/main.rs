@@ -6,6 +6,7 @@
 mod jail;
 mod krun;
 mod launcher;
+mod seccomp;
 mod serve;
 mod vm;
 

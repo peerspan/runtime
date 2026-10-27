@@ -56,12 +56,17 @@ is confined before libkrun sees any guest input:
 - a `pivot_root` into a root holding only the guest's read-only root filesystem, kernel and
   initramfs, the run's two sockets, `/dev/kvm`, and its own `/proc`;
 - its own user and group, a fresh ID per run with only the `kvm` group, no capabilities,
-  `no_new_privs`, and not dumpable.
+  `no_new_privs`, and not dumpable;
+- a seccomp filter, installed before libkrun starts any thread, that refuses with `EPERM` the
+  calls a VMM never needs: `execve`, mounts and namespace changes, `ptrace` and cross-process
+  memory access, `bpf`, `perf_event_open`, `userfaultfd`, keyrings, kernel modules, `kexec`,
+  and host-wide settings such as the clock and `reboot`. It is a deny-list for now; an
+  allow-list traced from libkrun's actual calls would be tighter.
 
 The workspace server runs in `virtiofsd`'s namespace sandbox with its seccomp filter, so its
 file access stays inside the workspace. Setting this up needs root, as Firecracker's jailer
-does. Not yet: a seccomp filter for the VMM, resource limits through cgroups, and running the
-workspace server as the run's user. `scripts/check.sh` inspects a running VM from the host to
+does. Not yet: resource limits through cgroups, a seccomp allow-list, and running the workspace
+server as the run's user. `scripts/check.sh` inspects a running VM from the host to
 check the confinement above.
 
 ## Layout
