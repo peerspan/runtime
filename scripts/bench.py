@@ -58,17 +58,32 @@ def main():
             m = json.loads(metrics_file.read_text())
             samples.append({"connect_ms": m["connect_ms"], "start_ms": m["start_ms"],
                             "total_ms": m["total_ms"],
-                            "memory_peak_mib": m["memory_peak_bytes"] / (1 << 20)})
+                            "memory_peak_mib": m["memory_peak_bytes"] / (1 << 20),
+                            "phases": dict(m["phases_ms"]), "guest": dict(m["guest_phases_ms"])})
 
     summary = {key: {"p50": round(statistics.median(s[key] for s in samples), 1),
                      "p90": round(percentile([s[key] for s in samples], 90), 1),
                      "max": round(max(s[key] for s in samples), 1)} for key in METRICS}
+    timeline = {kind: {name: round(statistics.median(s[kind][name] for s in samples
+                                                     if name in s[kind]), 1)
+                       for name in samples[0][kind]}
+                for kind in ("phases", "guest")}
+    summary["phases_p50_ms"] = timeline["phases"]
+    summary["guest_phases_p50_ms"] = timeline["guest"]
+
     print(f"{args.runs} runs of {' '.join(args.command)!r}, {args.cpus} vCPUs, "
           f"{args.memory_mib} MiB guest")
     print(f"{'':18}{'p50':>9}{'p90':>9}{'max':>9}")
     for key in METRICS:
         row = summary[key]
         print(f"{key:18}{row['p50']:>9}{row['p90']:>9}{row['max']:>9}")
+    for kind, title in (("phases", "runtime phases, p50 ms since run start"),
+                        ("guest", "guest init phases, p50 ms of guest boot clock")):
+        print(title)
+        previous = 0.0
+        for name, at in timeline[kind].items():
+            print(f"  {at:8.1f}  (+{at - previous:6.1f})  {name}")
+            previous = at
 
     if args.record:
         commit = subprocess.run(["git", "-C", str(REPO), "describe", "--always", "--dirty"],

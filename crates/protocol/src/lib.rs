@@ -37,6 +37,7 @@ const TAG_STARTED: u8 = 7;
 const TAG_FAILED: u8 = 8;
 const TAG_CHANGES: u8 = 9;
 const TAG_DELETED: u8 = 10;
+const TAG_PHASES: u8 = 11;
 
 /// Largest chunk of archive or changes data a writer puts in one frame.
 pub const DATA_CHUNK: usize = 64 * 1024;
@@ -82,6 +83,9 @@ pub enum Message {
     Changes(Vec<u8>),
     /// Guest to host: a piece of `deleted.txt`, the paths removed since the archive.
     Deleted(Vec<u8>),
+    /// Guest to host, just before [`Message::Started`]: when init reached each step, as
+    /// microseconds of the guest's boot clock, which starts with the kernel.
+    Phases(Vec<(String, u64)>),
 }
 
 impl Message {
@@ -103,6 +107,7 @@ impl Message {
             Message::Failed(reason) => (TAG_FAILED, reason.as_bytes().to_vec()),
             Message::Changes(bytes) => (TAG_CHANGES, bytes.clone()),
             Message::Deleted(bytes) => (TAG_DELETED, bytes.clone()),
+            Message::Phases(phases) => (TAG_PHASES, encode_phases(phases)),
         };
         if payload.len() > MAX_PAYLOAD {
             return Err(io::Error::new(
@@ -155,6 +160,7 @@ impl Message {
             ),
             TAG_CHANGES => Message::Changes(payload),
             TAG_DELETED => Message::Deleted(payload),
+            TAG_PHASES => Message::Phases(decode_phases(&payload)?),
             other => return Err(invalid(format!("unknown message tag {other}"))),
         };
         Ok(Some(message))
@@ -198,6 +204,28 @@ fn decode_exit(payload: &[u8]) -> io::Result<Message> {
         code: (flags & 1 != 0).then(|| i32::from_be_bytes(*code)),
         signal: (flags & 2 != 0).then(|| i32::from_be_bytes(signal)),
     })
+}
+
+fn encode_phases(phases: &[(String, u64)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_count(&mut out, phases.len());
+    for (name, micros) in phases {
+        put_str(&mut out, name);
+        out.extend_from_slice(&micros.to_be_bytes());
+    }
+    out
+}
+
+fn decode_phases(payload: &[u8]) -> io::Result<Vec<(String, u64)>> {
+    let mut cursor = Cursor { rest: payload };
+    let count = cursor.count()?;
+    let phases = (0..count)
+        .map(|_| Ok((cursor.string()?, cursor.u64()?)))
+        .collect::<io::Result<Vec<_>>>()?;
+    if !cursor.rest.is_empty() {
+        return Err(invalid("trailing bytes after phases"));
+    }
+    Ok(phases)
 }
 
 fn encode_command(command: &Command) -> Vec<u8> {
@@ -269,6 +297,15 @@ impl Cursor<'_> {
         Ok(usize::try_from(u32::from_be_bytes(*head)).expect("u32 fits in usize"))
     }
 
+    fn u64(&mut self) -> io::Result<u64> {
+        let (head, rest) = self
+            .rest
+            .split_first_chunk::<8>()
+            .ok_or_else(|| invalid("truncated phases"))?;
+        self.rest = rest;
+        Ok(u64::from_be_bytes(*head))
+    }
+
     fn string(&mut self) -> io::Result<String> {
         let len = self.count()?;
         if len > self.rest.len() {
@@ -329,6 +366,11 @@ mod tests {
             Message::Failed("refused entry ../x".into()),
             Message::Changes(b"tar".to_vec()),
             Message::Deleted(b"a\nb\n".to_vec()),
+            Message::Phases(vec![
+                ("init".into(), 120_000),
+                ("connected".into(), u64::MAX),
+            ]),
+            Message::Phases(Vec::new()),
         ];
         for message in &messages {
             assert_eq!(&round_trip(message), message);

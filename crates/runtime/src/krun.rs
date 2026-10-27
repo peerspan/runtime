@@ -140,7 +140,11 @@ impl Libkrun {
     /// # Errors
     ///
     /// Fails if libkrun rejects the configuration.
-    pub fn boot(&self, config: &VmConfig<'_>) -> anyhow::Result<Infallible> {
+    pub fn boot(
+        &self,
+        config: &VmConfig<'_>,
+        before_run: &mut dyn FnMut(),
+    ) -> anyhow::Result<Infallible> {
         let api = &self.api;
         let mut err: Handle = ptr::null_mut();
 
@@ -230,6 +234,7 @@ impl Libkrun {
                 &mut err,
                 "build VM",
             )?;
+            before_run();
             (api.vmm_run)(vmm);
         }
         bail!("libkrun returned from running the VM")

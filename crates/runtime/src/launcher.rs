@@ -12,6 +12,7 @@ use peerspan_runtime_protocol::{AGENT_PORT, ROOTFS_TAG, WORKSPACE_TAG};
 
 use crate::jail::{self, Jail};
 use crate::krun::{Libkrun, VmConfig};
+use crate::phases::PhaseWriter;
 use crate::seccomp;
 
 /// Kernel command line for runtime guests. `reboot=k` makes the guest's reboot end the VM.
@@ -45,6 +46,12 @@ pub struct LaunchArgs {
     pub cpus: u8,
     #[arg(long)]
     pub memory_mib: u32,
+    /// Extra kernel command-line arguments, for experiments.
+    #[arg(long)]
+    pub kernel_args: Option<String>,
+    /// Descriptor to write step timestamps to, for measurement.
+    #[arg(long)]
+    pub phases_fd: Option<i32>,
 }
 
 /// Confines this process and boots the VM described by `args`.
@@ -54,7 +61,11 @@ pub struct LaunchArgs {
 /// Fails before the VM starts, if libkrun cannot be loaded, confinement fails, or libkrun
 /// rejects the configuration.
 pub fn launch(args: &LaunchArgs) -> anyhow::Result<Infallible> {
+    // SAFETY: the supervisor passes a descriptor it opened for this process alone.
+    let mut phases = unsafe { PhaseWriter::from_fd(args.phases_fd) };
+    phases.mark("launcher");
     let libkrun = Libkrun::load(&args.libkrun)?;
+    phases.mark("libkrun_loaded");
     Jail {
         dir: &args.jail,
         rootfs: &args.rootfs,
@@ -65,20 +76,29 @@ pub fn launch(args: &LaunchArgs) -> anyhow::Result<Infallible> {
         gid: args.gid,
     }
     .enter()?;
+    phases.mark("jailed");
     seccomp::install()?;
+    phases.mark("seccomp");
+    let cmdline = match &args.kernel_args {
+        Some(extra) => format!("{KERNEL_CMDLINE} {extra}"),
+        None => KERNEL_CMDLINE.to_owned(),
+    };
     let workspace_socket = format!("{}/{WORKSPACE_SOCKET}", jail::SOCKETS);
     let agent_socket = format!("{}/{AGENT_SOCKET}", jail::SOCKETS);
-    libkrun.boot(&VmConfig {
-        cpus: args.cpus,
-        memory_mib: args.memory_mib,
-        kernel: jail::KERNEL,
-        initrd: jail::INITRD,
-        cmdline: KERNEL_CMDLINE,
-        rootfs_tag: ROOTFS_TAG,
-        rootfs_dir: jail::ROOTFS,
-        workspace_tag: WORKSPACE_TAG,
-        workspace_socket: &workspace_socket,
-        agent_port: AGENT_PORT,
-        agent_socket: &agent_socket,
-    })
+    libkrun.boot(
+        &VmConfig {
+            cpus: args.cpus,
+            memory_mib: args.memory_mib,
+            kernel: jail::KERNEL,
+            initrd: jail::INITRD,
+            cmdline: &cmdline,
+            rootfs_tag: ROOTFS_TAG,
+            rootfs_dir: jail::ROOTFS,
+            workspace_tag: WORKSPACE_TAG,
+            workspace_socket: &workspace_socket,
+            agent_port: AGENT_PORT,
+            agent_socket: &agent_socket,
+        },
+        &mut || phases.mark("vm_built"),
+    )
 }

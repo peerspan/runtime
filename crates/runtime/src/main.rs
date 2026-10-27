@@ -7,6 +7,7 @@ mod cgroup;
 mod jail;
 mod krun;
 mod launcher;
+mod phases;
 mod seccomp;
 mod serve;
 mod vm;
@@ -57,6 +58,9 @@ struct RunArgs {
     /// Stop the command after this many seconds.
     #[arg(long)]
     timeout_seconds: Option<u64>,
+    /// Extra kernel command-line arguments, for experiments such as `initcall_debug`.
+    #[arg(long)]
+    kernel_args: Option<String>,
     /// Write the run's boot time and memory measurements to this file, as JSON.
     #[arg(long)]
     metrics: Option<PathBuf>,
@@ -146,6 +150,7 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
         timeout: args.timeout_seconds.map(Duration::from_secs),
         console_log: args.console_log,
         cgroup_root: args.cgroup_root,
+        kernel_args: args.kernel_args,
         command: peerspan_runtime_protocol::Command {
             argv: args.command,
             cwd: args.cwd,
@@ -168,19 +173,7 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
             .map_or(Ok(()), |(_, txt)| txt.write_all(data)),
     })?;
     if let Some(path) = &args.metrics {
-        let metrics = &outcome.metrics;
-        let millis = |d: Duration| d.as_secs_f64() * 1000.0;
-        let json = format!(
-            "{{\"connect_ms\": {:.1}, \"start_ms\": {}, \"total_ms\": {:.1}, \"memory_peak_bytes\": {}}}\n",
-            millis(metrics.connect),
-            metrics
-                .start
-                .map_or("null".into(), |d| format!("{:.1}", millis(d))),
-            millis(metrics.total),
-            metrics
-                .memory_peak_bytes
-                .map_or("null".into(), |b| b.to_string()),
-        );
+        let json = metrics_json(&outcome.metrics).to_string() + "\n";
         std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
     }
     if let Some(error) = &outcome.error {
@@ -200,5 +193,24 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
             ..
         } => 128 + signal,
         _ => EXIT_NOT_RUN,
+    })
+}
+
+/// The run's measurements as JSON, with durations in milliseconds.
+fn metrics_json(metrics: &vm::Metrics) -> serde_json::Value {
+    let millis = |d: Duration| (d.as_secs_f64() * 10_000.0).round() / 10.0;
+    let timeline = |phases: &[(String, Duration)]| {
+        phases
+            .iter()
+            .map(|(name, at)| serde_json::json!([name, millis(*at)]))
+            .collect::<Vec<_>>()
+    };
+    serde_json::json!({
+        "connect_ms": millis(metrics.connect),
+        "start_ms": metrics.start.map(millis),
+        "total_ms": millis(metrics.total),
+        "memory_peak_bytes": metrics.memory_peak_bytes,
+        "phases_ms": timeline(&metrics.phases),
+        "guest_phases_ms": timeline(&metrics.guest_phases),
     })
 }

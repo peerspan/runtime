@@ -7,6 +7,7 @@
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read};
 use std::net::Shutdown;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,7 @@ use anyhow::{Context, bail};
 use peerspan_runtime_protocol::{self as protocol, DATA_CHUNK, Message, WORKSPACE_TAG};
 
 use crate::cgroup::{Limits, RunCgroup};
+use crate::phases;
 
 use crate::launcher::{AGENT_SOCKET, WORKSPACE_SOCKET};
 
@@ -60,6 +62,8 @@ pub struct VmSpec {
     pub console_log: Option<PathBuf>,
     /// The cgroup v2 directory each run's own cgroup is created in.
     pub cgroup_root: PathBuf,
+    /// Extra kernel command-line arguments, for experiments.
+    pub kernel_args: Option<String>,
     /// The command; its `archive` flag is set from `archive` above.
     pub command: protocol::Command,
 }
@@ -104,6 +108,21 @@ pub struct Metrics {
     pub total: Duration,
     /// The most host memory the VMM and the workspace server used together.
     pub memory_peak_bytes: Option<u64>,
+    /// When the supervisor and the launcher reached each step, since the start of `run`.
+    pub phases: Vec<(String, Duration)>,
+    /// When guest init reached each step, by the guest's boot clock.
+    pub guest_phases: Vec<(String, Duration)>,
+}
+
+/// What the conversation with the guest has reached, shared with the watchdog.
+#[derive(Debug, Default)]
+struct Progress {
+    /// When the command started.
+    started: Option<Instant>,
+    /// Host stamps of the conversation's steps.
+    stamps: Vec<(String, u64)>,
+    /// The guest's own phases, in microseconds of its boot clock.
+    guest_phases: Vec<(String, u64)>,
 }
 
 /// Why the watchdog stopped a run.
@@ -127,6 +146,9 @@ pub fn run(
 ) -> anyhow::Result<Outcome> {
     let options = spec;
     let began = Instant::now();
+    let began_ns = phases::monotonic_ns();
+    let mut stamps: Vec<(String, u64)> = Vec::new();
+    let mut mark = |name: &str| stamps.push((name.to_owned(), phases::monotonic_ns()));
     if let Some(archive) = &options.archive
         && fs::read_dir(&options.workspace)?.next().is_some()
     {
@@ -157,6 +179,7 @@ pub fn run(
             guest_memory_mib: options.memory_mib,
         },
     )?;
+    mark("cgroup");
     let console_path = options
         .console_log
         .clone()
@@ -178,6 +201,7 @@ pub fn run(
     wait_for_path(&workspace_socket, SERVER_READY_TIMEOUT)
         .context("workspace server did not create its socket")?;
     chown(&workspace_socket, id)?;
+    mark("workspace_server");
 
     let agent_socket = sockets.join(AGENT_SOCKET);
     let listener = UnixListener::bind(&agent_socket)
@@ -186,61 +210,92 @@ pub fn run(
 
     let console = File::create(&console_path)
         .with_context(|| format!("creating {}", console_path.display()))?;
+    let (mut phase_reader, phase_writer) = io::pipe()?;
     let launched = Instant::now();
+    mark("launched");
+    let mut launcher_command =
+        Command::new(std::env::current_exe().context("locating this executable")?);
+    join_cgroup(&mut launcher_command, &cgroup);
+    pass_fd(&mut launcher_command, phase_writer.as_raw_fd(), PHASES_FD);
     let mut launcher = ChildGuard(
-        join_cgroup(
-            &mut Command::new(std::env::current_exe().context("locating this executable")?),
-            &cgroup,
-        )
-        .arg("launch")
-        .arg("--libkrun")
-        .arg(&options.libkrun)
-        .arg("--kernel")
-        .arg(&guest.kernel)
-        .arg("--initrd")
-        .arg(&guest.initrd)
-        .arg("--rootfs")
-        .arg(&guest.rootfs)
-        .arg("--sockets")
-        .arg(&sockets)
-        .arg("--jail")
-        .arg(&jail)
-        .arg("--uid")
-        .arg(id.to_string())
-        .arg("--gid")
-        .arg(id.to_string())
-        .arg("--cpus")
-        .arg(options.cpus.to_string())
-        .arg("--memory-mib")
-        .arg(options.memory_mib.to_string())
-        .stdin(Stdio::null())
-        .stdout(console.try_clone()?)
-        .stderr(console)
-        .spawn()
-        .context("starting the launcher")?,
+        launcher_command
+            .arg("launch")
+            .arg("--phases-fd")
+            .arg(PHASES_FD.to_string())
+            .arg("--libkrun")
+            .arg(&options.libkrun)
+            .arg("--kernel")
+            .arg(&guest.kernel)
+            .arg("--initrd")
+            .arg(&guest.initrd)
+            .arg("--rootfs")
+            .arg(&guest.rootfs)
+            .arg("--sockets")
+            .arg(&sockets)
+            .arg("--jail")
+            .arg(&jail)
+            .arg("--uid")
+            .arg(id.to_string())
+            .arg("--gid")
+            .arg(id.to_string())
+            .arg("--cpus")
+            .arg(options.cpus.to_string())
+            .arg("--memory-mib")
+            .arg(options.memory_mib.to_string())
+            .args(
+                options
+                    .kernel_args
+                    .iter()
+                    .flat_map(|extra| ["--kernel-args", extra.as_str()]),
+            )
+            .stdin(Stdio::null())
+            .stdout(console.try_clone()?)
+            .stderr(console)
+            .spawn()
+            .context("starting the launcher")?,
     );
+    drop(phase_writer);
 
     let stream = match accept_guest(&listener, &mut launcher.0, cancel) {
         Ok(stream) => stream,
         Err(e) => return Err(e.context(console_tail(&console_path))),
     };
     let connect = launched.elapsed();
-    let started = Mutex::new(None);
-    let mut outcome = serve_guest(spec, stream, &cgroup, &started, cancel, on_event);
+    mark("connected");
+    let progress = Mutex::new(Progress::default());
+    let mut outcome = serve_guest(spec, stream, &cgroup, &progress, cancel, on_event);
     if cgroup.oom_killed() && outcome.exit_code.is_none() && !outcome.timed_out {
         outcome.error = Some("the VM exceeded its memory limit and was killed".into());
     }
-    if wait_with_timeout(&mut launcher.0, SHUTDOWN_TIMEOUT)?.is_none() {
+    let shut_down = wait_with_timeout(&mut launcher.0, SHUTDOWN_TIMEOUT)?.is_some();
+    if !shut_down {
         eprintln!("peerspan-runtime: the VM did not shut down; stopping it");
     }
+    mark("vm_exited");
+    let progress = progress.into_inner().expect("lock poisoned");
+    if shut_down {
+        // Every writer has exited, so this reads to the end without blocking.
+        let mut text = String::new();
+        let _ = phase_reader.read_to_string(&mut text);
+        stamps.extend(phases::parse(&text));
+    }
+    stamps.extend(progress.stamps);
+    stamps.sort_by_key(|(_, ns)| *ns);
+    let since_start = |ns: u64| Duration::from_nanos(ns.saturating_sub(began_ns));
     outcome.metrics = Metrics {
         connect,
-        start: started
-            .lock()
-            .expect("lock poisoned")
-            .map(|at| at.duration_since(launched)),
+        start: progress.started.map(|at| at.duration_since(launched)),
         total: began.elapsed(),
         memory_peak_bytes: cgroup.memory_peak(),
+        phases: stamps
+            .into_iter()
+            .map(|(name, ns)| (name, since_start(ns)))
+            .collect(),
+        guest_phases: progress
+            .guest_phases
+            .into_iter()
+            .map(|(name, micros)| (name, Duration::from_micros(micros)))
+            .collect(),
     };
     Ok(outcome)
 }
@@ -251,7 +306,7 @@ fn serve_guest(
     spec: &VmSpec,
     mut stream: UnixStream,
     cgroup: &RunCgroup,
-    started: &Mutex<Option<Instant>>,
+    progress: &Mutex<Progress>,
     cancel: &AtomicBool,
     on_event: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
 ) -> Outcome {
@@ -264,9 +319,10 @@ fn serve_guest(
             let Ok(watched) = watched else { return };
             while !done.load(Ordering::Relaxed) {
                 let timed_out = spec.timeout.is_some_and(|limit| {
-                    started
+                    progress
                         .lock()
                         .expect("lock poisoned")
+                        .started
                         .is_some_and(|at| at.elapsed() >= limit)
                 });
                 let stop = if cancel.load(Ordering::Relaxed) {
@@ -285,11 +341,12 @@ fn serve_guest(
                 thread::sleep(WATCH_INTERVAL);
             }
         });
-        let result = converse(spec, &mut stream, started, on_event);
+        let result = converse(spec, &mut stream, progress, on_event);
         done.store(true, Ordering::Relaxed);
-        let ran_for = started
+        let ran_for = progress
             .lock()
             .expect("lock poisoned")
+            .started
             .map(|at| at.elapsed());
         outcome.duration = ran_for.unwrap_or_default();
         match (*stopped.lock().expect("lock poisoned"), result) {
@@ -318,9 +375,15 @@ enum Ended {
 fn converse(
     spec: &VmSpec,
     stream: &mut UnixStream,
-    started: &Mutex<Option<Instant>>,
+    progress: &Mutex<Progress>,
     on_event: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
 ) -> anyhow::Result<Ended> {
+    let stamp = |name: &str| {
+        let mut progress = progress.lock().expect("lock poisoned");
+        progress
+            .stamps
+            .push((name.to_owned(), phases::monotonic_ns()));
+    };
     let mut command = spec.command.clone();
     command.archive = spec.archive.is_some();
     Message::Run(command)
@@ -334,8 +397,12 @@ fn converse(
         let message = Message::read_from(stream).context("reading from the guest")?;
         match message {
             Some(Message::Started) => {
-                *started.lock().expect("lock poisoned") = Some(Instant::now());
+                progress.lock().expect("lock poisoned").started = Some(Instant::now());
+                stamp("started");
                 on_event(Event::Started)?;
+            }
+            Some(Message::Phases(phases)) => {
+                progress.lock().expect("lock poisoned").guest_phases = phases;
             }
             Some(Message::Stdout(bytes)) => on_event(Event::Stdout(&bytes))?,
             Some(Message::Stderr(bytes)) => on_event(Event::Stderr(&bytes))?,
@@ -343,6 +410,7 @@ fn converse(
             Some(Message::Deleted(bytes)) => on_event(Event::Deleted(&bytes))?,
             Some(Message::Failed(reason)) => failure = Some(reason),
             Some(Message::Exited { code, signal }) => {
+                stamp("exited");
                 return Ok(match failure {
                     Some(reason) => Ended::Failed(reason),
                     None => Ended::Exited { code, signal },
@@ -363,6 +431,24 @@ fn send_archive(path: &Path, stream: &mut UnixStream) -> io::Result<()> {
             return Message::ArchiveEnd.write_to(stream);
         }
         Message::ArchiveData(buf[..n].to_vec()).write_to(stream)?;
+    }
+}
+
+/// The descriptor number the launcher receives the phase pipe on.
+const PHASES_FD: RawFd = 3;
+
+/// Makes `fd` available to `command`'s process as `target`.
+fn pass_fd(command: &mut Command, fd: RawFd, target: RawFd) {
+    // SAFETY: the hook only calls dup2(2), which is async-signal-safe, on a descriptor that stays
+    // open until after the child has started; dup2 clears close-on-exec on the copy.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(fd, target) == target {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
     }
 }
 

@@ -54,9 +54,12 @@ extern "C" fn main(_argc: libc::c_int, _argv: *const *const libc::c_char) -> lib
         eprintln!("peerspan-guest-init: not PID 1; it runs only as a VM's init");
         return 1;
     }
-    let result = std::panic::catch_unwind(|| {
+    let mut phases = Phases::default();
+    phases.mark("init");
+    let result = std::panic::catch_unwind(move || {
         attach_console();
-        run()
+        phases.mark("console");
+        run(phases)
     });
     match result {
         Ok(Ok(())) => {}
@@ -105,10 +108,29 @@ fn attach_console() {
     }
 }
 
-fn run() -> io::Result<()> {
+/// When init reached each step, by the guest's boot clock, for the host's measurements.
+#[derive(Debug, Default)]
+struct Phases(Vec<(String, u64)>);
+
+impl Phases {
+    fn mark(&mut self, name: &str) {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: now is a valid out-pointer.
+        unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &raw mut now) };
+        let micros = u64::try_from(now.tv_sec).unwrap_or(0) * 1_000_000
+            + u64::try_from(now.tv_nsec).unwrap_or(0) / 1_000;
+        self.0.push((name.to_owned(), micros));
+    }
+}
+
+fn run(mut phases: Phases) -> io::Result<()> {
     mount("proc", "/proc", "proc", 0)?;
     mount("sysfs", "/sys", "sysfs", 0)?;
     load_modules()?;
+    phases.mark("modules");
 
     mount(ROOTFS_TAG, NEW_ROOT, "virtiofs", libc::MS_RDONLY)?;
     mount(
@@ -124,8 +146,10 @@ fn run() -> io::Result<()> {
     mount("tmpfs", &format!("{NEW_ROOT}/run"), "tmpfs", 0)?;
     unix_fs::chroot(NEW_ROOT)?;
     std::env::set_current_dir("/")?;
+    phases.mark("mounted");
 
     let stream = connect_host(AGENT_PORT)?;
+    phases.mark("connected");
     let mut reader = stream.try_clone()?;
     let command = match Message::read_from(&mut reader)? {
         Some(Message::Run(command)) => command,
@@ -144,9 +168,10 @@ fn run() -> io::Result<()> {
     } else {
         workspace::Manifest::new()
     };
+    phases.mark("unpacked");
 
     let writer = Arc::new(Mutex::new(stream));
-    let Some((code, signal)) = execute(&command, &writer) else {
+    let Some((code, signal)) = execute(&command, &writer, phases) else {
         return Message::Exited {
             code: None,
             signal: None,
@@ -268,7 +293,11 @@ fn connect_vsock(cid: u32, port: u32) -> io::Result<File> {
 
 /// Runs the command, streaming its output, and returns its exit code or signal, or `None` if it
 /// could not be started, after reporting why.
-fn execute(command: &Command, writer: &Arc<Mutex<File>>) -> Option<(Option<i32>, Option<i32>)> {
+fn execute(
+    command: &Command,
+    writer: &Arc<Mutex<File>>,
+    mut phases: Phases,
+) -> Option<(Option<i32>, Option<i32>)> {
     let lock = || writer.lock().expect("stream lock poisoned");
     let Some((program, args)) = command.argv.split_first() else {
         let _ = Message::Failed("empty command".into()).write_to(&mut *lock());
@@ -291,7 +320,12 @@ fn execute(command: &Command, writer: &Arc<Mutex<File>>) -> Option<(Option<i32>,
             return None;
         }
     };
-    if Message::Started.write_to(&mut *lock()).is_err() {
+    phases.mark("spawned");
+    let report = Message::Phases(phases.0).write_to(&mut *lock());
+    if report
+        .and_then(|()| Message::Started.write_to(&mut *lock()))
+        .is_err()
+    {
         let _ = child.kill();
     }
     let stdout = child.stdout.take().expect("stdout is piped");

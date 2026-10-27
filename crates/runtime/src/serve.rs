@@ -341,6 +341,7 @@ fn execute(runtime: &Runtime, run: &Run) {
                 ))),
                 console_log: Some(run.dir.join("console.log")),
                 cgroup_root: runtime.args.cgroup_root.clone(),
+                kernel_args: None,
                 command: peerspan_runtime_protocol::Command {
                     argv: request.argv.clone(),
                     cwd: request.cwd.clone(),
