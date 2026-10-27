@@ -307,7 +307,11 @@ pub fn run(
     if cgroup.oom_killed() && outcome.exit_code.is_none() && !outcome.timed_out {
         outcome.error = Some("the VM exceeded its memory limit and was killed".into());
     }
-    let shut_down = wait_with_timeout(&mut launcher.0, SHUTDOWN_TIMEOUT)?.is_some();
+    let status = wait_with_timeout(&mut launcher.0, SHUTDOWN_TIMEOUT)?;
+    if status.is_some_and(killed_by_seccomp) && outcome.exit_code.is_none() {
+        outcome.error = Some(SECCOMP_KILLED.into());
+    }
+    let shut_down = status.is_some();
     if !shut_down {
         eprintln!("peerspan-runtime: the VM did not shut down; stopping it");
     }
@@ -528,6 +532,15 @@ fn join_cgroup<'cmd>(command: &'cmd mut Command, cgroup: &RunCgroup) -> &'cmd mu
     }
 }
 
+const SECCOMP_KILLED: &str = "the VMM made a system call its seccomp filter does not allow \
+    and was killed; the kernel log names the call";
+
+/// Whether the launcher reports that its VMM was killed by its seccomp filter: the launcher
+/// exits with 128 plus the signal that ended the VMM, and seccomp kills with SIGSYS.
+fn killed_by_seccomp(status: std::process::ExitStatus) -> bool {
+    status.code() == Some(128 + libc::SIGSYS)
+}
+
 /// Waits for the guest to connect, failing early if the launcher exits first or the run is
 /// cancelled.
 fn accept_guest(
@@ -547,6 +560,9 @@ fn accept_guest(
             Err(e) => return Err(e).context("accepting the guest connection"),
         }
         if let Some(status) = launcher.try_wait()? {
+            if killed_by_seccomp(status) {
+                bail!("{SECCOMP_KILLED}");
+            }
             bail!("the VM exited before the guest connected ({status})");
         }
         if cancel.load(Ordering::Relaxed) {

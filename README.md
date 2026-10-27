@@ -120,11 +120,12 @@ is confined before libkrun sees any guest input:
   initramfs, the run's two sockets, `/dev/kvm`, and its own `/proc`;
 - its own user and group, a fresh ID per run with only the `kvm` group, no capabilities,
   `no_new_privs`, and not dumpable;
-- a seccomp filter, installed before libkrun starts any thread, that refuses with `EPERM` the
-  calls a VMM never needs: `execve`, mounts and namespace changes, `ptrace` and cross-process
-  memory access, `bpf`, `perf_event_open`, `userfaultfd`, keyrings, kernel modules, `kexec`,
-  and host-wide settings such as the clock and `reboot`. It is a deny-list for now; an
-  allow-list traced from libkrun's actual calls would be tighter.
+- a seccomp allow-list, installed before libkrun starts any thread: the calls the VMM was
+  seen to make across `scripts/check.sh`, those libkrun's read-only file server makes, and
+  those the C and Rust runtimes make on rarer paths, about 80 in all. Sockets are Unix sockets
+  only, `clone` cannot create namespaces, and `clone3`, whose flags seccomp cannot inspect,
+  fails so the C library falls back to `clone`. Any other call kills the VMM; the run fails
+  saying so, and the kernel log names the call.
 
 Each run also gets its own cgroup v2, under `/sys/fs/cgroup/peerspan-runtime` by default
 (`--cgroup-root`), which the VMM, the workspace server and passt join before they run any code
@@ -140,7 +141,7 @@ run directories.
 
 The workspace server runs in `virtiofsd`'s namespace sandbox with its seccomp filter, so its
 file access stays inside the workspace. Setting this up needs root, as Firecracker's jailer
-does. Not yet: a seccomp allow-list, I/O limits, and running the workspace server as the run's
+does. Not yet: I/O and disk limits, and running the workspace server as the run's
 user. `scripts/check.sh` inspects a running VM from the host to
 check the confinement above.
 
