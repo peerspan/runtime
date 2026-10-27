@@ -42,6 +42,7 @@ const CONNECT_ATTEMPTS: u32 = 100;
 const CONNECT_RETRY: Duration = Duration::from_millis(50);
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+mod net;
 mod workspace;
 
 /// How long init waits for the console before running without one.
@@ -146,6 +147,7 @@ fn run(mut phases: Phases) -> io::Result<()> {
     mount("tmpfs", &format!("{NEW_ROOT}/run"), "tmpfs", 0)?;
     unix_fs::chroot(NEW_ROOT)?;
     std::env::set_current_dir("/")?;
+    net::loopback_up()?;
     phases.mark("mounted");
 
     let stream = connect_host(AGENT_PORT)?;
@@ -159,6 +161,12 @@ fn run(mut phases: Phases) -> io::Result<()> {
             )));
         }
     };
+    if command.network {
+        if let Err(e) = net::configure() {
+            return fail(&mut reader, &format!("setting up the network: {e}"));
+        }
+        phases.mark("network");
+    }
     let workspace = Path::new(WORKSPACE_PATH);
     let manifest = if command.archive {
         match workspace::unpack(&mut reader, workspace) {

@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tiny_http::{Header, Method, Request, Response, Server};
 
+use crate::net::Level;
 use crate::vm::{self, Event, Outcome, VmSpec};
 
 /// Largest request body accepted, as on the daemon's `admin.sock`.
@@ -54,6 +55,12 @@ pub struct ServeArgs {
         default_value = "/usr/libexec/virtiofsd"
     )]
     virtiofsd: PathBuf,
+    /// passt binary that carries guests' network traffic.
+    #[arg(long, env = "PEERSPAN_PASST", default_value = "passt")]
+    passt: PathBuf,
+    /// The most network a run may ask for; the host owner's ceiling.
+    #[arg(long, value_enum, default_value_t = Level::Internet)]
+    max_network: Level,
     /// Directory for runs' workspaces and results.
     #[arg(long, default_value = "/var/lib/peerspan-runtime")]
     state: PathBuf,
@@ -84,6 +91,13 @@ struct RunRequest {
     resources: Resources,
     workspace_archive: Option<PathBuf>,
     results: Results,
+    /// What the guest may reach; none when the request does not say.
+    #[serde(default = "no_network")]
+    network: Level,
+}
+
+fn no_network() -> Level {
+    Level::None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -252,6 +266,16 @@ fn start(runtime: &Arc<Runtime>, body: &[u8]) -> (u16, Value) {
     {
         return error(422, "too_large", "resources exceed this runtime's maximums");
     }
+    if request.network > args.max_network {
+        return error(
+            422,
+            "too_large",
+            &format!(
+                "network {} exceeds this runtime's maximum, {}",
+                request.network, args.max_network
+            ),
+        );
+    }
 
     let mut runs = runtime.runs.lock().expect("runs lock poisoned");
     if let Some(existing) = runs.get(&request.run_id) {
@@ -334,6 +358,8 @@ fn execute(runtime: &Runtime, run: &Run) {
                 guest: runtime.args.guest.clone(),
                 libkrun: runtime.args.libkrun.clone(),
                 virtiofsd: runtime.args.virtiofsd.clone(),
+                passt: runtime.args.passt.clone(),
+                network: request.network,
                 cpus: request.resources.cpus,
                 memory_mib: request.resources.memory_mib,
                 timeout: Some(Duration::from_secs(u64::from(
@@ -348,6 +374,7 @@ fn execute(runtime: &Runtime, run: &Run) {
                     env: request.env.clone().into_iter().collect(),
                     archive: false,
                     collect_changes: request.results == Results::Changes,
+                    network: false,
                 },
             };
             let outcome = vm::run(&spec, &run.cancel, &mut |event| results.record(run, &event))

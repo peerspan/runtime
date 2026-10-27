@@ -76,7 +76,8 @@ def main():
     state = os.path.join(work, "state")
     server = subprocess.Popen([os.environ["PEERSPAN_RUNTIME_BIN"], "serve", "--socket", sock,
                                "--state", state, "--max-cpus", "2", "--max-memory-mib", "2048",
-                               "--max-seconds", "120", "--max-concurrent-runs", "1"],
+                               "--max-seconds", "120", "--max-concurrent-runs", "1",
+                               "--max-network", "internet"],
                               stderr=subprocess.DEVNULL)
     try:
         for _ in range(100):
@@ -124,6 +125,12 @@ def main():
 
         status, _ = call(sock, "POST", "/v1/runs", request(3, ["true"], cpus=3))
         check("too-large", status == 422, status)
+
+        # A run may not ask for more network than the host owner's maximum, nor an unknown level.
+        status, _ = call(sock, "POST", "/v1/runs", {**request(90, ["true"]), "network": "internet+lan"})
+        check("network-too-large", status == 422, status)
+        status, _ = call(sock, "POST", "/v1/runs", {**request(91, ["true"]), "network": "everything"})
+        check("network-invalid", status == 400, status)
 
         status, _ = call(sock, "POST", "/v1/runs", request(4, ["sleep", "60"], results="none"))
         time.sleep(3)

@@ -7,6 +7,7 @@ mod cgroup;
 mod jail;
 mod krun;
 mod launcher;
+mod net;
 mod phases;
 mod seccomp;
 mod serve;
@@ -80,6 +81,12 @@ struct RunArgs {
         default_value = "/usr/libexec/virtiofsd"
     )]
     virtiofsd: PathBuf,
+    /// What the guest may reach.
+    #[arg(long, value_enum, default_value_t = net::Level::Internet)]
+    network: net::Level,
+    /// passt binary that carries the guest's network traffic.
+    #[arg(long, env = "PEERSPAN_PASST", default_value = "passt")]
+    passt: PathBuf,
     /// Virtual CPUs.
     #[arg(long, default_value_t = 2)]
     cpus: u8,
@@ -145,6 +152,8 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
         guest: args.guest,
         libkrun: args.libkrun,
         virtiofsd: args.virtiofsd,
+        passt: args.passt,
+        network: args.network,
         cpus: args.cpus,
         memory_mib: args.memory_mib,
         timeout: args.timeout_seconds.map(Duration::from_secs),
@@ -157,6 +166,7 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
             env: args.env,
             archive: false,
             collect_changes,
+            network: false,
         },
     };
     let mut stdout = io::stdout().lock();

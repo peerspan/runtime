@@ -70,6 +70,11 @@ impl RunCgroup {
         Ok(cgroup)
     }
 
+    /// The cgroup's directory.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// A descriptor for `cgroup.procs`; a child that writes `0` to it before exec joins.
     pub fn procs_fd(&self) -> RawFd {
         self.procs.as_raw_fd()

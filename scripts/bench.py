@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--runs", type=int, default=20)
     parser.add_argument("--cpus", type=int, default=2)
     parser.add_argument("--memory-mib", type=int, default=1024)
+    parser.add_argument("--network", default="internet", choices=["none", "internet", "internet+lan"])
     parser.add_argument("--label", default="")
     parser.add_argument("--record", action="store_true")
     parser.add_argument("command", nargs="*", default=["true"])
@@ -50,7 +51,8 @@ def main():
         # One unmeasured boot first, so page-cache state does not skew the first sample.
         for i in range(args.runs + 1):
             subprocess.run([binary, "run", "--workspace", str(workspace), "--cpus", str(args.cpus),
-                            "--memory-mib", str(args.memory_mib), "--metrics", str(metrics_file),
+                            "--memory-mib", str(args.memory_mib), "--network", args.network,
+                            "--metrics", str(metrics_file),
                             "--", *args.command],
                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if i == 0:
@@ -92,7 +94,7 @@ def main():
             (line.split()[2] for line in (guest / "kernel.config").read_text().splitlines()
              if line.startswith("# Linux/")), None)
         entry = {"at": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
-                 "label": args.label, "commit": commit, "kernel": kernel or "distribution",
+                 "label": args.label, "network": args.network, "commit": commit, "kernel": kernel or "distribution",
                  "host": {"cpus": os.cpu_count(), "kernel": platform.release()},
                  "runs": args.runs, "command": args.command, "cpus": args.cpus,
                  "memory_mib": args.memory_mib, **summary}

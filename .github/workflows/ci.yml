@@ -34,7 +34,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang libclang-dev virtiofsd zstd cpio \
-            flex bison bc libelf-dev
+            flex bison bc libelf-dev passt nftables
 
       - name: Add musl target
         run: rustup target add x86_64-unknown-linux-musl
@@ -42,7 +42,7 @@ jobs:
       - name: Build libkrun from peerspan/libkrun
         run: |
           git clone --depth 1 --branch peerspan https://github.com/peerspan/libkrun "$RUNNER_TEMP/libkrun"
-          make -C "$RUNNER_TEMP/libkrun" VHOST_USER=1
+          make -C "$RUNNER_TEMP/libkrun" VHOST_USER=1 NET=1
           echo "PEERSPAN_LIBKRUN=$RUNNER_TEMP/libkrun/target/release/libkrun.so.2.0.0" >> "$GITHUB_ENV"
 
       - name: Enable KVM group perms

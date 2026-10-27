@@ -52,6 +52,9 @@ pub struct LaunchArgs {
     /// Descriptor to write step timestamps to, for measurement.
     #[arg(long)]
     pub phases_fd: Option<i32>,
+    /// Connected stream socket to the guest's network backend (passt); no network without it.
+    #[arg(long)]
+    pub net_fd: Option<i32>,
 }
 
 /// Confines this process and boots the VM described by `args`.
@@ -98,6 +101,7 @@ pub fn launch(args: &LaunchArgs) -> anyhow::Result<Infallible> {
             workspace_socket: &workspace_socket,
             agent_port: AGENT_PORT,
             agent_socket: &agent_socket,
+            net_fd: args.net_fd,
         },
         &mut || phases.mark("vm_built"),
     )

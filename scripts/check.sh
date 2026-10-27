@@ -4,7 +4,8 @@
 #
 # End-to-end checks: boots real microVMs with `peerspan-runtime run`.
 # Needs root, /dev/kvm, a guest image (scripts/build-guest.sh), PEERSPAN_RUNTIME_GUEST pointing
-# at it, and PEERSPAN_LIBKRUN pointing at a libkrun built with `make VHOST_USER=1`.
+# at it, PEERSPAN_LIBKRUN pointing at a libkrun built with `make VHOST_USER=1 NET=1`, and passt,
+# nft and ip on PATH.
 # PEERSPAN_RUNTIME_BIN names a built binary; without it the script builds one.
 set -eu
 
@@ -157,6 +158,95 @@ else
 fi
 wait "$run_pid" || fail "confinement: the run failed"
 [ -n "${cg:-}" ] && [ -d "/sys/fs/cgroup$cg" ] && fail "confinement: cgroup $cg left behind"
+
+# Network levels (decision 5). Targets: a public address; the metadata address; the host's own
+# addresses (public, Docker's bridge if any, and a veth); a private peer that is not the host
+# (a network namespace behind that veth); the gateway address and host loopback. TCP probes
+# connect; UDP probes send one datagram that the host side counts.
+pub=$(hostname -I | awk '{print $1}')
+docker=$(ip -4 -o addr show docker0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+ns=pscheck$$
+ip netns add "$ns"
+ip link add "${ns}a" type veth peer name "${ns}b"
+ip link set "${ns}b" netns "$ns"
+ip addr add 10.203.0.1/24 dev "${ns}a" && ip link set "${ns}a" up
+ip -n "$ns" addr add 10.203.0.2/24 dev "${ns}b" && ip -n "$ns" link set "${ns}b" up
+listen='import socket, sys, time
+kind, host, port, log = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM if kind == "udp" else socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((host, port))
+if kind == "tcp":
+    s.listen(16)
+    time.sleep(600)
+while True:
+    s.recv(64)
+    open(log, "a").write("hit\n")'
+python3 -c "$listen" tcp 0.0.0.0 47011 - & listeners=$!
+python3 -c "$listen" tcp 127.0.0.1 47013 - & listeners="$listeners $!"
+python3 -c "$listen" udp 0.0.0.0 47014 "$work/udp-host" & listeners="$listeners $!"
+ip netns exec "$ns" python3 -c "$listen" tcp 10.203.0.2 47012 - & listeners="$listeners $!"
+ip netns exec "$ns" python3 -c "$listen" udp 10.203.0.2 47015 "$work/udp-peer" & listeners="$listeners $!"
+trap 'kill $listeners 2>/dev/null; ip netns del "$ns"; ip link del "${ns}a" 2>/dev/null; rm -rf "$work"' EXIT
+sleep 0.5
+targets="1.1.1.1:80 169.254.169.254:80 $pub:47011 ${docker:+$docker:47011} 10.203.0.1:47011"
+targets="$targets 10.203.0.2:47012 10.0.2.2:47013 127.0.0.1:47013"
+probe='for t in '$targets'; do
+  nc -w 3 ${t%:*} ${t#*:} </dev/null 2>/dev/null && echo "$t open" || echo "$t refused"
+done
+for t in '$pub':47014 10.203.0.2:47015; do echo hit | nc -u -w 1 ${t%:*} ${t#*:} 2>/dev/null; done
+nslookup example.com >/dev/null 2>&1 && echo "dns open" || echo "dns refused"
+echo "interfaces $(ls /sys/class/net | tr "\n" " ")"'
+# expect LEVEL REACHABLE...: what a guest at LEVEL reaches, everything else refused.
+expect_network() {
+  level=$1
+  shift
+  : > "$work/udp-host"
+  : > "$work/udp-peer"
+  if ! "$bin" run --network "$level" --workspace "$work/ws" -- sh -c "$probe" \
+    > "$work/out" 2> "$work/err"; then
+    fail "network-$level: run failed: $(tail -3 "$work/err")"
+    return
+  fi
+  problems=""
+  for t in $targets; do
+    want=refused
+    for open in "$@"; do [ "$open" = "$t" ] && want=open; done
+    grep -qx "$t $want" "$work/out" || problems="$problems $t-not-$want"
+  done
+  sleep 0.2
+  [ -s "$work/udp-host" ] && problems="$problems udp-reached-host"
+  case " $* " in
+    *" 10.203.0.2:47012 "*) [ -s "$work/udp-peer" ] || problems="$problems udp-peer-not-reached" ;;
+    *) [ -s "$work/udp-peer" ] && problems="$problems udp-reached-peer" ;;
+  esac
+  dns=refused
+  [ "$level" = none ] || dns=open
+  grep -qx "dns $dns" "$work/out" || problems="$problems dns-not-$dns"
+  interfaces="eth0 lo "
+  [ "$level" = none ] && interfaces="lo "
+  grep -qx "interfaces $interfaces" "$work/out" || problems="$problems $(grep interfaces "$work/out")"
+  [ -z "$problems" ] && pass "network-$level" || fail "network-$level:$problems"
+}
+expect_network none
+expect_network internet 1.1.1.1:80
+expect_network internet+lan 1.1.1.1:80 10.203.0.2:47012
+
+# Fail closed: a process in the runtime's cgroups with no run chain reaches nothing.
+probe_cg=/sys/fs/cgroup/peerspan-runtime/fail-closed-$$
+mkdir "$probe_cg"
+closed=$(sh -c "echo \$\$ > $probe_cg/cgroup.procs; exec python3 -c '
+import socket
+s = socket.socket(); s.settimeout(3)
+try:
+    s.connect((\"1.1.1.1\", 80)); print(\"open\")
+except OSError:
+    print(\"refused\")'")
+rmdir "$probe_cg"
+[ "$closed" = refused ] && pass network-fail-closed || fail "network-fail-closed: $closed"
+
+left=$(nft list table inet peerspan_runtime | grep -c -e 'chain run-' -e '"peerspan-runtime/run-' || true)
+[ "$left" -eq 0 ] && pass network-cleanup || fail "network-cleanup: $left run entries left in nftables"
 
 leaked=$(( $(run_cgroups) - cgroups_before ))
 [ "$leaked" -le 0 ] && pass cgroup-cleanup || fail "cgroup-cleanup: $leaked run cgroups left behind"

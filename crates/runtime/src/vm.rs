@@ -23,6 +23,7 @@ use anyhow::{Context, bail};
 use peerspan_runtime_protocol::{self as protocol, DATA_CHUNK, Message, WORKSPACE_TAG};
 
 use crate::cgroup::{Limits, RunCgroup};
+use crate::net::{self, Level, RunFilter};
 use crate::phases;
 
 use crate::launcher::{AGENT_SOCKET, WORKSPACE_SOCKET};
@@ -55,6 +56,10 @@ pub struct VmSpec {
     pub guest: PathBuf,
     pub libkrun: PathBuf,
     pub virtiofsd: PathBuf,
+    /// The passt binary that carries the guest's network traffic.
+    pub passt: PathBuf,
+    /// What the guest may reach.
+    pub network: Level,
     pub cpus: u8,
     pub memory_mib: u32,
     /// How long the command may run once started.
@@ -203,6 +208,31 @@ pub fn run(
     chown(&workspace_socket, id)?;
     mark("workspace_server");
 
+    // Declared after the cgroup and dropped before it: passt first, then the filter, which
+    // names the cgroup by its path.
+    let mut network = None;
+    if options.network > Level::None {
+        let filter = RunFilter::install(cgroup.path(), options.network)?;
+        let (guest_end, passt_end) = UnixStream::pair()?;
+        let mut passt_command = Command::new(&options.passt);
+        join_cgroup(&mut passt_command, &cgroup);
+        pass_fd(&mut passt_command, passt_end.as_raw_fd(), PASST_FD);
+        let passt = ChildGuard(
+            passt_command
+                .arg("--fd")
+                .arg(PASST_FD.to_string())
+                .args(net::passt_args())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(File::create(run_dir.path.join("passt.log"))?)
+                .spawn()
+                .with_context(|| format!("starting {}", options.passt.display()))?,
+        );
+        drop(passt_end);
+        network = Some((guest_end, passt, filter));
+        mark("network");
+    }
+
     let agent_socket = sockets.join(AGENT_SOCKET);
     let listener = UnixListener::bind(&agent_socket)
         .with_context(|| format!("binding {}", agent_socket.display()))?;
@@ -217,6 +247,9 @@ pub fn run(
         Command::new(std::env::current_exe().context("locating this executable")?);
     join_cgroup(&mut launcher_command, &cgroup);
     pass_fd(&mut launcher_command, phase_writer.as_raw_fd(), PHASES_FD);
+    if let Some((guest_end, _, _)) = &network {
+        pass_fd(&mut launcher_command, guest_end.as_raw_fd(), NET_FD);
+    }
     let mut launcher = ChildGuard(
         launcher_command
             .arg("launch")
@@ -248,6 +281,11 @@ pub fn run(
                     .iter()
                     .flat_map(|extra| ["--kernel-args", extra.as_str()]),
             )
+            .args(
+                network
+                    .iter()
+                    .flat_map(|_| ["--net-fd".to_owned(), NET_FD.to_string()]),
+            )
             .stdin(Stdio::null())
             .stdout(console.try_clone()?)
             .stderr(console)
@@ -255,6 +293,7 @@ pub fn run(
             .context("starting the launcher")?,
     );
     drop(phase_writer);
+    let _network = network.map(|(_guest_end, passt, filter)| (passt, filter));
 
     let stream = match accept_guest(&listener, &mut launcher.0, cancel) {
         Ok(stream) => stream,
@@ -386,6 +425,7 @@ fn converse(
     };
     let mut command = spec.command.clone();
     command.archive = spec.archive.is_some();
+    command.network = spec.network > Level::None;
     Message::Run(command)
         .write_to(stream)
         .context("sending the command")?;
@@ -436,14 +476,24 @@ fn send_archive(path: &Path, stream: &mut UnixStream) -> io::Result<()> {
 
 /// The descriptor number the launcher receives the phase pipe on.
 const PHASES_FD: RawFd = 3;
+/// The descriptor number the launcher receives its end of the guest's network on.
+const NET_FD: RawFd = 4;
+/// The descriptor number passt receives its end of the guest's network on.
+const PASST_FD: RawFd = 3;
 
 /// Makes `fd` available to `command`'s process as `target`.
 fn pass_fd(command: &mut Command, fd: RawFd, target: RawFd) {
-    // SAFETY: the hook only calls dup2(2), which is async-signal-safe, on a descriptor that stays
-    // open until after the child has started; dup2 clears close-on-exec on the copy.
+    // SAFETY: the hook only calls dup2(2) and fcntl(2), which are async-signal-safe, on a
+    // descriptor that stays open until after the child has started. dup2 clears close-on-exec
+    // on the copy; when the descriptor already has the target number, fcntl clears it instead.
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(fd, target) == target {
+            let ok = if fd == target {
+                libc::fcntl(fd, libc::F_SETFD, 0) == 0
+            } else {
+                libc::dup2(fd, target) == target
+            };
+            if ok {
                 Ok(())
             } else {
                 Err(io::Error::last_os_error())

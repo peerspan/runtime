@@ -8,6 +8,7 @@
 
 use std::convert::Infallible;
 use std::ffi::{c_char, c_void};
+use std::os::fd::RawFd;
 use std::path::Path;
 use std::ptr;
 
@@ -28,6 +29,11 @@ const VIRTIO_ID_FS: u32 = 26;
 const GUEST_CID: u64 = 3;
 /// Two queues for virtiofsd: one high-priority queue and one request queue.
 const FS_QUEUE_SIZES: [u16; 2] = [1024, 1024];
+/// virtio-net features offered with a passt backend, as libkrun's examples use: checksum
+/// offload both ways, and TCP and UDP segmentation offload both ways.
+const NET_FEATURES: u32 = (1 << 0) | (1 << 1) | (1 << 7) | (1 << 10) | (1 << 11) | (1 << 14);
+/// The guest's MAC address, locally administered; every guest is alone on its network.
+const GUEST_MAC: [u8; 6] = [0x02, 0x50, 0x53, 0x00, 0x00, 0x01];
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -44,6 +50,13 @@ impl KrunStr {
             len: s.len(),
         }
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct KrunBytes {
+    data: *const u8,
+    len: usize,
 }
 
 #[repr(C)]
@@ -75,6 +88,9 @@ struct Api {
         unsafe extern "C" fn(u32, KrunStr, KrunStr, u16, *const u16, usize, *mut Handle) -> Handle,
     vsock_device_new: unsafe extern "C" fn(u64, u32, *mut Handle) -> Handle,
     vsock_device_add_unix_port: unsafe extern "C" fn(Handle, u32, KrunStr, bool),
+    /// Absent from a libkrun built without networking (`make NET=1`).
+    net_device_new_unixstream_fd:
+        Option<unsafe extern "C" fn(KrunStr, i32, KrunBytes, u32, u32, *mut Handle) -> Handle>,
     payload_load_external:
         unsafe extern "C" fn(KrunStr, u32, KrunStr, KrunStr, *mut Handle) -> Handle,
     vmm_builder_new: unsafe extern "C" fn() -> Handle,
@@ -103,6 +119,8 @@ pub struct VmConfig<'cfg> {
     pub workspace_socket: &'cfg str,
     pub agent_port: u32,
     pub agent_socket: &'cfg str,
+    /// A connected stream socket to passt, handed to libkrun; no network device without one.
+    pub net_fd: Option<RawFd>,
 }
 
 /// A loaded libkrun.
@@ -148,7 +166,8 @@ impl Libkrun {
         let api = &self.api;
         let mut err: Handle = ptr::null_mut();
 
-        // SAFETY: every call below passes handles that libkrun returned and has not consumed,
+        // SAFETY: every call below passes handles that libkrun returned and has not consumed, the
+        // network socket this process owns and gives to libkrun,
         // KrunStr values borrowed from strings that outlive the call, and a valid error out-pointer
         // that `check` resets after reading.
         unsafe {
@@ -206,6 +225,24 @@ impl Libkrun {
                 false,
             );
             (api.mmio_device_manager_add)(devices, vsock);
+
+            if let Some(fd) = config.net_fd {
+                let Some(new_net) = api.net_device_new_unixstream_fd else {
+                    bail!("this libkrun was built without networking (make NET=1)");
+                };
+                let net = new_net(
+                    KrunStr::new("eth0"),
+                    fd,
+                    KrunBytes {
+                        data: GUEST_MAC.as_ptr(),
+                        len: GUEST_MAC.len(),
+                    },
+                    NET_FEATURES,
+                    0,
+                    &mut err,
+                );
+                (api.mmio_device_manager_add)(devices, api.handle(net, &mut err, "network")?);
+            }
 
             let payload = (api.payload_load_external)(
                 KrunStr::new(config.kernel),
@@ -265,6 +302,12 @@ impl Api {
             vhost_user_device_new: sym!("krun_vhost_user_device_new"),
             vsock_device_new: sym!("krun_vsock_device_new"),
             vsock_device_add_unix_port: sym!("krun_vsock_device_add_unix_port"),
+            // SAFETY: as for sym! above.
+            net_device_new_unixstream_fd: unsafe {
+                library.get(b"krun_net_device_new_unixstream_fd\0")
+            }
+            .ok()
+            .map(|symbol| *symbol),
             payload_load_external: sym!("krun_payload_load_external"),
             vmm_builder_new: sym!("krun_vmm_builder_new"),
             vmm_builder_vcpus: sym!("krun_vmm_builder_vcpus"),

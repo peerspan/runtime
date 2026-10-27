@@ -83,5 +83,7 @@ rm -rf "$out/rootfs"
 mkdir -p "$out/rootfs"
 tar -xzf "$cache/$tarball" -C "$out/rootfs"
 mkdir -p "$out/rootfs/workspace"
+# Guest init binds the run's DNS settings over this file; the root filesystem is read-only.
+: > "$out/rootfs/etc/resolv.conf"
 
 echo "guest image in $out (kernel $ver, $(wc -l < "$initramfs/lib/modules/order") modules)"

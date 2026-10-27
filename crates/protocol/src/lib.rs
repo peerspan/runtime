@@ -24,6 +24,14 @@ pub const WORKSPACE_TAG: &str = "workspace";
 /// Where the workspace is mounted inside the guest's root filesystem.
 pub const WORKSPACE_PATH: &str = "/workspace";
 
+/// The guest's network, when it has one: a fixed address on a /24 behind the host's user-mode
+/// network, with the gateway and DNS server the host serves. Fixed addresses keep DHCP off the
+/// boot path; every VM has its own network, so they never clash.
+pub const GUEST_ADDRESS: [u8; 4] = [10, 0, 2, 15];
+pub const GUEST_PREFIX: u8 = 24;
+pub const GUEST_GATEWAY: [u8; 4] = [10, 0, 2, 2];
+pub const GUEST_DNS: [u8; 4] = [10, 0, 2, 3];
+
 /// Largest payload a reader accepts, so a corrupt frame cannot force a huge allocation.
 pub const MAX_PAYLOAD: usize = 16 << 20;
 
@@ -55,6 +63,8 @@ pub struct Command {
     pub archive: bool,
     /// Whether to send the files the command changed relative to the archive.
     pub collect_changes: bool,
+    /// Whether the guest has a network device to configure before the command starts.
+    pub network: bool,
 }
 
 /// One frame on the guest's stream.
@@ -242,6 +252,7 @@ fn encode_command(command: &Command) -> Vec<u8> {
     }
     out.push(u8::from(command.archive));
     out.push(u8::from(command.collect_changes));
+    out.push(u8::from(command.network));
     out
 }
 
@@ -256,8 +267,8 @@ fn decode_command(payload: &[u8]) -> io::Result<Command> {
     let env = (0..envc)
         .map(|_| Ok((cursor.string()?, cursor.string()?)))
         .collect::<io::Result<Vec<_>>>()?;
-    let [archive, collect_changes] = *cursor.rest else {
-        return Err(invalid("command flags are not 2 bytes"));
+    let [archive, collect_changes, network] = *cursor.rest else {
+        return Err(invalid("command flags are not 3 bytes"));
     };
     let flag = |b: u8| match b {
         0 => Ok(false),
@@ -270,6 +281,7 @@ fn decode_command(payload: &[u8]) -> io::Result<Command> {
         env,
         archive: flag(archive)?,
         collect_changes: flag(collect_changes)?,
+        network: flag(network)?,
     })
 }
 
@@ -344,6 +356,7 @@ mod tests {
                 ],
                 archive: true,
                 collect_changes: true,
+                network: true,
             }),
             Message::Run(Command::default()),
             Message::Stdout(b"out\n".to_vec()),

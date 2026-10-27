@@ -24,8 +24,9 @@ machines, with the results coming back to the agent that asked.
 Linux x86_64 with `/dev/kvm` only, for now, run as root (see Confinement). You need a kernel
 build toolchain (`flex`, `bison`, `bc`, `libelf-dev`) for the guest kernel, libkrun built from
 the `peerspan`
-branch of [peerspan/libkrun](https://github.com/peerspan/libkrun) with `make VHOST_USER=1`,
-`virtiofsd`, and the `x86_64-unknown-linux-musl` Rust target.
+branch of [peerspan/libkrun](https://github.com/peerspan/libkrun) with
+`make VHOST_USER=1 NET=1`, `virtiofsd`, `passt`, `nft` (nftables), and the
+`x86_64-unknown-linux-musl` Rust target.
 
 ```sh
 scripts/build-guest.sh target/guest
@@ -40,19 +41,45 @@ filesystem, runs the command there, streams its output, and exits with its code 
 `--timeout-seconds`, 127 if it never ran). `--archive FILE` unpacks a tar or tar.gz into an
 empty workspace inside the VM, refusing absolute paths, `..` and anything but directories,
 files and symbolic links; `--results-dir DIR` receives `changes.tar` and `deleted.txt`, what
-the command changed. Until peerfs serves workspaces, `virtiofsd` stands in for it. The guest
-has no network.
+the command changed. Until peerfs serves workspaces, `virtiofsd` stands in for it.
+`--network` sets what the guest may reach (see Network).
 
 `serve --socket PATH` is the local API the Peerspan host daemon drives: start a run, follow its
 events with a long poll, cancel it, collect its result files and delete it. The runtime task
 contract in the Peerspan host repository specifies it; `scripts/check-serve.py` exercises it.
+
+## Network
+
+Each run has a network level:
+
+| Level | The guest reaches |
+| --- | --- |
+| `none` | Nothing: no network device, only loopback |
+| `internet` (the default for `run`) | Public addresses only |
+| `internet+lan` | Public addresses and private ranges |
+
+At every level the guest is refused the host's own addresses, loopback, link-local addresses
+(including the cloud metadata service at 169.254.169.254) and multicast; `internet` also
+refuses private ranges (RFC 1918, shared address space, unique local IPv6). Refusals fail at
+once rather than time out. `serve` caps what a run may ask for with `--max-network` (default
+`internet`); a request without `network` gets `none`.
+
+A guest with a network gets a virtio-net device whose other end is a
+[passt](https://passt.top) process of its own, joined by a socket pair, so the VMM itself keeps
+its empty network namespace. passt carries the guest's traffic as ordinary host sockets, so
+the limits are enforced by the kernel: passt runs in the run's cgroup, and the runtime's
+nftables table (`inet peerspan_runtime`) sends traffic from each run's cgroup to a chain for
+its level, and rejects traffic from any other process in the runtime's cgroups, so a missing
+rule fails closed. DNS goes to passt, which forwards it to the host's resolvers, the one local
+address a guest may reach, on port 53 only. The guest's addresses are fixed (10.0.2.15/24,
+gateway 10.0.2.2, DNS 10.0.2.3), so booting needs no DHCP. IPv4 only for now.
 
 ## Guest kernel
 
 `scripts/build-kernel.sh` builds the guest kernel: a pinned kernel.org longterm release,
 checked against its published SHA-256, configured by `guest/kernel.config` on top of
 `allnoconfig`, with everything the guest needs built in (virtio-mmio, the virtio console,
-virtio-fs, vsock, and what programs expect of a kernel) and nothing else. It is cached by
+virtio-fs, vsock, virtio-net, and what programs expect of a kernel) and nothing else. It is cached by
 version and config. `build-guest.sh` uses it by default and copies the resolved config into
 the image beside `vmlinux`; `GUEST_ROOT=/` uses a distribution kernel and its modules instead.
 The kernel is GPL-2.0: its source is the pinned release and its configuration is
@@ -90,8 +117,8 @@ is confined before libkrun sees any guest input:
   allow-list traced from libkrun's actual calls would be tighter.
 
 Each run also gets its own cgroup v2, under `/sys/fs/cgroup/peerspan-runtime` by default
-(`--cgroup-root`), which the VMM and the workspace server join before they run any code of
-their own. It caps their memory at the guest's plus 256 MiB with no swap, their CPU time at the
+(`--cgroup-root`), which the VMM, the workspace server and passt join before they run any code
+of their own. It caps their memory at the guest's plus 256 MiB with no swap, their CPU time at the
 run's vCPUs, and their processes and threads at 512; a run that exceeds its memory is killed
 and reports so. Stopping a run, by cancellation or timeout, kills the whole cgroup, which is
 removed afterwards.
