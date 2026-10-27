@@ -8,8 +8,11 @@ permissions:
 
 jobs:
   close:
+    # Branches in this repository can only be pushed by people with write access, so only
+    # pull requests from forks can come from outside.
     if: >-
-      !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
+      github.event.pull_request.head.repo.full_name != github.repository
+      && !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
       && github.event.pull_request.user.type != 'Bot'
     runs-on: ubuntu-24.04
     steps:
