@@ -53,4 +53,5 @@ jobs:
       - name: Run checks
         run: |
           cargo build --release -p peerspan-runtime
-          sudo --preserve-env=PEERSPAN_LIBKRUN,PEERSPAN_RUNTIME_GUEST env "PATH=$PATH" "CARGO_HOME=$CARGO_HOME" "RUSTUP_HOME=$RUSTUP_HOME" scripts/check.sh
+          sudo --preserve-env=PEERSPAN_LIBKRUN,PEERSPAN_RUNTIME_GUEST \
+            PEERSPAN_RUNTIME_BIN="$PWD/target/release/peerspan-runtime" scripts/check.sh

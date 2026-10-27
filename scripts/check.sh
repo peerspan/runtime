@@ -5,11 +5,15 @@
 # End-to-end checks: boots real microVMs with `peerspan-runtime run`.
 # Needs root, /dev/kvm, a guest image (scripts/build-guest.sh), PEERSPAN_RUNTIME_GUEST pointing
 # at it, and PEERSPAN_LIBKRUN pointing at a libkrun built with `make VHOST_USER=1`.
+# PEERSPAN_RUNTIME_BIN names a built binary; without it the script builds one.
 set -eu
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
-cargo build --quiet --release --manifest-path "$repo/Cargo.toml" -p peerspan-runtime
-bin="$repo/target/release/peerspan-runtime"
+bin=${PEERSPAN_RUNTIME_BIN:-}
+if [ -z "$bin" ]; then
+  cargo build --quiet --release --manifest-path "$repo/Cargo.toml" -p peerspan-runtime
+  bin="$repo/target/release/peerspan-runtime"
+fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 failures=0
