@@ -63,10 +63,17 @@ is confined before libkrun sees any guest input:
   and host-wide settings such as the clock and `reboot`. It is a deny-list for now; an
   allow-list traced from libkrun's actual calls would be tighter.
 
+Each run also gets its own cgroup v2, under `/sys/fs/cgroup/peerspan-runtime` by default
+(`--cgroup-root`), which the VMM and the workspace server join before they run any code of
+their own. It caps their memory at the guest's plus 256 MiB with no swap, their CPU time at the
+run's vCPUs, and their processes and threads at 512; a run that exceeds its memory is killed
+and reports so. Stopping a run, by cancellation or timeout, kills the whole cgroup, which is
+removed afterwards.
+
 The workspace server runs in `virtiofsd`'s namespace sandbox with its seccomp filter, so its
 file access stays inside the workspace. Setting this up needs root, as Firecracker's jailer
-does. Not yet: resource limits through cgroups, a seccomp allow-list, and running the workspace
-server as the run's user. `scripts/check.sh` inspects a running VM from the host to
+does. Not yet: a seccomp allow-list, I/O limits, and running the workspace server as the run's
+user. `scripts/check.sh` inspects a running VM from the host to
 check the confinement above.
 
 ## Layout

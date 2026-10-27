@@ -57,6 +57,9 @@ pub struct ServeArgs {
     /// Directory for runs' workspaces and results.
     #[arg(long, default_value = "/var/lib/peerspan-runtime")]
     state: PathBuf,
+    /// cgroup v2 directory to create each run's cgroup in.
+    #[arg(long, default_value = crate::cgroup::DEFAULT_ROOT)]
+    cgroup_root: PathBuf,
     /// The user the daemon runs as: it owns the socket and the result files.
     #[arg(long, default_value_t = 0)]
     client_uid: u32,
@@ -337,6 +340,7 @@ fn execute(runtime: &Runtime, run: &Run) {
                     request.resources.timeout_seconds,
                 ))),
                 console_log: Some(run.dir.join("console.log")),
+                cgroup_root: runtime.args.cgroup_root.clone(),
                 command: peerspan_runtime_protocol::Command {
                     argv: request.argv.clone(),
                     cwd: request.cwd.clone(),

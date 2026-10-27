@@ -3,6 +3,7 @@
 
 //! `peerspan-runtime`: runs agent work in microVMs.
 
+mod cgroup;
 mod jail;
 mod krun;
 mod launcher;
@@ -56,6 +57,9 @@ struct RunArgs {
     /// Stop the command after this many seconds.
     #[arg(long)]
     timeout_seconds: Option<u64>,
+    /// cgroup v2 directory to create the run's cgroup in.
+    #[arg(long, default_value = cgroup::DEFAULT_ROOT)]
+    cgroup_root: PathBuf,
     /// Guest image directory holding `vmlinux`, `initramfs.cpio.gz` and `rootfs/`.
     #[arg(long, env = "PEERSPAN_RUNTIME_GUEST")]
     guest: PathBuf,
@@ -138,6 +142,7 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
         memory_mib: args.memory_mib,
         timeout: args.timeout_seconds.map(Duration::from_secs),
         console_log: args.console_log,
+        cgroup_root: args.cgroup_root,
         command: peerspan_runtime_protocol::Command {
             argv: args.command,
             cwd: args.cwd,

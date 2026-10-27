@@ -16,8 +16,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use std::os::unix::process::CommandExt;
+
 use anyhow::{Context, bail};
 use peerspan_runtime_protocol::{self as protocol, DATA_CHUNK, Message, WORKSPACE_TAG};
+
+use crate::cgroup::{Limits, RunCgroup};
 
 use crate::launcher::{AGENT_SOCKET, WORKSPACE_SOCKET};
 
@@ -54,6 +58,8 @@ pub struct VmSpec {
     /// How long the command may run once started.
     pub timeout: Option<Duration>,
     pub console_log: Option<PathBuf>,
+    /// The cgroup v2 directory each run's own cgroup is created in.
+    pub cgroup_root: PathBuf,
     /// The command; its `archive` flag is set from `archive` above.
     pub command: protocol::Command,
 }
@@ -127,6 +133,14 @@ pub fn run(
     chown(&sockets, id)?;
     let jail = run_dir.path.join("jail");
     fs::DirBuilder::new().mode(0o700).create(&jail)?;
+    let cgroup = RunCgroup::create(
+        &options.cgroup_root,
+        &format!("run-{id}"),
+        Limits {
+            cpus: options.cpus,
+            guest_memory_mib: options.memory_mib,
+        },
+    )?;
     let console_path = options
         .console_log
         .clone()
@@ -134,7 +148,7 @@ pub fn run(
 
     let workspace_socket = sockets.join(WORKSPACE_SOCKET);
     let _server = ChildGuard(
-        Command::new(&options.virtiofsd)
+        join_cgroup(&mut Command::new(&options.virtiofsd), &cgroup)
             .arg(format!("--socket-path={}", workspace_socket.display()))
             .arg(format!("--shared-dir={}", workspace.display()))
             .arg(format!("--tag={WORKSPACE_TAG}"))
@@ -157,40 +171,46 @@ pub fn run(
     let console = File::create(&console_path)
         .with_context(|| format!("creating {}", console_path.display()))?;
     let mut launcher = ChildGuard(
-        Command::new(std::env::current_exe().context("locating this executable")?)
-            .arg("launch")
-            .arg("--libkrun")
-            .arg(&options.libkrun)
-            .arg("--kernel")
-            .arg(&guest.kernel)
-            .arg("--initrd")
-            .arg(&guest.initrd)
-            .arg("--rootfs")
-            .arg(&guest.rootfs)
-            .arg("--sockets")
-            .arg(&sockets)
-            .arg("--jail")
-            .arg(&jail)
-            .arg("--uid")
-            .arg(id.to_string())
-            .arg("--gid")
-            .arg(id.to_string())
-            .arg("--cpus")
-            .arg(options.cpus.to_string())
-            .arg("--memory-mib")
-            .arg(options.memory_mib.to_string())
-            .stdin(Stdio::null())
-            .stdout(console.try_clone()?)
-            .stderr(console)
-            .spawn()
-            .context("starting the launcher")?,
+        join_cgroup(
+            &mut Command::new(std::env::current_exe().context("locating this executable")?),
+            &cgroup,
+        )
+        .arg("launch")
+        .arg("--libkrun")
+        .arg(&options.libkrun)
+        .arg("--kernel")
+        .arg(&guest.kernel)
+        .arg("--initrd")
+        .arg(&guest.initrd)
+        .arg("--rootfs")
+        .arg(&guest.rootfs)
+        .arg("--sockets")
+        .arg(&sockets)
+        .arg("--jail")
+        .arg(&jail)
+        .arg("--uid")
+        .arg(id.to_string())
+        .arg("--gid")
+        .arg(id.to_string())
+        .arg("--cpus")
+        .arg(options.cpus.to_string())
+        .arg("--memory-mib")
+        .arg(options.memory_mib.to_string())
+        .stdin(Stdio::null())
+        .stdout(console.try_clone()?)
+        .stderr(console)
+        .spawn()
+        .context("starting the launcher")?,
     );
 
     let stream = match accept_guest(&listener, &mut launcher.0, cancel) {
         Ok(stream) => stream,
         Err(e) => return Err(e.context(console_tail(&console_path))),
     };
-    let outcome = serve_guest(spec, stream, launcher.0.id(), cancel, on_event);
+    let mut outcome = serve_guest(spec, stream, &cgroup, cancel, on_event);
+    if cgroup.oom_killed() && outcome.exit_code.is_none() && !outcome.timed_out {
+        outcome.error = Some("the VM exceeded its memory limit and was killed".into());
+    }
     if wait_with_timeout(&mut launcher.0, SHUTDOWN_TIMEOUT)?.is_none() {
         eprintln!("peerspan-runtime: the VM did not shut down; stopping it");
     }
@@ -202,7 +222,7 @@ pub fn run(
 fn serve_guest(
     spec: &VmSpec,
     mut stream: UnixStream,
-    launcher_pid: u32,
+    cgroup: &RunCgroup,
     cancel: &AtomicBool,
     on_event: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
 ) -> Outcome {
@@ -230,9 +250,7 @@ fn serve_guest(
                 };
                 if let Some(stop) = stop {
                     *stopped.lock().expect("lock poisoned") = Some(stop);
-                    // The jailed VMM dies with the launcher.
-                    // SAFETY: kill takes only integers; the pid is our live child.
-                    unsafe { libc::kill(i32::try_from(launcher_pid).unwrap_or(0), libc::SIGKILL) };
+                    cgroup.kill();
                     let _ = watched.shutdown(Shutdown::Both);
                     return;
                 }
@@ -317,6 +335,23 @@ fn send_archive(path: &Path, stream: &mut UnixStream) -> io::Result<()> {
             return Message::ArchiveEnd.write_to(stream);
         }
         Message::ArchiveData(buf[..n].to_vec()).write_to(stream)?;
+    }
+}
+
+/// Makes `command`'s process join `cgroup` before it runs any code of its own, so no work of its
+/// escapes the limits.
+fn join_cgroup<'cmd>(command: &'cmd mut Command, cgroup: &RunCgroup) -> &'cmd mut Command {
+    let fd = cgroup.procs_fd();
+    // SAFETY: the hook only calls write(2), which is async-signal-safe, on a descriptor that
+    // stays open until after the child has started.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::write(fd, b"0".as_ptr().cast(), 1) == 1 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        })
     }
 }
 

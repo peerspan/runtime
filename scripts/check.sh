@@ -17,6 +17,8 @@ fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 failures=0
+run_cgroups() { find /sys/fs/cgroup/peerspan-runtime -maxdepth 1 -name 'run-*' 2>/dev/null | wc -l; }
+cgroups_before=$(run_cgroups)
 
 # check NAME EXPECTED_EXIT -- COMMAND...: runs COMMAND in a fresh VM on $work/ws.
 check() {
@@ -142,9 +144,22 @@ else
   [ "$(ls "/proc/$vmm/root/proc" | grep -c '^[0-9]')" -eq 1 ] || problems="$problems sees-other-processes"
   [ -n "$vfs" ] || problems="$problems workspace-server-unsandboxed"
   [ -z "${root_launchers:-}" ] || problems="$problems launcher-as-root:${root_launchers}"
+  # Resource limits: the VMM and the workspace server share the run's cgroup, which caps memory
+  # at the guest's 1024 MiB plus 256 MiB, CPU at 2 vCPUs, and processes at 512.
+  cg=$(sed -n 's/^0:://p' "/proc/$vmm/cgroup")
+  case "$cg" in /peerspan-runtime/run-*) ;; *) problems="$problems cgroup=[$cg]" ;; esac
+  [ -n "$vfs" ] && [ "$(sed -n 's/^0:://p' "/proc/$vfs/cgroup")" != "$cg" ] \
+    && problems="$problems workspace-server-outside-cgroup"
+  limits="$(cat "/sys/fs/cgroup$cg/memory.max") $(cat "/sys/fs/cgroup$cg/memory.swap.max")"
+  limits="$limits $(cat "/sys/fs/cgroup$cg/cpu.max") $(cat "/sys/fs/cgroup$cg/pids.max")"
+  [ "$limits" = "1342177280 0 200000 100000 512" ] || problems="$problems limits=[$limits]"
   [ -z "$problems" ] && pass confinement || fail "confinement:$problems"
 fi
 wait "$run_pid" || fail "confinement: the run failed"
+[ -n "${cg:-}" ] && [ -d "/sys/fs/cgroup$cg" ] && fail "confinement: cgroup $cg left behind"
+
+leaked=$(( $(run_cgroups) - cgroups_before ))
+[ "$leaked" -le 0 ] && pass cgroup-cleanup || fail "cgroup-cleanup: $leaked run cgroups left behind"
 
 [ "$failures" -eq 0 ] || { echo "$failures check(s) failed"; exit 1; }
 echo "all checks passed"
