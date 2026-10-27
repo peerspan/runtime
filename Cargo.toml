@@ -1,0 +1,10 @@
+[package]
+name = "peerspan-runtime"
+version = "0.0.0"
+edition = "2024"
+description = "Peerspan's runtime: lightweight VMs for agent collaboration"
+license = "Apache-2.0"
+repository = "https://github.com/peerspan/runtime"
+publish = false
+
+[dependencies]

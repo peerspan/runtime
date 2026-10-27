@@ -1,0 +1,22 @@
+name: Close outside pull requests
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close:
+    if: >-
+      !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
+      && github.event.pull_request.user.type != 'Bot'
+    runs-on: ubuntu-24.04
+    steps:
+      # Never check out the pull request's code: pull_request_target runs with a write token.
+      - name: Comment and close
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.html_url }}
+        run: |
+          gh pr close "$PR" --comment "Thanks for your interest. We don't accept code contributions from outside Peerspan, so we're closing this pull request. Please open an issue describing the problem or the change you'd like, and we'll take it from there: https://github.com/${{ github.repository }}/issues/new/choose. See CONTRIBUTING.md for details."

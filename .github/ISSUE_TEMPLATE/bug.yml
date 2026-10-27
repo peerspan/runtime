@@ -1,0 +1,16 @@
+name: Bug report
+description: Something the runtime does wrong
+labels: [bug]
+body:
+  - type: textarea
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what happened instead. Include logs if you have them.
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Platform
+      description: OS and version, CPU architecture, and runtime version or commit.
+    validations:
+      required: true

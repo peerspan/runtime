@@ -1,0 +1,14 @@
+name: Feature request
+description: Something you need the runtime to do
+labels: [enhancement]
+body:
+  - type: textarea
+    attributes:
+      label: The problem
+      description: What you are trying to do and what gets in the way.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Ideas
+      description: Optional. How you imagine it working, described in words rather than code.
