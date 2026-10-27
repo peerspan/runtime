@@ -85,6 +85,15 @@ impl RunCgroup {
         })
     }
 
+    /// The most memory the run's processes have used together, in bytes.
+    pub fn memory_peak(&self) -> Option<u64> {
+        fs::read_to_string(self.path.join("memory.peak"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
     /// Kills every process in the cgroup at once.
     pub fn kill(&self) {
         let _ = fs::write(self.path.join("cgroup.kill"), "1");

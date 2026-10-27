@@ -33,7 +33,8 @@ jobs:
       - name: Install packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang libclang-dev virtiofsd zstd cpio
+          sudo apt-get install -y --no-install-recommends clang libclang-dev virtiofsd zstd cpio \
+            flex bison bc libelf-dev
 
       - name: Add musl target
         run: rustup target add x86_64-unknown-linux-musl
@@ -50,11 +51,9 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      # The runner's cloud kernel is not a dependable guest; use Ubuntu's generic one.
-      - name: Build guest image
+      - name: Build guest kernel and image
         run: |
-          version=$(scripts/fetch-ubuntu-kernel.sh "$RUNNER_TEMP/kernel")
-          GUEST_ROOT="$RUNNER_TEMP/kernel" GUEST_KERNEL_VERSION="$version" scripts/build-guest.sh "$RUNNER_TEMP/guest"
+          scripts/build-guest.sh "$RUNNER_TEMP/guest"
           echo "PEERSPAN_RUNTIME_GUEST=$RUNNER_TEMP/guest" >> "$GITHUB_ENV"
 
       # The runtime confines each VM, which needs root.

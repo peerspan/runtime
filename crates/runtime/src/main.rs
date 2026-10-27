@@ -57,6 +57,9 @@ struct RunArgs {
     /// Stop the command after this many seconds.
     #[arg(long)]
     timeout_seconds: Option<u64>,
+    /// Write the run's boot time and memory measurements to this file, as JSON.
+    #[arg(long)]
+    metrics: Option<PathBuf>,
     /// cgroup v2 directory to create the run's cgroup in.
     #[arg(long, default_value = cgroup::DEFAULT_ROOT)]
     cgroup_root: PathBuf,
@@ -164,6 +167,22 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
             .as_mut()
             .map_or(Ok(()), |(_, txt)| txt.write_all(data)),
     })?;
+    if let Some(path) = &args.metrics {
+        let metrics = &outcome.metrics;
+        let millis = |d: Duration| d.as_secs_f64() * 1000.0;
+        let json = format!(
+            "{{\"connect_ms\": {:.1}, \"start_ms\": {}, \"total_ms\": {:.1}, \"memory_peak_bytes\": {}}}\n",
+            millis(metrics.connect),
+            metrics
+                .start
+                .map_or("null".into(), |d| format!("{:.1}", millis(d))),
+            millis(metrics.total),
+            metrics
+                .memory_peak_bytes
+                .map_or("null".into(), |b| b.to_string()),
+        );
+        std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
+    }
     if let Some(error) = &outcome.error {
         eprintln!("peerspan-runtime: {error}");
         return Ok(EXIT_NOT_RUN);

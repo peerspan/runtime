@@ -89,6 +89,21 @@ pub struct Outcome {
     pub duration: Duration,
     /// Why the run failed outside the command, if it did.
     pub error: Option<String>,
+    /// How long setup took and how much memory the run used.
+    pub metrics: Metrics,
+}
+
+/// Measurements of one run, for tracking boot time and memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Metrics {
+    /// From starting the launcher until the guest connected: VMM setup, kernel boot and init.
+    pub connect: Duration,
+    /// From starting the launcher until the command started.
+    pub start: Option<Duration>,
+    /// From the start of `run` until the VM was torn down.
+    pub total: Duration,
+    /// The most host memory the VMM and the workspace server used together.
+    pub memory_peak_bytes: Option<u64>,
 }
 
 /// Why the watchdog stopped a run.
@@ -111,6 +126,7 @@ pub fn run(
     on_event: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
 ) -> anyhow::Result<Outcome> {
     let options = spec;
+    let began = Instant::now();
     if let Some(archive) = &options.archive
         && fs::read_dir(&options.workspace)?.next().is_some()
     {
@@ -170,6 +186,7 @@ pub fn run(
 
     let console = File::create(&console_path)
         .with_context(|| format!("creating {}", console_path.display()))?;
+    let launched = Instant::now();
     let mut launcher = ChildGuard(
         join_cgroup(
             &mut Command::new(std::env::current_exe().context("locating this executable")?),
@@ -207,13 +224,24 @@ pub fn run(
         Ok(stream) => stream,
         Err(e) => return Err(e.context(console_tail(&console_path))),
     };
-    let mut outcome = serve_guest(spec, stream, &cgroup, cancel, on_event);
+    let connect = launched.elapsed();
+    let started = Mutex::new(None);
+    let mut outcome = serve_guest(spec, stream, &cgroup, &started, cancel, on_event);
     if cgroup.oom_killed() && outcome.exit_code.is_none() && !outcome.timed_out {
         outcome.error = Some("the VM exceeded its memory limit and was killed".into());
     }
     if wait_with_timeout(&mut launcher.0, SHUTDOWN_TIMEOUT)?.is_none() {
         eprintln!("peerspan-runtime: the VM did not shut down; stopping it");
     }
+    outcome.metrics = Metrics {
+        connect,
+        start: started
+            .lock()
+            .expect("lock poisoned")
+            .map(|at| at.duration_since(launched)),
+        total: began.elapsed(),
+        memory_peak_bytes: cgroup.memory_peak(),
+    };
     Ok(outcome)
 }
 
@@ -223,10 +251,10 @@ fn serve_guest(
     spec: &VmSpec,
     mut stream: UnixStream,
     cgroup: &RunCgroup,
+    started: &Mutex<Option<Instant>>,
     cancel: &AtomicBool,
     on_event: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
 ) -> Outcome {
-    let started: Mutex<Option<Instant>> = Mutex::new(None);
     let stopped: Mutex<Option<Stop>> = Mutex::new(None);
     let done = AtomicBool::new(false);
     let mut outcome = Outcome::default();
@@ -257,7 +285,7 @@ fn serve_guest(
                 thread::sleep(WATCH_INTERVAL);
             }
         });
-        let result = converse(spec, &mut stream, &started, on_event);
+        let result = converse(spec, &mut stream, started, on_event);
         done.store(true, Ordering::Relaxed);
         let ran_for = started
             .lock()

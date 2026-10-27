@@ -8,12 +8,15 @@
 #   rootfs/            a pinned Alpine minirootfs, shared read-only into the guest
 #
 # usage: build-guest.sh OUT_DIR
+# By default the kernel is the one scripts/build-kernel.sh builds, with everything built in.
 # Environment:
-#   GUEST_ROOT            where the kernel and modules live (default /, the host's)
-#   GUEST_KERNEL_VERSION  default: uname -r
+#   GUEST_KERNEL          another vmlinux with everything built in
+#   GUEST_ROOT            instead, a distribution kernel and its modules under this root (for
+#                         example / for the host's), loaded as modules from the initramfs
+#   GUEST_KERNEL_VERSION  that distribution kernel's version (default: uname -r)
 #
-# The kernel needs virtio-mmio command-line devices; virtio-fs and virtio-vsock may be
-# built in or modules. Ubuntu's generic kernel has all three.
+# A distribution kernel needs virtio-mmio command-line devices; virtio-fs and virtio-vsock may
+# be built in or modules. Ubuntu's generic kernel has all three.
 set -eu
 
 ALPINE_VERSION=3.22.7
@@ -36,7 +39,18 @@ trap 'rm -rf "$work"' EXIT
 cargo build --quiet --release --manifest-path "$repo/Cargo.toml" \
   -p peerspan-guest-init --target "$arch-unknown-linux-musl"
 
-"$here/extract-vmlinux.py" "$root/boot/vmlinuz-$ver" "$out/vmlinux"
+if [ -n "${GUEST_ROOT:-}" ]; then
+  "$here/extract-vmlinux.py" "$root/boot/vmlinuz-$ver" "$out/vmlinux"
+else
+  if [ -z "${GUEST_KERNEL:-}" ]; then
+    "$here/build-kernel.sh" "$work/kernel" > /dev/null
+    GUEST_KERNEL="$work/kernel/vmlinux"
+    cp "$work/kernel/kernel.config" "$out/kernel.config"
+  fi
+  cp "$GUEST_KERNEL" "$out/vmlinux"
+  MODULES=""
+  ver=$(cat "$(dirname "$GUEST_KERNEL")/kernel.version" 2>/dev/null || echo "custom")
+fi
 
 initramfs="$work/initramfs"
 mkdir -p "$initramfs/proc" "$initramfs/sys" "$initramfs/dev" "$initramfs/rootfs" \

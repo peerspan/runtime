@@ -21,11 +21,11 @@ machines, with the results coming back to the agent that asked.
 
 ## Trying it
 
-Linux x86_64 with `/dev/kvm` only, for now, run as root (see Confinement). You need libkrun
-built from the `peerspan`
+Linux x86_64 with `/dev/kvm` only, for now, run as root (see Confinement). You need a kernel
+build toolchain (`flex`, `bison`, `bc`, `libelf-dev`) for the guest kernel, libkrun built from
+the `peerspan`
 branch of [peerspan/libkrun](https://github.com/peerspan/libkrun) with `make VHOST_USER=1`,
-`virtiofsd`, the `x86_64-unknown-linux-musl` Rust target, and a guest kernel with virtio-mmio
-command-line devices (Ubuntu's generic kernel works).
+`virtiofsd`, and the `x86_64-unknown-linux-musl` Rust target.
 
 ```sh
 scripts/build-guest.sh target/guest
@@ -46,6 +46,32 @@ has no network.
 `serve --socket PATH` is the local API the Peerspan host daemon drives: start a run, follow its
 events with a long poll, cancel it, collect its result files and delete it. The runtime task
 contract in the Peerspan host repository specifies it; `scripts/check-serve.py` exercises it.
+
+## Guest kernel
+
+`scripts/build-kernel.sh` builds the guest kernel: a pinned kernel.org longterm release,
+checked against its published SHA-256, configured by `guest/kernel.config` on top of
+`allnoconfig`, with everything the guest needs built in (virtio-mmio, the virtio console,
+virtio-fs, vsock, and what programs expect of a kernel) and nothing else. It is cached by
+version and config. `build-guest.sh` uses it by default and copies the resolved config into
+the image beside `vmlinux`; `GUEST_ROOT=/` uses a distribution kernel and its modules instead.
+The kernel is GPL-2.0: its source is the pinned release and its configuration is
+`guest/kernel.config`.
+
+## Measuring
+
+`scripts/bench.py` boots a VM repeatedly (20 times by default, running `true`) and reports
+p50, p90 and the maximum of:
+
+- `connect_ms`: from starting the VM's process until the guest connects (VMM setup, kernel
+  boot and init);
+- `start_ms`: until the command starts;
+- `total_ms`: the whole run, through teardown;
+- `memory_peak_mib`: the most host memory the run's processes used, from its cgroup.
+
+`--record` appends the result to `bench/history.jsonl`, with the commit, the kernel and the
+settings, so each change can be compared with the last. `run --metrics FILE` writes one run's
+measurements.
 
 ## Confinement
 
