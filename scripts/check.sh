@@ -264,6 +264,33 @@ rmdir "$probe_cg"
 left=$(nft list table inet peerspan_runtime | grep -c -e 'chain run-' -e '"peerspan-runtime/run-' || true)
 [ "$left" -eq 0 ] && pass network-cleanup || fail "network-cleanup: $left run entries left in nftables"
 
+# A supervisor killed outright: its run's processes die with it, and the next run removes the
+# cgroup, network filter and run directory it left.
+ls -d /sys/fs/cgroup/peerspan-runtime/run-* > "$work/runs-before" 2>/dev/null || true
+"$bin" run --network internet --workspace "$work/ws" -- sleep 60 > /dev/null 2>&1 &
+supervisor=$!
+# Wait until the run is up: its cgroup and network filter exist.
+dead=""
+for _ in $(seq 100); do
+  dead=$(ls -d /sys/fs/cgroup/peerspan-runtime/run-* 2>/dev/null | grep -vxF -f "$work/runs-before" | head -1)
+  [ -n "$dead" ] && nft list chain inet peerspan_runtime "${dead##*/}" > /dev/null 2>&1 && break
+  sleep 0.1
+done
+kill -9 "$supervisor"
+wait "$supervisor" 2>/dev/null || true
+problems=""
+if [ -z "$dead" ]; then
+  problems=" no-run-started"
+else
+  sleep 1
+  [ -s "$dead/cgroup.procs" ] && problems="$problems processes-outlived-supervisor"
+  check stale-next 0 -- true || problems="$problems next-run-failed"
+  [ -d "$dead" ] && problems="$problems cgroup-left"
+  nft list chain inet peerspan_runtime "${dead##*/}" > /dev/null 2>&1 && problems="$problems filter-left"
+  [ -d "${TMPDIR:-/tmp}/peerspan-runtime-${dead##*/run-}" ] && problems="$problems run-dir-left"
+fi
+[ -z "$problems" ] && pass stale-run || fail "stale-run:$problems"
+
 leaked=$(( $(run_cgroups) - cgroups_before ))
 [ "$leaked" -le 0 ] && pass cgroup-cleanup || fail "cgroup-cleanup: $leaked run cgroups left behind"
 

@@ -133,6 +133,11 @@ run's vCPUs, and their processes and threads at 512; a run that exceeds its memo
 and reports so. Stopping a run, by cancellation or timeout, kills the whole cgroup, which is
 removed afterwards.
 
+A supervisor killed outright cannot tear its run down. Every process of a run dies with it,
+and a supervisor holds a lock on its run's cgroup for as long as the run lasts, so the next
+run on the host finds runs whose lock is free and removes their cgroups, network filters and
+run directories.
+
 The workspace server runs in `virtiofsd`'s namespace sandbox with its seccomp filter, so its
 file access stays inside the workspace. Setting this up needs root, as Firecracker's jailer
 does. Not yet: a seccomp allow-list, I/O limits, and running the workspace server as the run's

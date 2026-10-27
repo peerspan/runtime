@@ -76,7 +76,11 @@ impl fmt::Display for Level {
 ///
 /// Drop it before the run's cgroup: nftables names the cgroup by path, which must still exist.
 #[derive(Debug)]
-pub struct RunFilter {
+pub struct RunFilter(Names);
+
+/// Where a run is in the filter: its chain, and its cgroup's key in the map of runs.
+#[derive(Debug)]
+struct Names {
     chain: String,
     cgroup: String,
 }
@@ -98,31 +102,84 @@ impl RunFilter {
                 cgroup.display()
             );
         };
+        let names = Names::of(cgroup)?;
+        let script = format!(
+            "{base}{chain}add element {TABLE} runs {{ \"{cgroup}\" : jump {name} }}\n",
+            base = base_rules(path_str(root)?, depth),
+            chain = run_chain(&names.chain, level, &resolvers()),
+            cgroup = names.cgroup,
+            name = names.chain,
+        );
+        nft(&script).context("installing the run's network filter")?;
+        Ok(RunFilter(names))
+    }
+}
+
+impl Names {
+    /// The names of the run whose cgroup is `cgroup`.
+    fn of(cgroup: &Path) -> anyhow::Result<Names> {
+        let relative = cgroup
+            .strip_prefix(CGROUP_MOUNT)
+            .with_context(|| format!("{} is not under {CGROUP_MOUNT}", cgroup.display()))?;
         let name = relative
             .file_name()
             .and_then(|n| n.to_str())
             .context("cgroup name is not UTF-8")?;
-        let filter = RunFilter {
+        Ok(Names {
             chain: name.to_owned(),
             cgroup: path_str(relative)?.to_owned(),
-        };
-        let script = format!(
-            "{base}{chain}add element {TABLE} runs {{ \"{cgroup}\" : jump {name} }}\n",
-            base = base_rules(path_str(root)?, depth),
-            chain = run_chain(name, level, &resolvers()),
-            cgroup = filter.cgroup,
-        );
-        nft(&script).context("installing the run's network filter")?;
-        Ok(filter)
+        })
     }
+
+    fn delete_element(&self) -> String {
+        format!("delete element {TABLE} runs {{ \"{}\" }}\n", self.cgroup)
+    }
+
+    fn delete_chain(&self) -> String {
+        format!("delete chain {TABLE} {}\n", self.chain)
+    }
+}
+
+/// Removes what supervisors that died left in the filter for `cgroups`, their runs' cgroups,
+/// which must still exist: nftables resolves a cgroup's path when it parses the rules.
+///
+/// # Errors
+///
+/// Fails if `nft` cannot be run or rejects the removal.
+pub fn remove_stale(cgroups: &[&Path]) -> anyhow::Result<()> {
+    if cgroups.is_empty() {
+        return Ok(());
+    }
+    let listing = Command::new("nft")
+        .args(["list", "table"])
+        .args(TABLE.split(' '))
+        .stderr(Stdio::null())
+        .output()
+        .context("running nft")?;
+    // No table, nothing left in it.
+    if !listing.status.success() {
+        return Ok(());
+    }
+    let listing = String::from_utf8_lossy(&listing.stdout);
+    let mut script = String::new();
+    for cgroup in cgroups {
+        let names = Names::of(cgroup)?;
+        if listing.contains(&format!("\"{}\" : jump", names.cgroup)) {
+            script.push_str(&names.delete_element());
+        }
+        if listing.contains(&format!("chain {} {{", names.chain)) {
+            script.push_str(&names.delete_chain());
+        }
+    }
+    if script.is_empty() {
+        return Ok(());
+    }
+    nft(&script).context("removing stale network filters")
 }
 
 impl Drop for RunFilter {
     fn drop(&mut self) {
-        let script = format!(
-            "delete element {TABLE} runs {{ \"{}\" }}\ndelete chain {TABLE} {}\n",
-            self.cgroup, self.chain
-        );
+        let script = self.0.delete_element() + &self.0.delete_chain();
         if let Err(e) = nft(&script) {
             eprintln!("peerspan-runtime: removing the run's network filter: {e:#}");
         }

@@ -22,7 +22,7 @@ use std::os::unix::process::CommandExt;
 use anyhow::{Context, bail};
 use peerspan_runtime_protocol::{self as protocol, DATA_CHUNK, Message, WORKSPACE_TAG};
 
-use crate::cgroup::{Limits, RunCgroup};
+use crate::cgroup::{self, Limits, RunCgroup};
 use crate::net::{self, Level, RunFilter};
 use crate::phases;
 
@@ -169,6 +169,7 @@ pub fn run(
     if unsafe { libc::geteuid() } != 0 {
         bail!("peerspan-runtime must run as root to confine its VMs");
     }
+    remove_stale_runs(&options.cgroup_root);
     let run_dir = RunDir::create()?;
     let id = run_dir.id;
     let sockets = run_dir.path.join("sockets");
@@ -504,17 +505,25 @@ fn pass_fd(command: &mut Command, fd: RawFd, target: RawFd) {
 
 /// Makes `command`'s process join `cgroup` before it runs any code of its own, so no work of its
 /// escapes the limits.
+/// Puts a child in the run's cgroup, and has it killed if the supervisor dies first.
 fn join_cgroup<'cmd>(command: &'cmd mut Command, cgroup: &RunCgroup) -> &'cmd mut Command {
     let fd = cgroup.procs_fd();
-    // SAFETY: the hook only calls write(2), which is async-signal-safe, on a descriptor that
-    // stays open until after the child has started.
+    // SAFETY: getpid has no preconditions.
+    let supervisor = unsafe { libc::getpid() };
+    // SAFETY: the hook only calls write(2), prctl(2) and getppid(2), which are
+    // async-signal-safe, and the descriptor stays open until after the child has started.
     unsafe {
         command.pre_exec(move || {
-            if libc::write(fd, b"0".as_ptr().cast(), 1) == 1 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
+            if libc::write(fd, b"0".as_ptr().cast(), 1) != 1
+                || libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
+            {
+                return Err(io::Error::last_os_error());
             }
+            // The supervisor died before the death signal was set.
+            if libc::getppid() != supervisor {
+                return Err(io::Error::from(ErrorKind::Interrupted));
+            }
+            Ok(())
         })
     }
 }
@@ -626,18 +635,56 @@ impl RunDir {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos());
         let id = RUN_ID_BASE + ((nanos ^ std::process::id().rotate_left(16)) & RUN_ID_MASK);
-        let path = std::env::temp_dir().join(format!("peerspan-runtime-{id}"));
+        let path = RunDir::path_for(&id.to_string());
         fs::DirBuilder::new()
             .mode(0o700)
             .create(&path)
             .with_context(|| format!("creating {}", path.display()))?;
         Ok(RunDir { path, id })
     }
+
+    fn path_for(id: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("peerspan-runtime-{id}"))
+    }
 }
 
 fn chown(path: &Path, id: u32) -> anyhow::Result<()> {
     std::os::unix::fs::chown(path, Some(id), Some(id))
         .with_context(|| format!("giving {} to the run's user", path.display()))
+}
+
+/// Tears down runs whose supervisor died without doing it: their processes, network filters,
+/// cgroups and run directories. A run that cannot be cleaned up is reported, not fatal.
+fn remove_stale_runs(cgroup_root: &Path) {
+    let stale = match cgroup::stale(cgroup_root) {
+        Ok(stale) if stale.is_empty() => return,
+        Ok(stale) => stale,
+        Err(e) => {
+            eprintln!("peerspan-runtime: looking for stale runs: {e:#}");
+            return;
+        }
+    };
+    for cgroup in &stale {
+        cgroup.kill();
+    }
+    let paths: Vec<&Path> = stale.iter().map(RunCgroup::path).collect();
+    if let Err(e) = net::remove_stale(&paths) {
+        eprintln!("peerspan-runtime: {e:#}");
+    }
+    for cgroup in stale {
+        let name = cgroup
+            .path()
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+        drop(cgroup);
+        if let Some(id) = name.as_deref().and_then(|n| n.strip_prefix("run-")) {
+            let _ = fs::remove_dir_all(RunDir::path_for(id));
+        }
+        eprintln!(
+            "peerspan-runtime: removed {}, left by a supervisor that died",
+            name.unwrap_or_default()
+        );
+    }
 }
 
 impl Drop for RunDir {

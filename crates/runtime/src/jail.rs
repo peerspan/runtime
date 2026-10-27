@@ -157,7 +157,12 @@ fn fork_into_namespace(uid: u32, gid: u32) -> anyhow::Result<()> {
     std::process::exit(code);
 }
 
+/// Becomes `uid` and `gid` with only `groups`, for good. Changing user clears the parent death
+/// signal, which every process of a run has so that it dies with the supervisor, so this sets
+/// it again.
 fn drop_privileges(uid: u32, gid: u32, groups: &[libc::gid_t]) -> anyhow::Result<()> {
+    // SAFETY: getppid has no preconditions.
+    let parent = unsafe { libc::getppid() };
     // SAFETY: groups is a valid slice of the given length.
     let rc = unsafe { libc::setgroups(groups.len(), groups.as_ptr()) };
     check(rc, "setgroups")?;
@@ -176,6 +181,13 @@ fn drop_privileges(uid: u32, gid: u32, groups: &[libc::gid_t]) -> anyhow::Result
     // SAFETY: setuid takes only an ID; this call only probes and must fail.
     if unsafe { libc::setuid(0) } == 0 {
         bail!("privileges were not dropped");
+    }
+    // SAFETY: prctl with this option takes only integers.
+    let rc = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
+    check(rc, "parent death signal")?;
+    // SAFETY: getppid has no preconditions.
+    if unsafe { libc::getppid() } != parent {
+        bail!("the parent process died");
     }
     Ok(())
 }

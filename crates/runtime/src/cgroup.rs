@@ -6,10 +6,17 @@
 //! The guest's memory and vCPUs are bounded by libkrun, but the processes behind it (the VMM
 //! and the workspace server) are host processes. Each run's cgroup caps their memory, CPU time
 //! and process count, so a run cannot exhaust its host, and kills them all at teardown.
+//!
+//! A supervisor holds an exclusive lock on its run's cgroup directory for as long as the run
+//! lasts, and the kernel releases it when the supervisor dies however it dies. A cgroup whose
+//! lock is free was left by a supervisor that died before tearing it down; [`stale`] finds
+//! them. Creating a cgroup and taking its lock happen under a shared lock on the root, and
+//! [`stale`] takes the root exclusively, so it never sees a new cgroup before its lock is held.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -41,6 +48,8 @@ pub struct Limits {
 pub struct RunCgroup {
     path: PathBuf,
     procs: File,
+    /// The cgroup's directory, locked exclusively while the run is live.
+    _lock: File,
 }
 
 impl RunCgroup {
@@ -52,15 +61,12 @@ impl RunCgroup {
     /// run must not start without its limits.
     pub fn create(root: &Path, name: &str, limits: Limits) -> anyhow::Result<RunCgroup> {
         prepare_root(root)?;
+        let root_lock = lock(root, libc::LOCK_SH)?;
         let path = root.join(name);
         fs::create_dir(&path).with_context(|| format!("creating cgroup {}", path.display()))?;
-        let cgroup = RunCgroup {
-            procs: OpenOptions::new()
-                .write(true)
-                .open(path.join("cgroup.procs"))
-                .with_context(|| format!("opening {}/cgroup.procs", path.display()))?,
-            path,
-        };
+        let lock = lock(&path, libc::LOCK_EX | libc::LOCK_NB)?;
+        drop(root_lock);
+        let cgroup = RunCgroup::open(path, lock)?;
         let memory = u64::from(limits.guest_memory_mib) * (1 << 20) + OVERHEAD_BYTES;
         let quota = u64::from(limits.cpus) * CPU_PERIOD_US;
         cgroup.set("memory.max", &memory.to_string())?;
@@ -68,6 +74,17 @@ impl RunCgroup {
         cgroup.set("pids.max", &PIDS_MAX.to_string())?;
         cgroup.set("cpu.max", &format!("{quota} {CPU_PERIOD_US}"))?;
         Ok(cgroup)
+    }
+
+    fn open(path: PathBuf, lock: File) -> anyhow::Result<RunCgroup> {
+        Ok(RunCgroup {
+            procs: OpenOptions::new()
+                .write(true)
+                .open(path.join("cgroup.procs"))
+                .with_context(|| format!("opening {}/cgroup.procs", path.display()))?,
+            path,
+            _lock: lock,
+        })
     }
 
     /// The cgroup's directory.
@@ -132,6 +149,48 @@ impl Drop for RunCgroup {
             self.path.display()
         );
     }
+}
+
+/// The run cgroups under `root` that no live supervisor holds, locked and ready to drop, which
+/// kills what is left in them and removes them.
+///
+/// # Errors
+///
+/// Fails if `root` cannot be read or locked; a missing root has nothing stale in it.
+pub fn stale(root: &Path) -> anyhow::Result<Vec<RunCgroup>> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", root.display())),
+    };
+    let _root_lock = lock(root, libc::LOCK_EX)?;
+    let mut stale = vec![];
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with("run-") || !entry.path().is_dir() {
+            continue;
+        }
+        // A cgroup removed since the listing is someone else's finished run.
+        if let Ok(lock) = lock(&entry.path(), libc::LOCK_EX | libc::LOCK_NB) {
+            stale.push(RunCgroup::open(entry.path(), lock)?);
+        }
+    }
+    Ok(stale)
+}
+
+/// Opens directory `path` and takes `operation`, a flock(2) operation, on it.
+fn lock(path: &Path, operation: libc::c_int) -> anyhow::Result<File> {
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    // SAFETY: flock takes a descriptor this function owns and an integer.
+    if unsafe { libc::flock(dir.as_raw_fd(), operation) } != 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("locking {}", path.display()));
+    }
+    Ok(dir)
 }
 
 fn prepare_root(root: &Path) -> anyhow::Result<()> {
