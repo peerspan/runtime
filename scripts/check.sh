@@ -68,6 +68,54 @@ rc=0
 "$bin" run --workspace "$work/ws" --guest "$work/no-such-guest" -- true 2> "$work/err" || rc=$?
 [ "$rc" -eq 125 ] && grep -q "guest image" "$work/err" && pass bad-guest || fail "bad-guest: exit $rc"
 
+# Workspace archives: unpacked inside the VM, with the changes reported back.
+mkdir -p "$work/src/sub" "$work/arch" "$work/res"
+echo alpha > "$work/src/a.txt"
+echo beta > "$work/src/sub/b.txt"
+ln -s sub/b.txt "$work/src/link"
+tar -C "$work/src" -cf "$work/ws.tar" .
+gzip -c "$work/ws.tar" > "$work/ws.tar.gz"
+rc=0
+"$bin" run --workspace "$work/arch" --archive "$work/ws.tar" --results-dir "$work/res" -- \
+  sh -c 'cat a.txt link; echo new > new.txt; echo more >> sub/b.txt; rm a.txt' \
+  > "$work/out" 2> "$work/err" || rc=$?
+listed=$(tar -tf "$work/res/changes.tar" 2>/dev/null | sort | tr '\n' ' ')
+if [ "$rc" -eq 0 ] && [ "$(cat "$work/out")" = "$(printf 'alpha\nbeta')" ] \
+    && [ "$listed" = "new.txt sub/b.txt " ] && [ "$(cat "$work/res/deleted.txt")" = "a.txt" ]; then
+  pass archive-and-changes
+else
+  fail "archive-and-changes: exit $rc, out [$(cat "$work/out")], changes [$listed], deleted [$(cat "$work/res/deleted.txt" 2>/dev/null)]"
+fi
+
+mkdir -p "$work/gz"
+rc=0
+"$bin" run --workspace "$work/gz" --archive "$work/ws.tar.gz" -- cat sub/b.txt > "$work/out" 2>&1 || rc=$?
+[ "$rc" -eq 0 ] && [ "$(cat "$work/out")" = beta ] && pass gzip-archive || fail "gzip-archive: exit $rc"
+
+python3 -c '
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w") as t:
+    data = b"escaped\n"
+    info = tarfile.TarInfo("../escaped.txt"); info.size = len(data)
+    t.addfile(info, io.BytesIO(data))
+' "$work/evil.tar"
+mkdir -p "$work/evil"
+rc=0
+"$bin" run --workspace "$work/evil" --archive "$work/evil.tar" -- true > "$work/out" 2> "$work/err" || rc=$?
+if [ "$rc" -eq 127 ] && grep -q "refused archive entry ../escaped.txt" "$work/err" \
+    && [ ! -e "$work/escaped.txt" ]; then
+  pass hostile-archive
+else
+  fail "hostile-archive: exit $rc, $(cat "$work/err")"
+fi
+
+start=$(date +%s); rc=0
+"$bin" run --workspace "$work/ws" --timeout-seconds 1 -- sleep 60 > /dev/null 2>&1 || rc=$?
+took=$(( $(date +%s) - start ))
+[ "$rc" -eq 124 ] && [ "$took" -lt 15 ] && pass timeout || fail "timeout: exit $rc after ${took}s"
+
+PEERSPAN_RUNTIME_BIN="$bin" python3 "$repo/scripts/check-serve.py" || failures=$((failures + 1))
+
 # Inspect a running VM from the host: the jailed VMM and the workspace server.
 "$bin" run --workspace "$work/ws" -- sleep 4 > /dev/null 2>&1 &
 run_pid=$!

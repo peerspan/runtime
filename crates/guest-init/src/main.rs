@@ -13,6 +13,7 @@ use std::io::{self, Read};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs as unix_fs;
 use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
 use std::process::{self, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -29,9 +30,9 @@ const NEW_ROOT: &str = "/rootfs";
 /// How long to keep retrying the vsock connection while the transport comes up.
 const CONNECT_ATTEMPTS: u32 = 100;
 const CONNECT_RETRY: Duration = Duration::from_millis(50);
-/// Exit code reported when the command cannot be started, as shells do.
-const EXIT_NOT_RUN: i32 = 127;
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+mod workspace;
 
 fn main() {
     if let Err(e) = run() {
@@ -75,9 +76,39 @@ fn run() -> io::Result<()> {
             )));
         }
     };
+    let workspace = Path::new(WORKSPACE_PATH);
+    let manifest = if command.archive {
+        match workspace::unpack(&mut reader, workspace) {
+            Ok(manifest) => manifest,
+            Err(reason) => return fail(&mut reader, &reason),
+        }
+    } else {
+        workspace::Manifest::new()
+    };
+
     let writer = Arc::new(Mutex::new(stream));
-    let code = execute(&command, &writer);
-    Message::Exit(code).write_to(&mut *writer.lock().expect("stream lock poisoned"))
+    let Some((code, signal)) = execute(&command, &writer) else {
+        return Message::Exited {
+            code: None,
+            signal: None,
+        }
+        .write_to(&mut *writer.lock().expect("stream lock poisoned"));
+    };
+    let mut stream = writer.lock().expect("stream lock poisoned");
+    if command.collect_changes {
+        workspace::send_changes(workspace, &manifest, &mut *stream)?;
+    }
+    Message::Exited { code, signal }.write_to(&mut *stream)
+}
+
+/// Reports a run that failed before its command started.
+fn fail(stream: &mut File, reason: &str) -> io::Result<()> {
+    Message::Failed(reason.to_owned()).write_to(stream)?;
+    Message::Exited {
+        code: None,
+        signal: None,
+    }
+    .write_to(stream)
 }
 
 fn mount(source: &str, target: &str, fstype: &str, flags: libc::c_ulong) -> io::Result<()> {
@@ -176,11 +207,13 @@ fn connect_vsock(cid: u32, port: u32) -> io::Result<File> {
     Ok(File::from(fd))
 }
 
-/// Runs the command, streaming its output, and returns the code to report.
-fn execute(command: &Command, writer: &Arc<Mutex<File>>) -> i32 {
+/// Runs the command, streaming its output, and returns its exit code or signal, or `None` if it
+/// could not be started, after reporting why.
+fn execute(command: &Command, writer: &Arc<Mutex<File>>) -> Option<(Option<i32>, Option<i32>)> {
+    let lock = || writer.lock().expect("stream lock poisoned");
     let Some((program, args)) = command.argv.split_first() else {
-        report(writer, "empty command");
-        return EXIT_NOT_RUN;
+        let _ = Message::Failed("empty command".into()).write_to(&mut *lock());
+        return None;
     };
     let mut child = process::Command::new(program);
     child
@@ -195,10 +228,13 @@ fn execute(command: &Command, writer: &Arc<Mutex<File>>) -> i32 {
     let mut child = match child.spawn() {
         Ok(child) => child,
         Err(e) => {
-            report(writer, &format!("cannot run {program}: {e}"));
-            return EXIT_NOT_RUN;
+            let _ = Message::Failed(format!("cannot run {program}: {e}")).write_to(&mut *lock());
+            return None;
         }
     };
+    if Message::Started.write_to(&mut *lock()).is_err() {
+        let _ = child.kill();
+    }
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
     let pumps = [
@@ -210,14 +246,8 @@ fn execute(command: &Command, writer: &Arc<Mutex<File>>) -> i32 {
         handle.join().expect("output pump panicked");
     }
     match status {
-        Ok(status) => status
-            .code()
-            .or_else(|| status.signal().map(|signal| 128 + signal))
-            .unwrap_or(EXIT_NOT_RUN),
-        Err(e) => {
-            report(writer, &format!("waiting for {program}: {e}"));
-            EXIT_NOT_RUN
-        }
+        Ok(status) => Some((status.code(), status.signal())),
+        Err(_) => Some((None, None)),
     }
 }
 
@@ -240,12 +270,4 @@ fn pump(
             }
         }
     })
-}
-
-/// Sends a runtime error to the command's standard error, where the caller will see it.
-fn report(writer: &Arc<Mutex<File>>, message: &str) {
-    let line = format!("peerspan-guest-init: {message}\n").into_bytes();
-    let mut stream = writer.lock().expect("stream lock poisoned");
-    // The final Exit frame carries the failure even if this write is lost.
-    let _ = Message::Stderr(line).write_to(&mut *stream);
 }

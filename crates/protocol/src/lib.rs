@@ -3,9 +3,12 @@
 
 //! Messages between the runtime and the init inside its microVM, and the names they share.
 //!
-//! The guest opens one vsock stream to the host. The runtime sends a single [`Message::Run`];
-//! the guest answers with output chunks and finally [`Message::Exit`]. Each message is a frame:
-//! a one-byte tag, a big-endian `u32` payload length, then the payload.
+//! The guest opens one vsock stream to the host. The host sends one [`Message::Run`], followed,
+//! when [`Command::archive`] is set, by the workspace archive as [`Message::ArchiveData`] frames
+//! and [`Message::ArchiveEnd`]. The guest answers with [`Message::Started`] or
+//! [`Message::Failed`], output chunks, the changes when [`Command::collect_changes`] is set, and
+//! finally [`Message::Exited`]. Each message is a frame: a one-byte tag, a big-endian `u32`
+//! payload length, then the payload.
 
 use std::io::{self, ErrorKind, Read, Write};
 
@@ -27,7 +30,16 @@ pub const MAX_PAYLOAD: usize = 16 << 20;
 const TAG_RUN: u8 = 1;
 const TAG_STDOUT: u8 = 2;
 const TAG_STDERR: u8 = 3;
-const TAG_EXIT: u8 = 4;
+const TAG_EXITED: u8 = 4;
+const TAG_ARCHIVE_DATA: u8 = 5;
+const TAG_ARCHIVE_END: u8 = 6;
+const TAG_STARTED: u8 = 7;
+const TAG_FAILED: u8 = 8;
+const TAG_CHANGES: u8 = 9;
+const TAG_DELETED: u8 = 10;
+
+/// Largest chunk of archive or changes data a writer puts in one frame.
+pub const DATA_CHUNK: usize = 64 * 1024;
 
 /// A command for the guest to run.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -38,6 +50,10 @@ pub struct Command {
     pub cwd: String,
     /// The complete environment, as name and value pairs.
     pub env: Vec<(String, String)>,
+    /// Whether a workspace archive follows, to unpack into the empty workspace first.
+    pub archive: bool,
+    /// Whether to send the files the command changed relative to the archive.
+    pub collect_changes: bool,
 }
 
 /// One frame on the guest's stream.
@@ -49,8 +65,23 @@ pub enum Message {
     Stdout(Vec<u8>),
     /// Guest to host: bytes the command wrote to standard error.
     Stderr(Vec<u8>),
-    /// Guest to host: the command's exit code, or 128 plus the signal that ended it.
-    Exit(i32),
+    /// Guest to host: how the command ended; at most one of the two is set.
+    Exited {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+    /// Host to guest: a piece of the workspace archive.
+    ArchiveData(Vec<u8>),
+    /// Host to guest: the end of the workspace archive.
+    ArchiveEnd,
+    /// Guest to host: the command is running.
+    Started,
+    /// Guest to host: the run failed before the command started, for the reason given.
+    Failed(String),
+    /// Guest to host: a piece of `changes.tar`, the files new or changed since the archive.
+    Changes(Vec<u8>),
+    /// Guest to host: a piece of `deleted.txt`, the paths removed since the archive.
+    Deleted(Vec<u8>),
 }
 
 impl Message {
@@ -65,7 +96,13 @@ impl Message {
             Message::Run(command) => (TAG_RUN, encode_command(command)),
             Message::Stdout(bytes) => (TAG_STDOUT, bytes.clone()),
             Message::Stderr(bytes) => (TAG_STDERR, bytes.clone()),
-            Message::Exit(code) => (TAG_EXIT, code.to_be_bytes().to_vec()),
+            Message::Exited { code, signal } => (TAG_EXITED, encode_exit(*code, *signal)),
+            Message::ArchiveData(bytes) => (TAG_ARCHIVE_DATA, bytes.clone()),
+            Message::ArchiveEnd => (TAG_ARCHIVE_END, Vec::new()),
+            Message::Started => (TAG_STARTED, Vec::new()),
+            Message::Failed(reason) => (TAG_FAILED, reason.as_bytes().to_vec()),
+            Message::Changes(bytes) => (TAG_CHANGES, bytes.clone()),
+            Message::Deleted(bytes) => (TAG_DELETED, bytes.clone()),
         };
         if payload.len() > MAX_PAYLOAD {
             return Err(io::Error::new(
@@ -109,12 +146,15 @@ impl Message {
             TAG_RUN => Message::Run(decode_command(&payload)?),
             TAG_STDOUT => Message::Stdout(payload),
             TAG_STDERR => Message::Stderr(payload),
-            TAG_EXIT => {
-                let code: [u8; 4] = payload
-                    .try_into()
-                    .map_err(|_| invalid("exit payload is not 4 bytes"))?;
-                Message::Exit(i32::from_be_bytes(code))
-            }
+            TAG_EXITED => decode_exit(&payload)?,
+            TAG_ARCHIVE_DATA => Message::ArchiveData(payload),
+            TAG_ARCHIVE_END => empty(&payload, Message::ArchiveEnd)?,
+            TAG_STARTED => empty(&payload, Message::Started)?,
+            TAG_FAILED => Message::Failed(
+                String::from_utf8(payload).map_err(|_| invalid("failure reason is not UTF-8"))?,
+            ),
+            TAG_CHANGES => Message::Changes(payload),
+            TAG_DELETED => Message::Deleted(payload),
             other => return Err(invalid(format!("unknown message tag {other}"))),
         };
         Ok(Some(message))
@@ -123,6 +163,41 @@ impl Message {
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, message.into())
+}
+
+fn empty(payload: &[u8], message: Message) -> io::Result<Message> {
+    if payload.is_empty() {
+        Ok(message)
+    } else {
+        Err(invalid("unexpected payload"))
+    }
+}
+
+/// A flags byte (bit 0: code present, bit 1: signal present), then the code and the signal as
+/// big-endian `i32`, zero when absent.
+fn encode_exit(code: Option<i32>, signal: Option<i32>) -> Vec<u8> {
+    let flags = u8::from(code.is_some()) | (u8::from(signal.is_some()) << 1);
+    let mut out = vec![flags];
+    out.extend_from_slice(&code.unwrap_or(0).to_be_bytes());
+    out.extend_from_slice(&signal.unwrap_or(0).to_be_bytes());
+    out
+}
+
+fn decode_exit(payload: &[u8]) -> io::Result<Message> {
+    let [flags, rest @ ..] = payload else {
+        return Err(invalid("empty exit payload"));
+    };
+    let (Some((code, signal)), true) = (rest.split_first_chunk::<4>(), rest.len() == 8) else {
+        return Err(invalid("exit payload is not 9 bytes"));
+    };
+    let signal: [u8; 4] = signal.try_into().expect("length checked");
+    if *flags > 0b11 {
+        return Err(invalid("unknown exit flags"));
+    }
+    Ok(Message::Exited {
+        code: (flags & 1 != 0).then(|| i32::from_be_bytes(*code)),
+        signal: (flags & 2 != 0).then(|| i32::from_be_bytes(signal)),
+    })
 }
 
 fn encode_command(command: &Command) -> Vec<u8> {
@@ -137,6 +212,8 @@ fn encode_command(command: &Command) -> Vec<u8> {
         put_str(&mut out, name);
         put_str(&mut out, value);
     }
+    out.push(u8::from(command.archive));
+    out.push(u8::from(command.collect_changes));
     out
 }
 
@@ -151,10 +228,21 @@ fn decode_command(payload: &[u8]) -> io::Result<Command> {
     let env = (0..envc)
         .map(|_| Ok((cursor.string()?, cursor.string()?)))
         .collect::<io::Result<Vec<_>>>()?;
-    if !cursor.rest.is_empty() {
-        return Err(invalid("trailing bytes after command"));
-    }
-    Ok(Command { argv, cwd, env })
+    let [archive, collect_changes] = *cursor.rest else {
+        return Err(invalid("command flags are not 2 bytes"));
+    };
+    let flag = |b: u8| match b {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(invalid("command flag is not 0 or 1")),
+    };
+    Ok(Command {
+        argv,
+        cwd,
+        env,
+        archive: flag(archive)?,
+        collect_changes: flag(collect_changes)?,
+    })
 }
 
 fn put_count(out: &mut Vec<u8>, count: usize) {
@@ -217,12 +305,30 @@ mod tests {
                     ("PATH".into(), "/bin".into()),
                     ("EMPTY".into(), String::new()),
                 ],
+                archive: true,
+                collect_changes: true,
             }),
             Message::Run(Command::default()),
             Message::Stdout(b"out\n".to_vec()),
             Message::Stderr(Vec::new()),
-            Message::Exit(-1),
-            Message::Exit(137),
+            Message::Exited {
+                code: Some(-1),
+                signal: None,
+            },
+            Message::Exited {
+                code: None,
+                signal: Some(9),
+            },
+            Message::Exited {
+                code: None,
+                signal: None,
+            },
+            Message::ArchiveData(vec![0; 3]),
+            Message::ArchiveEnd,
+            Message::Started,
+            Message::Failed("refused entry ../x".into()),
+            Message::Changes(b"tar".to_vec()),
+            Message::Deleted(b"a\nb\n".to_vec()),
         ];
         for message in &messages {
             assert_eq!(&round_trip(message), message);
@@ -264,7 +370,7 @@ mod tests {
     #[test]
     fn malformed_command_is_rejected() {
         let mut frame = vec![TAG_RUN];
-        let payload = [0u8, 0, 0, 1, 0, 0, 0, 9, b'x'];
+        let payload = [0u8, 0, 0, 1, 0, 0, 0, 9, b'x', 0, 0];
         frame.extend_from_slice(&u32::try_from(payload.len()).expect("small").to_be_bytes());
         frame.extend_from_slice(&payload);
         let err = Message::read_from(&mut frame.as_slice()).expect_err("truncated string");

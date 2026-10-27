@@ -36,8 +36,16 @@ scripts/check.sh   # end-to-end checks
 ```
 
 `run` mounts the workspace at `/workspace` in a fresh microVM, with a read-only Alpine root
-filesystem, runs the command there, streams its output, and exits with its code. Until peerfs
-serves workspaces, `virtiofsd` stands in for it. The guest has no network.
+filesystem, runs the command there, streams its output, and exits with its code (124 on
+`--timeout-seconds`, 127 if it never ran). `--archive FILE` unpacks a tar or tar.gz into an
+empty workspace inside the VM, refusing absolute paths, `..` and anything but directories,
+files and symbolic links; `--results-dir DIR` receives `changes.tar` and `deleted.txt`, what
+the command changed. Until peerfs serves workspaces, `virtiofsd` stands in for it. The guest
+has no network.
+
+`serve --socket PATH` is the local API the Peerspan host daemon drives: start a run, follow its
+events with a long poll, cancel it, collect its result files and delete it. The runtime task
+contract in the Peerspan host repository specifies it; `scripts/check-serve.py` exercises it.
 
 ## Confinement
 
@@ -58,10 +66,12 @@ check the confinement above.
 
 ## Layout
 
-- `crates/runtime`: the `peerspan-runtime` binary. `run` supervises one VM; `launch` is the
-  per-VM child that boots libkrun, which takes over its process.
-- `crates/guest-init`: PID 1 in the guest, a static binary that mounts the filesystems, runs
-  the command and streams its output back over vsock.
+- `crates/runtime`: the `peerspan-runtime` binary. `vm.rs` runs one VM; `run` and `serve` are
+  its two front ends; `launch` is the per-VM child that confines itself and boots libkrun,
+  which takes over its process.
+- `crates/guest-init`: PID 1 in the guest, a static binary that mounts the filesystems,
+  unpacks the workspace archive, runs the command, streams its output back over vsock, and
+  reports what it changed.
 - `crates/protocol`: the framing the two speak.
 - `scripts/`: the guest image build and end-to-end checks.
 

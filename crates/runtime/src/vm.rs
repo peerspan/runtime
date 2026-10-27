@@ -2,19 +2,22 @@
 // Copyright The Peerspan Authors
 
 //! Runs one command in one microVM: serves the workspace, starts the launcher, hands the
-//! command to the guest and relays its output.
+//! command and the workspace archive to the guest, and reports what happens as [`Event`]s.
 
 use std::fs::{self, File};
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, ErrorKind, Read};
+use std::net::Shutdown;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
-use peerspan_runtime_protocol::{self as protocol, Message, WORKSPACE_TAG};
+use peerspan_runtime_protocol::{self as protocol, DATA_CHUNK, Message, WORKSPACE_TAG};
 
 use crate::launcher::{AGENT_SOCKET, WORKSPACE_SOCKET};
 
@@ -33,26 +36,83 @@ const RUN_ID_MASK: u32 = 0x00ff_ffff;
 /// Console lines shown when the VM fails.
 const CONSOLE_TAIL_LINES: usize = 30;
 
+/// How often the watchdog checks for cancellation and the timeout.
+const WATCH_INTERVAL: Duration = Duration::from_millis(50);
+
 /// One command to run in one VM.
 #[derive(Debug)]
-pub struct RunOptions {
+pub struct VmSpec {
+    /// Host directory shared as the guest's workspace. With an archive it must be empty.
     pub workspace: PathBuf,
+    /// A tar archive, optionally gzip-compressed, unpacked into the workspace inside the VM.
+    pub archive: Option<PathBuf>,
     pub guest: PathBuf,
     pub libkrun: PathBuf,
     pub virtiofsd: PathBuf,
     pub cpus: u8,
     pub memory_mib: u32,
+    /// How long the command may run once started.
+    pub timeout: Option<Duration>,
     pub console_log: Option<PathBuf>,
+    /// The command; its `archive` flag is set from `archive` above.
     pub command: protocol::Command,
 }
 
-/// Runs the command and returns its exit code.
+/// Something the run reported.
+#[derive(Debug)]
+pub enum Event<'data> {
+    /// The command started.
+    Started,
+    Stdout(&'data [u8]),
+    Stderr(&'data [u8]),
+    /// A piece of `changes.tar`, when the command asked for changes.
+    Changes(&'data [u8]),
+    /// A piece of `deleted.txt`, when the command asked for changes.
+    Deleted(&'data [u8]),
+}
+
+/// How a run ended.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Outcome {
+    /// The command's exit status, if it exited.
+    pub exit_code: Option<i32>,
+    /// The signal that ended it; 9 after cancellation.
+    pub signal: Option<i32>,
+    pub timed_out: bool,
+    /// From the start of the command to its end; zero if it never started.
+    pub duration: Duration,
+    /// Why the run failed outside the command, if it did.
+    pub error: Option<String>,
+}
+
+/// Why the watchdog stopped a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    Cancelled,
+    TimedOut,
+}
+
+/// Runs the command, passing each event to `on_event`, and returns how it ended. Setting
+/// `cancel` stops the VM.
 ///
 /// # Errors
 ///
-/// Fails if the VM cannot be started or the guest does not report an exit code. The command
-/// failing is not an error; its code is returned.
-pub fn run(options: RunOptions) -> anyhow::Result<i32> {
+/// Fails if the VM cannot be set up or the guest never connects. A failure after the guest
+/// connects is reported in [`Outcome::error`] instead.
+pub fn run(
+    spec: &VmSpec,
+    cancel: &AtomicBool,
+    on_event: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
+) -> anyhow::Result<Outcome> {
+    let options = spec;
+    if let Some(archive) = &options.archive
+        && fs::read_dir(&options.workspace)?.next().is_some()
+    {
+        bail!(
+            "the workspace must be empty to unpack {} into it",
+            archive.display()
+        );
+    }
     let workspace = fs::canonicalize(&options.workspace)
         .with_context(|| format!("workspace {}", options.workspace.display()))?;
     let guest = GuestImage::open(&options.guest)?;
@@ -126,47 +186,147 @@ pub fn run(options: RunOptions) -> anyhow::Result<i32> {
             .context("starting the launcher")?,
     );
 
-    let outcome = serve_guest(&listener, &mut launcher.0, &options.command);
-    let code = match outcome {
-        Ok(code) => code,
+    let stream = match accept_guest(&listener, &mut launcher.0, cancel) {
+        Ok(stream) => stream,
         Err(e) => return Err(e.context(console_tail(&console_path))),
     };
+    let outcome = serve_guest(spec, stream, launcher.0.id(), cancel, on_event);
     if wait_with_timeout(&mut launcher.0, SHUTDOWN_TIMEOUT)?.is_none() {
         eprintln!("peerspan-runtime: the VM did not shut down; stopping it");
     }
-    Ok(code)
+    Ok(outcome)
 }
 
+/// Hands the guest its command and archive, and relays its messages until it reports an exit,
+/// the watchdog stops it, or the connection ends.
 fn serve_guest(
-    listener: &UnixListener,
-    launcher: &mut Child,
-    command: &protocol::Command,
-) -> anyhow::Result<i32> {
-    let mut stream = accept_guest(listener, launcher)?;
-    Message::Run(command.clone())
-        .write_to(&mut stream)
+    spec: &VmSpec,
+    mut stream: UnixStream,
+    launcher_pid: u32,
+    cancel: &AtomicBool,
+    on_event: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
+) -> Outcome {
+    let started: Mutex<Option<Instant>> = Mutex::new(None);
+    let stopped: Mutex<Option<Stop>> = Mutex::new(None);
+    let done = AtomicBool::new(false);
+    let mut outcome = Outcome::default();
+    thread::scope(|scope| {
+        let watched = stream.try_clone();
+        scope.spawn(|| {
+            let Ok(watched) = watched else { return };
+            while !done.load(Ordering::Relaxed) {
+                let timed_out = spec.timeout.is_some_and(|limit| {
+                    started
+                        .lock()
+                        .expect("lock poisoned")
+                        .is_some_and(|at| at.elapsed() >= limit)
+                });
+                let stop = if cancel.load(Ordering::Relaxed) {
+                    Some(Stop::Cancelled)
+                } else if timed_out {
+                    Some(Stop::TimedOut)
+                } else {
+                    None
+                };
+                if let Some(stop) = stop {
+                    *stopped.lock().expect("lock poisoned") = Some(stop);
+                    // The jailed VMM dies with the launcher.
+                    // SAFETY: kill takes only integers; the pid is our live child.
+                    unsafe { libc::kill(i32::try_from(launcher_pid).unwrap_or(0), libc::SIGKILL) };
+                    let _ = watched.shutdown(Shutdown::Both);
+                    return;
+                }
+                thread::sleep(WATCH_INTERVAL);
+            }
+        });
+        let result = converse(spec, &mut stream, &started, on_event);
+        done.store(true, Ordering::Relaxed);
+        let ran_for = started
+            .lock()
+            .expect("lock poisoned")
+            .map(|at| at.elapsed());
+        outcome.duration = ran_for.unwrap_or_default();
+        match (*stopped.lock().expect("lock poisoned"), result) {
+            (Some(Stop::Cancelled), _) => outcome.signal = Some(libc::SIGKILL),
+            (Some(Stop::TimedOut), _) => outcome.timed_out = true,
+            (None, Ok(Ended::Exited { code, signal })) => {
+                outcome.exit_code = code;
+                outcome.signal = signal;
+            }
+            (None, Ok(Ended::Failed(reason))) => outcome.error = Some(reason),
+            (None, Err(e)) => outcome.error = Some(format!("{e:#}")),
+        }
+    });
+    outcome
+}
+
+/// How the guest ended the conversation.
+enum Ended {
+    Exited {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+    Failed(String),
+}
+
+fn converse(
+    spec: &VmSpec,
+    stream: &mut UnixStream,
+    started: &Mutex<Option<Instant>>,
+    on_event: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
+) -> anyhow::Result<Ended> {
+    let mut command = spec.command.clone();
+    command.archive = spec.archive.is_some();
+    Message::Run(command)
+        .write_to(stream)
         .context("sending the command")?;
-    let mut stdout = io::stdout().lock();
-    let mut stderr = io::stderr().lock();
+    if let Some(archive) = &spec.archive {
+        send_archive(archive, stream).context("sending the workspace archive")?;
+    }
+    let mut failure = None;
     loop {
-        match Message::read_from(&mut stream).context("reading from the guest")? {
-            Some(Message::Stdout(bytes)) => {
-                stdout.write_all(&bytes)?;
-                stdout.flush()?;
+        let message = Message::read_from(stream).context("reading from the guest")?;
+        match message {
+            Some(Message::Started) => {
+                *started.lock().expect("lock poisoned") = Some(Instant::now());
+                on_event(Event::Started)?;
             }
-            Some(Message::Stderr(bytes)) => {
-                stderr.write_all(&bytes)?;
-                stderr.flush()?;
+            Some(Message::Stdout(bytes)) => on_event(Event::Stdout(&bytes))?,
+            Some(Message::Stderr(bytes)) => on_event(Event::Stderr(&bytes))?,
+            Some(Message::Changes(bytes)) => on_event(Event::Changes(&bytes))?,
+            Some(Message::Deleted(bytes)) => on_event(Event::Deleted(&bytes))?,
+            Some(Message::Failed(reason)) => failure = Some(reason),
+            Some(Message::Exited { code, signal }) => {
+                return Ok(match failure {
+                    Some(reason) => Ended::Failed(reason),
+                    None => Ended::Exited { code, signal },
+                });
             }
-            Some(Message::Exit(code)) => return Ok(code),
             Some(other) => bail!("unexpected message from the guest: {other:?}"),
-            None => bail!("the guest closed the connection without an exit code"),
+            None => bail!("the VM exited before the command reported"),
         }
     }
 }
 
-/// Waits for the guest to connect, failing early if the launcher exits first.
-fn accept_guest(listener: &UnixListener, launcher: &mut Child) -> anyhow::Result<UnixStream> {
+fn send_archive(path: &Path, stream: &mut UnixStream) -> io::Result<()> {
+    let mut file = File::open(path)?;
+    let mut buf = vec![0u8; DATA_CHUNK];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            return Message::ArchiveEnd.write_to(stream);
+        }
+        Message::ArchiveData(buf[..n].to_vec()).write_to(stream)?;
+    }
+}
+
+/// Waits for the guest to connect, failing early if the launcher exits first or the run is
+/// cancelled.
+fn accept_guest(
+    listener: &UnixListener,
+    launcher: &mut Child,
+    cancel: &AtomicBool,
+) -> anyhow::Result<UnixStream> {
     listener.set_nonblocking(true)?;
     let deadline = Instant::now() + GUEST_CONNECT_TIMEOUT;
     loop {
@@ -180,6 +340,9 @@ fn accept_guest(listener: &UnixListener, launcher: &mut Child) -> anyhow::Result
         }
         if let Some(status) = launcher.try_wait()? {
             bail!("the VM exited before the guest connected ({status})");
+        }
+        if cancel.load(Ordering::Relaxed) {
+            bail!("cancelled before the guest connected");
         }
         if Instant::now() >= deadline {
             bail!("the guest did not connect within {GUEST_CONNECT_TIMEOUT:?}");
