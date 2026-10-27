@@ -6,6 +6,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Write};
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -15,6 +16,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, bail};
 use peerspan_runtime_protocol::{self as protocol, Message, WORKSPACE_TAG};
 
+use crate::launcher::{AGENT_SOCKET, WORKSPACE_SOCKET};
+
 /// How long the workspace server has to create its socket.
 const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the guest has, from launch, to boot and connect.
@@ -22,6 +25,11 @@ const GUEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the launcher has to exit after the guest reports the command's exit.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// Each run's VMM runs as its own user and group, numbered from this base, which is far above
+/// the IDs distributions assign so that it never matches a real account.
+const RUN_ID_BASE: u32 = 0x7000_0000;
+/// Low bits that vary between runs; a collision needs two concurrent runs with equal bits.
+const RUN_ID_MASK: u32 = 0x00ff_ffff;
 /// Console lines shown when the VM fails.
 const CONSOLE_TAIL_LINES: usize = 30;
 
@@ -48,20 +56,29 @@ pub fn run(options: RunOptions) -> anyhow::Result<i32> {
     let workspace = fs::canonicalize(&options.workspace)
         .with_context(|| format!("workspace {}", options.workspace.display()))?;
     let guest = GuestImage::open(&options.guest)?;
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("peerspan-runtime must run as root to confine its VMs");
+    }
     let run_dir = RunDir::create()?;
+    let id = run_dir.id;
+    let sockets = run_dir.path.join("sockets");
+    fs::DirBuilder::new().mode(0o700).create(&sockets)?;
+    chown(&sockets, id)?;
+    let jail = run_dir.path.join("jail");
+    fs::DirBuilder::new().mode(0o700).create(&jail)?;
     let console_path = options
         .console_log
         .clone()
         .unwrap_or_else(|| run_dir.path.join("console.log"));
 
-    let workspace_socket = run_dir.path.join("workspace.sock");
+    let workspace_socket = sockets.join(WORKSPACE_SOCKET);
     let _server = ChildGuard(
         Command::new(&options.virtiofsd)
             .arg(format!("--socket-path={}", workspace_socket.display()))
             .arg(format!("--shared-dir={}", workspace.display()))
             .arg(format!("--tag={WORKSPACE_TAG}"))
             .arg("--cache=auto")
-            .arg("--sandbox=none")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(File::create(run_dir.path.join("virtiofsd.log"))?)
@@ -70,10 +87,12 @@ pub fn run(options: RunOptions) -> anyhow::Result<i32> {
     );
     wait_for_path(&workspace_socket, SERVER_READY_TIMEOUT)
         .context("workspace server did not create its socket")?;
+    chown(&workspace_socket, id)?;
 
-    let agent_socket = run_dir.path.join("agent.sock");
+    let agent_socket = sockets.join(AGENT_SOCKET);
     let listener = UnixListener::bind(&agent_socket)
         .with_context(|| format!("binding {}", agent_socket.display()))?;
+    chown(&agent_socket, id)?;
 
     let console = File::create(&console_path)
         .with_context(|| format!("creating {}", console_path.display()))?;
@@ -88,10 +107,14 @@ pub fn run(options: RunOptions) -> anyhow::Result<i32> {
             .arg(&guest.initrd)
             .arg("--rootfs")
             .arg(&guest.rootfs)
-            .arg("--workspace-socket")
-            .arg(&workspace_socket)
-            .arg("--agent-socket")
-            .arg(&agent_socket)
+            .arg("--sockets")
+            .arg(&sockets)
+            .arg("--jail")
+            .arg(&jail)
+            .arg("--uid")
+            .arg(id.to_string())
+            .arg("--gid")
+            .arg(id.to_string())
             .arg("--cpus")
             .arg(options.cpus.to_string())
             .arg("--memory-mib")
@@ -227,10 +250,12 @@ impl GuestImage {
     }
 }
 
-/// A private directory for one run's sockets and logs, removed on drop.
+/// A private directory for one run's sockets, jail and logs, removed on drop, and the user and
+/// group ID the run's VMM becomes.
 #[derive(Debug)]
 struct RunDir {
     path: PathBuf,
+    id: u32,
 }
 
 impl RunDir {
@@ -238,11 +263,19 @@ impl RunDir {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos());
-        let path =
-            std::env::temp_dir().join(format!("peerspan-runtime-{}-{nanos}", std::process::id()));
-        fs::create_dir(&path).with_context(|| format!("creating {}", path.display()))?;
-        Ok(RunDir { path })
+        let id = RUN_ID_BASE + ((nanos ^ std::process::id().rotate_left(16)) & RUN_ID_MASK);
+        let path = std::env::temp_dir().join(format!("peerspan-runtime-{id}"));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        Ok(RunDir { path, id })
     }
+}
+
+fn chown(path: &Path, id: u32) -> anyhow::Result<()> {
+    std::os::unix::fs::chown(path, Some(id), Some(id))
+        .with_context(|| format!("giving {} to the run's user", path.display()))
 }
 
 impl Drop for RunDir {

@@ -49,5 +49,8 @@ jobs:
           GUEST_ROOT="$RUNNER_TEMP/kernel" GUEST_KERNEL_VERSION="$version" scripts/build-guest.sh "$RUNNER_TEMP/guest"
           echo "PEERSPAN_RUNTIME_GUEST=$RUNNER_TEMP/guest" >> "$GITHUB_ENV"
 
+      # The runtime confines each VM, which needs root.
       - name: Run checks
-        run: scripts/check.sh
+        run: |
+          cargo build --release -p peerspan-runtime
+          sudo --preserve-env=PEERSPAN_LIBKRUN,PEERSPAN_RUNTIME_GUEST env "PATH=$PATH" "CARGO_HOME=$CARGO_HOME" "RUSTUP_HOME=$RUSTUP_HOME" scripts/check.sh

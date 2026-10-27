@@ -1,19 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright The Peerspan Authors
 
-//! The per-VM child process: boots one microVM and never returns.
+//! The per-VM child process: confines itself, boots one microVM and never returns.
 
 use std::convert::Infallible;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use anyhow::Context;
 use clap::Args;
 use peerspan_runtime_protocol::{AGENT_PORT, ROOTFS_TAG, WORKSPACE_TAG};
 
-use crate::krun::{self, VmConfig};
+use crate::jail::{self, Jail};
+use crate::krun::{Libkrun, VmConfig};
 
 /// Kernel command line for runtime guests. `reboot=k` makes the guest's reboot end the VM.
 pub const KERNEL_CMDLINE: &str = "console=hvc0 rdinit=/init panic=-1 reboot=k quiet";
+
+/// Socket names inside the sockets directory.
+pub const WORKSPACE_SOCKET: &str = "workspace.sock";
+pub const AGENT_SOCKET: &str = "agent.sock";
 
 #[derive(Debug, Args)]
 pub struct LaunchArgs {
@@ -25,39 +29,53 @@ pub struct LaunchArgs {
     pub initrd: PathBuf,
     #[arg(long)]
     pub rootfs: PathBuf,
+    /// Directory holding the workspace and agent sockets.
     #[arg(long)]
-    pub workspace_socket: PathBuf,
+    pub sockets: PathBuf,
+    /// Empty directory to build the jail in.
     #[arg(long)]
-    pub agent_socket: PathBuf,
+    pub jail: PathBuf,
+    #[arg(long)]
+    pub uid: u32,
+    #[arg(long)]
+    pub gid: u32,
     #[arg(long)]
     pub cpus: u8,
     #[arg(long)]
     pub memory_mib: u32,
 }
 
-/// Boots the VM described by `args`.
+/// Confines this process and boots the VM described by `args`.
 ///
 /// # Errors
 ///
-/// Fails before the VM starts, if a path is not UTF-8 or libkrun rejects the configuration.
+/// Fails before the VM starts, if libkrun cannot be loaded, confinement fails, or libkrun
+/// rejects the configuration.
 pub fn launch(args: &LaunchArgs) -> anyhow::Result<Infallible> {
-    let config = VmConfig {
+    let libkrun = Libkrun::load(&args.libkrun)?;
+    Jail {
+        dir: &args.jail,
+        rootfs: &args.rootfs,
+        kernel: &args.kernel,
+        initrd: &args.initrd,
+        sockets: &args.sockets,
+        uid: args.uid,
+        gid: args.gid,
+    }
+    .enter()?;
+    let workspace_socket = format!("{}/{WORKSPACE_SOCKET}", jail::SOCKETS);
+    let agent_socket = format!("{}/{AGENT_SOCKET}", jail::SOCKETS);
+    libkrun.boot(&VmConfig {
         cpus: args.cpus,
         memory_mib: args.memory_mib,
-        kernel: utf8(&args.kernel)?,
-        initrd: utf8(&args.initrd)?,
+        kernel: jail::KERNEL,
+        initrd: jail::INITRD,
         cmdline: KERNEL_CMDLINE,
         rootfs_tag: ROOTFS_TAG,
-        rootfs_dir: utf8(&args.rootfs)?,
+        rootfs_dir: jail::ROOTFS,
         workspace_tag: WORKSPACE_TAG,
-        workspace_socket: utf8(&args.workspace_socket)?,
+        workspace_socket: &workspace_socket,
         agent_port: AGENT_PORT,
-        agent_socket: utf8(&args.agent_socket)?,
-    };
-    krun::boot(&args.libkrun, &config)
-}
-
-fn utf8(path: &Path) -> anyhow::Result<&str> {
-    path.to_str()
-        .with_context(|| format!("path is not UTF-8: {}", path.display()))
+        agent_socket: &agent_socket,
+    })
 }

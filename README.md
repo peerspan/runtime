@@ -21,7 +21,8 @@ machines, with the results coming back to the agent that asked.
 
 ## Trying it
 
-Linux x86_64 with `/dev/kvm` only, for now. You need libkrun built from the `peerspan`
+Linux x86_64 with `/dev/kvm` only, for now, run as root (see Confinement). You need libkrun
+built from the `peerspan`
 branch of [peerspan/libkrun](https://github.com/peerspan/libkrun) with `make VHOST_USER=1`,
 `virtiofsd`, the `x86_64-unknown-linux-musl` Rust target, and a guest kernel with virtio-mmio
 command-line devices (Ubuntu's generic kernel works).
@@ -36,8 +37,24 @@ scripts/check.sh   # end-to-end checks
 
 `run` mounts the workspace at `/workspace` in a fresh microVM, with a read-only Alpine root
 filesystem, runs the command there, streams its output, and exits with its code. Until peerfs
-serves workspaces, `virtiofsd` stands in for it. The VMM process is not yet confined, and the
-guest has no network.
+serves workspaces, `virtiofsd` stands in for it. The guest has no network.
+
+## Confinement
+
+libkrun's devices act with the authority of the process that runs them, so each VM's process
+is confined before libkrun sees any guest input:
+
+- new mount, PID, network, IPC and UTS namespaces, so it has no network and sees only itself;
+- a `pivot_root` into a root holding only the guest's read-only root filesystem, kernel and
+  initramfs, the run's two sockets, `/dev/kvm`, and its own `/proc`;
+- its own user and group, a fresh ID per run with only the `kvm` group, no capabilities,
+  `no_new_privs`, and not dumpable.
+
+The workspace server runs in `virtiofsd`'s namespace sandbox with its seccomp filter, so its
+file access stays inside the workspace. Setting this up needs root, as Firecracker's jailer
+does. Not yet: a seccomp filter for the VMM, resource limits through cgroups, and running the
+workspace server as the run's user. `scripts/check.sh` inspects a running VM from the host to
+check the confinement above.
 
 ## Layout
 

@@ -3,6 +3,7 @@
 
 //! `peerspan-runtime`: runs agent work in microVMs.
 
+mod jail;
 mod krun;
 mod launcher;
 mod supervisor;

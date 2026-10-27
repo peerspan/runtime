@@ -105,104 +105,135 @@ pub struct VmConfig<'cfg> {
     pub agent_socket: &'cfg str,
 }
 
-/// Loads libkrun, builds the VM and runs it.
+/// A loaded libkrun.
 ///
-/// On success this never returns: libkrun runs the VM on this thread and exits the process
-/// when the guest shuts down.
-///
-/// # Errors
-///
-/// Fails if the library or a symbol cannot be loaded, or if libkrun rejects the configuration.
-pub fn boot(library: &Path, config: &VmConfig<'_>) -> anyhow::Result<Infallible> {
-    let api = Api::load(library)?;
-    let mut err: Handle = ptr::null_mut();
+/// Loading happens before the launcher confines itself, because the library's path is
+/// outside the jail.
+#[derive(Debug)]
+pub struct Libkrun {
+    api: Api,
+}
 
-    // SAFETY: every call below passes handles that libkrun returned and has not consumed,
-    // KrunStr values borrowed from strings that outlive the call, and a valid error out-pointer
-    // that `check` resets after reading.
-    unsafe {
-        api.check(
-            (api.init_log)(-1, KRUN_LOG_LEVEL_WARN, KRUN_LOG_STYLE_AUTO, 0, &mut err),
-            &mut err,
-            "init log",
-        )?;
-        let devices = (api.mmio_device_manager_new)();
-
-        let console = (api.console_device_builder)();
-        api.check(
-            (api.console_builder_add_default_console)(console, 0, 1, 2, &mut err),
-            &mut err,
-            "add console",
-        )?;
-        let console = api.handle(
-            (api.console_builder_build)(console, &mut err),
-            &mut err,
-            "build console",
-        )?;
-        (api.mmio_device_manager_add)(devices, console);
-
-        let rootfs = (api.fs_device_new_read_only)(
-            KrunStr::new(config.rootfs_tag),
-            KrunStr::new(config.rootfs_dir),
-            &mut err,
-        );
-        (api.mmio_device_manager_add)(devices, api.handle(rootfs, &mut err, "root filesystem")?);
-
-        let workspace = (api.vhost_user_device_new)(
-            VIRTIO_ID_FS,
-            KrunStr::new(config.workspace_socket),
-            KrunStr::new(config.workspace_tag),
-            u16::try_from(FS_QUEUE_SIZES.len()).expect("two queues"),
-            FS_QUEUE_SIZES.as_ptr(),
-            FS_QUEUE_SIZES.len(),
-            &mut err,
-        );
-        (api.mmio_device_manager_add)(devices, api.handle(workspace, &mut err, "workspace")?);
-
-        // No TSI: the guest reaches the host only through the mapped Unix socket.
-        let vsock = api.handle(
-            (api.vsock_device_new)(GUEST_CID, 0, &mut err),
-            &mut err,
-            "vsock",
-        )?;
-        (api.vsock_device_add_unix_port)(
-            vsock,
-            config.agent_port,
-            KrunStr::new(config.agent_socket),
-            false,
-        );
-        (api.mmio_device_manager_add)(devices, vsock);
-
-        let payload = (api.payload_load_external)(
-            KrunStr::new(config.kernel),
-            KRUN_KERNEL_FORMAT_ELF,
-            KrunStr::new(config.initrd),
-            KrunStr::new(config.cmdline),
-            &mut err,
-        );
-        let payload = api.handle(payload, &mut err, "load kernel")?;
-
-        let mut builder = (api.vmm_builder_new)();
-        api.check(
-            (api.vmm_builder_vcpus)(&mut builder, config.cpus, &mut err),
-            &mut err,
-            "set vCPUs",
-        )?;
-        api.check(
-            (api.vmm_builder_ram_mib)(&mut builder, config.memory_mib, &mut err),
-            &mut err,
-            "set memory",
-        )?;
-        (api.vmm_builder_payload)(&mut builder, payload);
-        (api.vmm_builder_devices)(&mut builder, devices);
-        let vmm = api.handle(
-            (api.vmm_builder_build)(&mut builder, &mut err),
-            &mut err,
-            "build VM",
-        )?;
-        (api.vmm_run)(vmm);
+impl std::fmt::Debug for Api {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Api").finish_non_exhaustive()
     }
-    bail!("libkrun returned from running the VM")
+}
+
+impl Libkrun {
+    /// Loads the library and resolves every symbol the launcher uses.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the library or a symbol cannot be loaded.
+    pub fn load(library: &Path) -> anyhow::Result<Libkrun> {
+        Ok(Libkrun {
+            api: Api::load(library)?,
+        })
+    }
+
+    /// Builds the VM and runs it.
+    ///
+    /// On success this never returns: libkrun runs the VM on this thread and exits the process
+    /// when the guest shuts down.
+    ///
+    /// # Errors
+    ///
+    /// Fails if libkrun rejects the configuration.
+    pub fn boot(&self, config: &VmConfig<'_>) -> anyhow::Result<Infallible> {
+        let api = &self.api;
+        let mut err: Handle = ptr::null_mut();
+
+        // SAFETY: every call below passes handles that libkrun returned and has not consumed,
+        // KrunStr values borrowed from strings that outlive the call, and a valid error out-pointer
+        // that `check` resets after reading.
+        unsafe {
+            api.check(
+                (api.init_log)(-1, KRUN_LOG_LEVEL_WARN, KRUN_LOG_STYLE_AUTO, 0, &mut err),
+                &mut err,
+                "init log",
+            )?;
+            let devices = (api.mmio_device_manager_new)();
+
+            let console = (api.console_device_builder)();
+            api.check(
+                (api.console_builder_add_default_console)(console, 0, 1, 2, &mut err),
+                &mut err,
+                "add console",
+            )?;
+            let console = api.handle(
+                (api.console_builder_build)(console, &mut err),
+                &mut err,
+                "build console",
+            )?;
+            (api.mmio_device_manager_add)(devices, console);
+
+            let rootfs = (api.fs_device_new_read_only)(
+                KrunStr::new(config.rootfs_tag),
+                KrunStr::new(config.rootfs_dir),
+                &mut err,
+            );
+            (api.mmio_device_manager_add)(
+                devices,
+                api.handle(rootfs, &mut err, "root filesystem")?,
+            );
+
+            let workspace = (api.vhost_user_device_new)(
+                VIRTIO_ID_FS,
+                KrunStr::new(config.workspace_socket),
+                KrunStr::new(config.workspace_tag),
+                u16::try_from(FS_QUEUE_SIZES.len()).expect("two queues"),
+                FS_QUEUE_SIZES.as_ptr(),
+                FS_QUEUE_SIZES.len(),
+                &mut err,
+            );
+            (api.mmio_device_manager_add)(devices, api.handle(workspace, &mut err, "workspace")?);
+
+            // No TSI: the guest reaches the host only through the mapped Unix socket.
+            let vsock = api.handle(
+                (api.vsock_device_new)(GUEST_CID, 0, &mut err),
+                &mut err,
+                "vsock",
+            )?;
+            (api.vsock_device_add_unix_port)(
+                vsock,
+                config.agent_port,
+                KrunStr::new(config.agent_socket),
+                false,
+            );
+            (api.mmio_device_manager_add)(devices, vsock);
+
+            let payload = (api.payload_load_external)(
+                KrunStr::new(config.kernel),
+                KRUN_KERNEL_FORMAT_ELF,
+                KrunStr::new(config.initrd),
+                KrunStr::new(config.cmdline),
+                &mut err,
+            );
+            let payload = api.handle(payload, &mut err, "load kernel")?;
+
+            let mut builder = (api.vmm_builder_new)();
+            api.check(
+                (api.vmm_builder_vcpus)(&mut builder, config.cpus, &mut err),
+                &mut err,
+                "set vCPUs",
+            )?;
+            api.check(
+                (api.vmm_builder_ram_mib)(&mut builder, config.memory_mib, &mut err),
+                &mut err,
+                "set memory",
+            )?;
+            (api.vmm_builder_payload)(&mut builder, payload);
+            (api.vmm_builder_devices)(&mut builder, devices);
+            let vmm = api.handle(
+                (api.vmm_builder_build)(&mut builder, &mut err),
+                &mut err,
+                "build VM",
+            )?;
+            (api.vmm_run)(vmm);
+        }
+        bail!("libkrun returned from running the VM")
+    }
 }
 
 impl Api {
