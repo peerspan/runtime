@@ -1,8 +1,15 @@
 name: CI
+# Kept light while the project takes shape: the cheap check runs on pushes, and the KVM job,
+# which builds libkrun and boots VMs, only when started by hand (or locally: scripts/check.sh).
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -18,6 +25,7 @@ jobs:
 
   vm:
     name: microVM checks (Linux x86_64)
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
