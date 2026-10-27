@@ -1,0 +1,17 @@
+[package]
+name = "peerspan-runtime"
+description = "Peerspan's runtime: lightweight VMs for agent collaboration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+libloading = "0.8"
+peerspan-runtime-protocol.workspace = true
+
+[lints]
+workspace = true

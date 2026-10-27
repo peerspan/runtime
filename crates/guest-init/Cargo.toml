@@ -1,0 +1,15 @@
+[package]
+name = "peerspan-guest-init"
+description = "PID 1 inside Peerspan runtime microVMs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc = "0.2"
+peerspan-runtime-protocol.workspace = true
+
+[lints]
+workspace = true
