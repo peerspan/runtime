@@ -268,12 +268,20 @@ fn handle(runtime: &Arc<Runtime>, mut request: Request) {
             Ok(body) => {
                 let (status, record) = start(runtime, &body);
                 if status >= 400 {
-                    // The id as sent, if any, since the request may not have parsed.
+                    // The id as sent, if the request parsed that far and it has an id's form.
                     let id = serde_json::from_slice::<Value>(&body)
                         .ok()
                         .and_then(|v| v.get("run_id").and_then(Value::as_str).map(str::to_owned))
+                        .filter(|id| is_run_id(id))
                         .unwrap_or_default();
-                    let reason = record["error"].as_str().unwrap_or_default().to_owned();
+                    // An invalid request's reason can quote what it was sent, such as a
+                    // malformed environment, so only the other refusals', which are fixed
+                    // texts, go in the log.
+                    let reason = if status == 400 {
+                        "the request is invalid".to_owned()
+                    } else {
+                        record["error"].as_str().unwrap_or_default().to_owned()
+                    };
                     crate::log::info(
                         "run refused",
                         &[("run", &id), ("status", &status), ("reason", &reason)],
@@ -413,13 +421,18 @@ fn start(runtime: &Arc<Runtime>, body: &[u8]) -> (u16, Value) {
     (201, record)
 }
 
-fn validate(request: &RunRequest) -> Result<(), String> {
-    let id_ok = request.run_id.strip_prefix("run_").is_some_and(|hex| {
+/// Whether `id` has a run id's form: `run_` and 64 lowercase hex digits.
+fn is_run_id(id: &str) -> bool {
+    id.strip_prefix("run_").is_some_and(|hex| {
         hex.len() == 64
             && hex
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    });
+    })
+}
+
+fn validate(request: &RunRequest) -> Result<(), String> {
+    let id_ok = is_run_id(&request.run_id);
     if !id_ok {
         return Err("run_id must be run_ and 64 lowercase hex digits".into());
     }

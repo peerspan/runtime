@@ -185,6 +185,10 @@ def main():
         check("delete", status == 200 and gone == 404
               and not os.path.exists(os.path.join(state, "runs", run_id(1))), (status, gone))
 
+        # A malformed request's reason, which can quote what it was sent, stays out of the log.
+        status, _ = call(sock, "POST", "/v1/runs", {**request(9, ["true"]), "env": "TOKEN=hunter2"})
+        check("malformed", status == 400, status)
+
         # The log has one timestamped line per event, the first run's whole life among them,
         # and nothing of what the runs were given beyond the program's name.
         log = open(log_path).read()
@@ -197,7 +201,8 @@ def main():
                  if event != "run refused"]
         check("log", well_formed and first[:4] == ["run accepted", "run started", "run finished",
                                                    "run deleted"]
-              and "run refused" in log and "input.txt" not in log and "GREETING" not in log,
+              and "run refused" in log and "input.txt" not in log and "GREETING" not in log
+              and "hunter2" not in log,
               (first, [line for line in lines if not re.match(r"\d{4}-", line)][:3]))
         # A second serve may not share the state directory. A serve killed outright leaves its
         # runs behind, and the next one removes them: their directories, workspaces and records.
