@@ -19,12 +19,12 @@
 
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, PipeReader, Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs as unix_fs;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
-use std::process::{self, Stdio};
+use std::process::{self, ChildStdin, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -179,7 +179,7 @@ fn run(mut phases: Phases) -> io::Result<()> {
     phases.mark("unpacked");
 
     let writer = Arc::new(Mutex::new(stream));
-    let Some((code, signal)) = execute(&command, &writer, phases) else {
+    let Some((code, signal)) = execute(&command, reader, &writer, phases) else {
         return Message::Exited {
             code: None,
             signal: None,
@@ -303,28 +303,51 @@ fn connect_vsock(cid: u32, port: u32) -> io::Result<File> {
 /// could not be started, after reporting why.
 fn execute(
     command: &Command,
+    reader: File,
     writer: &Arc<Mutex<File>>,
     mut phases: Phases,
 ) -> Option<(Option<i32>, Option<i32>)> {
     let lock = || writer.lock().expect("stream lock poisoned");
+    let fail = |reason: String| {
+        let _ = Message::Failed(reason).write_to(&mut *lock());
+    };
     let Some((program, args)) = command.argv.split_first() else {
-        let _ = Message::Failed("empty command".into()).write_to(&mut *lock());
+        fail("empty command".into());
         return None;
     };
-    let mut child = process::Command::new(program);
-    child
+    let mut spawner = process::Command::new(program);
+    spawner
         .args(args)
         .current_dir(&command.cwd)
         .env_clear()
         .env("PATH", DEFAULT_PATH)
         .envs(command.env.iter().map(|(name, value)| (name, value)))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = match child.spawn() {
+        .stdin(if command.stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+    // Combined output shares one pipe between the two descriptors, which keeps the order of
+    // the command's writes; two pipes cannot.
+    let combined = if command.combined_output {
+        match combined_pipe(&mut spawner) {
+            Ok(reader) => Some(reader),
+            Err(e) => {
+                fail(format!("creating the output pipe: {e}"));
+                return None;
+            }
+        }
+    } else {
+        spawner.stdout(Stdio::piped()).stderr(Stdio::piped());
+        None
+    };
+    let spawned = spawner.spawn();
+    // The command holds the shared pipe's write ends; its output ends only once they close.
+    drop(spawner);
+    let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
-            let _ = Message::Failed(format!("cannot run {program}: {e}")).write_to(&mut *lock());
+            fail(format!("cannot run {program}: {e}"));
             return None;
         }
     };
@@ -336,12 +359,24 @@ fn execute(
     {
         let _ = child.kill();
     }
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
-    let pumps = [
-        pump(stdout, Arc::clone(writer), Message::Stdout),
-        pump(stderr, Arc::clone(writer), Message::Stderr),
-    ];
+    if let Some(stdin) = child.stdin.take() {
+        feed_stdin(reader, stdin);
+    }
+    let pumps = match combined {
+        Some(output) => vec![pump(output, Arc::clone(writer), Message::Stdout)],
+        None => vec![
+            pump(
+                child.stdout.take().expect("stdout is piped"),
+                Arc::clone(writer),
+                Message::Stdout,
+            ),
+            pump(
+                child.stderr.take().expect("stderr is piped"),
+                Arc::clone(writer),
+                Message::Stderr,
+            ),
+        ],
+    };
     let status = child.wait();
     for handle in pumps {
         handle.join().expect("output pump panicked");
@@ -350,6 +385,34 @@ fn execute(
         Ok(status) => Some((status.code(), status.signal())),
         Err(_) => Some((None, None)),
     }
+}
+
+/// Points the command's standard output and error at one new pipe, and returns its read end.
+fn combined_pipe(spawner: &mut process::Command) -> io::Result<PipeReader> {
+    let (reader, writer) = io::pipe()?;
+    spawner.stdout(writer.try_clone()?).stderr(writer);
+    Ok(reader)
+}
+
+/// Copies the host's [`Message::Stdin`] frames to the command's standard input, and closes it
+/// at [`Message::StdinEnd`]. Input the command no longer reads is discarded. The thread ends
+/// with the VM if the input never does.
+fn feed_stdin(mut stream: File, stdin: ChildStdin) {
+    thread::spawn(move || {
+        let mut stdin = Some(stdin);
+        loop {
+            match Message::read_from(&mut stream) {
+                Ok(Some(Message::Stdin(bytes))) => {
+                    if let Some(pipe) = stdin.as_mut()
+                        && pipe.write_all(&bytes).is_err()
+                    {
+                        stdin = None;
+                    }
+                }
+                _ => return,
+            }
+        }
+    });
 }
 
 /// Copies one output pipe to the host until it closes.

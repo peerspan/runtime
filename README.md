@@ -43,7 +43,12 @@ filesystem, runs the command there, streams its output, and exits with its code 
 empty workspace inside the VM, refusing absolute paths, `..` and anything but directories,
 files and symbolic links; `--results-dir DIR` receives `changes.tar` and `deleted.txt`, what
 the command changed. Until peerfs serves workspaces, `virtiofsd` stands in for it.
-`--network` sets what the guest may reach (see Network).
+`--network` sets what the guest may reach (see Network). The command's standard input is empty
+unless `--stdin` passes the runtime's own to it, streamed as it arrives and closed at its end.
+Its standard output and error stream back separately, which cannot keep the order of writes
+between the two; `--combined-output` sends both to standard output, as `2>&1` does, in the order
+they were written. `serve` has neither yet: the runtime task contract has no standard input and
+keeps the streams apart.
 
 `serve --socket PATH` is the local API the Peerspan host daemon drives: start a run, follow its
 events with a long poll, cancel it, collect its result files and delete it. The runtime task

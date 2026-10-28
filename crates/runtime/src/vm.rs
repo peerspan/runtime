@@ -62,6 +62,9 @@ pub struct VmSpec {
     pub own_workspace: bool,
     /// A tar archive, optionally gzip-compressed, unpacked into the workspace inside the VM.
     pub archive: Option<PathBuf>,
+    /// The command's standard input, streamed as it is read; without it the command reads an
+    /// empty one.
+    pub stdin: Option<File>,
     pub guest: PathBuf,
     pub libkrun: PathBuf,
     pub virtiofsd: PathBuf,
@@ -492,11 +495,15 @@ fn converse(
     let mut command = spec.command.clone();
     command.archive = spec.archive.is_some();
     command.network = spec.network > Level::None;
+    command.stdin = spec.stdin.is_some();
     Message::Run(command)
         .write_to(stream)
         .context("sending the command")?;
     if let Some(archive) = &spec.archive {
         send_archive(archive, stream).context("sending the workspace archive")?;
+    }
+    if let Some(input) = &spec.stdin {
+        feed_stdin(input.try_clone()?, stream.try_clone()?);
     }
     let mut failure = None;
     loop {
@@ -526,6 +533,30 @@ fn converse(
             None => bail!("the VM exited before the command reported"),
         }
     }
+}
+
+/// Streams `input` to the guest as the command's standard input, then its end. The thread is
+/// left behind if the input never ends, as a terminal's may not; it stops at the next read
+/// once the guest has gone.
+fn feed_stdin(mut input: File, mut stream: UnixStream) {
+    thread::spawn(move || {
+        let mut buf = vec![0u8; DATA_CHUNK];
+        loop {
+            let n = match input.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            if Message::Stdin(buf[..n].to_vec())
+                .write_to(&mut stream)
+                .is_err()
+            {
+                return;
+            }
+        }
+        let _ = Message::StdinEnd.write_to(&mut stream);
+    });
 }
 
 fn send_archive(path: &Path, stream: &mut UnixStream) -> io::Result<()> {

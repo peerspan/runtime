@@ -53,6 +53,8 @@ const TAG_FAILED: u8 = 8;
 const TAG_CHANGES: u8 = 9;
 const TAG_DELETED: u8 = 10;
 const TAG_PHASES: u8 = 11;
+const TAG_STDIN: u8 = 12;
+const TAG_STDIN_END: u8 = 13;
 
 /// Largest chunk of archive or changes data a writer puts in one frame.
 pub const DATA_CHUNK: usize = 64 * 1024;
@@ -72,6 +74,12 @@ pub struct Command {
     pub collect_changes: bool,
     /// Whether the guest has a network device to configure before the command starts.
     pub network: bool,
+    /// Whether the command reads standard input from [`Message::Stdin`] frames, which follow
+    /// the archive, rather than from an empty one.
+    pub stdin: bool,
+    /// Whether standard error goes to standard output, as with `2>&1`, so that one stream
+    /// keeps the order in which the command wrote to the two.
+    pub combined_output: bool,
 }
 
 /// One frame on the guest's stream.
@@ -100,6 +108,10 @@ pub enum Message {
     Changes(Vec<u8>),
     /// Guest to host: a piece of `deleted.txt`, the paths removed since the archive.
     Deleted(Vec<u8>),
+    /// Host to guest: bytes for the command's standard input.
+    Stdin(Vec<u8>),
+    /// Host to guest: the end of the command's standard input.
+    StdinEnd,
     /// Guest to host, just before [`Message::Started`]: when init reached each step, as
     /// microseconds of the guest's boot clock, which starts with the kernel.
     Phases(Vec<(String, u64)>),
@@ -125,6 +137,8 @@ impl Message {
             Message::Changes(bytes) => (TAG_CHANGES, bytes.clone()),
             Message::Deleted(bytes) => (TAG_DELETED, bytes.clone()),
             Message::Phases(phases) => (TAG_PHASES, encode_phases(phases)),
+            Message::Stdin(bytes) => (TAG_STDIN, bytes.clone()),
+            Message::StdinEnd => (TAG_STDIN_END, Vec::new()),
         };
         if payload.len() > MAX_PAYLOAD {
             return Err(io::Error::new(
@@ -178,6 +192,8 @@ impl Message {
             TAG_CHANGES => Message::Changes(payload),
             TAG_DELETED => Message::Deleted(payload),
             TAG_PHASES => Message::Phases(decode_phases(&payload)?),
+            TAG_STDIN => Message::Stdin(payload),
+            TAG_STDIN_END => empty(&payload, Message::StdinEnd)?,
             other => return Err(invalid(format!("unknown message tag {other}"))),
         };
         Ok(Some(message))
@@ -260,6 +276,8 @@ fn encode_command(command: &Command) -> Vec<u8> {
     out.push(u8::from(command.archive));
     out.push(u8::from(command.collect_changes));
     out.push(u8::from(command.network));
+    out.push(u8::from(command.stdin));
+    out.push(u8::from(command.combined_output));
     out
 }
 
@@ -274,8 +292,8 @@ fn decode_command(payload: &[u8]) -> io::Result<Command> {
     let env = (0..envc)
         .map(|_| Ok((cursor.string()?, cursor.string()?)))
         .collect::<io::Result<Vec<_>>>()?;
-    let [archive, collect_changes, network] = *cursor.rest else {
-        return Err(invalid("command flags are not 3 bytes"));
+    let [archive, collect_changes, network, stdin, combined_output] = *cursor.rest else {
+        return Err(invalid("command flags are not 5 bytes"));
     };
     let flag = |b: u8| match b {
         0 => Ok(false),
@@ -289,6 +307,8 @@ fn decode_command(payload: &[u8]) -> io::Result<Command> {
         archive: flag(archive)?,
         collect_changes: flag(collect_changes)?,
         network: flag(network)?,
+        stdin: flag(stdin)?,
+        combined_output: flag(combined_output)?,
     })
 }
 
@@ -364,6 +384,8 @@ mod tests {
                 archive: true,
                 collect_changes: true,
                 network: true,
+                stdin: true,
+                combined_output: true,
             }),
             Message::Run(Command::default()),
             Message::Stdout(b"out\n".to_vec()),
@@ -391,6 +413,8 @@ mod tests {
                 ("connected".into(), u64::MAX),
             ]),
             Message::Phases(Vec::new()),
+            Message::Stdin(b"in".to_vec()),
+            Message::StdinEnd,
         ];
         for message in &messages {
             assert_eq!(&round_trip(message), message);

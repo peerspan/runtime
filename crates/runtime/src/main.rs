@@ -18,6 +18,7 @@ mod vm;
 
 use std::fs::File;
 use std::io::{self, Write};
+use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
@@ -114,6 +115,13 @@ struct RunArgs {
     /// Environment variables for the command, as NAME=VALUE.
     #[arg(long = "env", value_name = "NAME=VALUE", value_parser = parse_env)]
     env: Vec<(String, String)>,
+    /// Pass this program's standard input to the command; without it the command's is empty.
+    #[arg(long)]
+    stdin: bool,
+    /// Send the command's standard error to its standard output, as `2>&1` does, which keeps
+    /// the order in which it wrote to the two.
+    #[arg(long)]
+    combined_output: bool,
     /// The command and its arguments.
     #[arg(last = true, required = true)]
     command: Vec<String>,
@@ -161,6 +169,11 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
     let spec = vm::VmSpec {
         workspace: args.workspace,
         own_workspace: false,
+        stdin: if args.stdin {
+            Some(File::from(io::stdin().as_fd().try_clone_to_owned()?))
+        } else {
+            None
+        },
         archive: args.archive,
         guest: args.guest,
         libkrun: args.libkrun,
@@ -184,6 +197,8 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
             archive: false,
             collect_changes,
             network: false,
+            stdin: false,
+            combined_output: args.combined_output,
         },
     };
     let mut stdout = io::stdout().lock();

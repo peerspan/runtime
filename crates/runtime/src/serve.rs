@@ -373,6 +373,7 @@ fn execute(runtime: &Runtime, run: &Run) {
             let spec = VmSpec {
                 workspace,
                 own_workspace: true,
+                stdin: None,
                 archive: request.workspace_archive.clone(),
                 guest: runtime.args.guest.clone(),
                 libkrun: runtime.args.libkrun.clone(),
@@ -402,6 +403,9 @@ fn execute(runtime: &Runtime, run: &Run) {
                     archive: false,
                     collect_changes: request.results == Results::Changes,
                     network: false,
+                    // The contract has no standard input and keeps the two streams apart.
+                    stdin: false,
+                    combined_output: false,
                 },
             };
             let outcome = vm::run(&spec, &run.cancel, &mut |event| results.record(run, &event))

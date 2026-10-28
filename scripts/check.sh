@@ -84,6 +84,25 @@ fi
 
 if check readonly-root 1 -- sh -c 'touch /etc/x'; then pass readonly-root; fi
 
+# Standard input reaches the command with --stdin, intact and with its end; without it the
+# command's is empty, and a command that ignores endless input still finishes.
+head -c 5000000 /dev/urandom > "$work/stdin.bin"
+want=$(sha256sum < "$work/stdin.bin" | cut -d' ' -f1)
+got=$("$bin" run --workspace "$work/ws" --stdin -- sh -c 'sha256sum | cut -d" " -f1' \
+  < "$work/stdin.bin" 2> "$work/err") || true
+empty=$(echo hi | "$bin" run --workspace "$work/ws" -- wc -c 2> "$work/err") || true
+rc=0
+yes | timeout 60 "$bin" run --workspace "$work/ws" --stdin -- true > /dev/null 2>&1 || rc=$?
+[ "$got" = "$want" ] && [ "$empty" = 0 ] && [ "$rc" -eq 0 ] && pass stdin \
+  || fail "stdin: digest ${got:-none}, empty input gave ${empty:-none}, ignored input exit $rc"
+rm -f "$work/stdin.bin"
+
+# --combined-output keeps the order of writes across the two streams.
+got=$("$bin" run --workspace "$work/ws" --combined-output -- \
+  sh -c 'for i in 1 2 3; do echo out$i; echo err$i >&2; done' 2> "$work/err" | tr '\n' ' ') || true
+[ "$got" = "out1 err1 out2 err2 out3 err3 " ] && [ ! -s "$work/err" ] && pass combined-output \
+  || fail "combined-output: [$got] stderr [$(cat "$work/err")]"
+
 rc=0
 "$bin" run --workspace "$work/ws" --guest "$work/no-such-guest" -- true 2> "$work/err" || rc=$?
 [ "$rc" -eq 125 ] && grep -q "guest image" "$work/err" && pass bad-guest || fail "bad-guest: exit $rc"
