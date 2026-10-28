@@ -14,7 +14,7 @@ use std::io::{self, Read, Seek, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use serde::Deserialize;
@@ -29,11 +29,24 @@ const MANIFEST_TYPES: &str = "application/vnd.oci.image.index.v1+json, \
     application/vnd.oci.image.manifest.v1+json, \
     application/vnd.docker.distribution.manifest.v2+json";
 
-/// An image ready to boot: its root and the environment its configuration sets.
+/// An image ready to boot: its root and the environment its configuration sets. It holds a
+/// shared lock on the image, so `prune` leaves it alone while this lasts.
 #[derive(Debug)]
 pub struct Image {
     pub rootfs: PathBuf,
     pub env: Vec<(String, String)>,
+    _lock: File,
+}
+
+/// An image in the cache, as `images` lists it.
+#[derive(Debug)]
+pub struct Cached {
+    pub digest: String,
+    /// The references whose tags name it.
+    pub tags: Vec<String>,
+    pub bytes: u64,
+    /// When a run last booted it.
+    pub last_used: SystemTime,
 }
 
 /// An image reference: `name[:tag]` or `name@digest`, with Docker Hub as the default registry.
@@ -124,6 +137,7 @@ impl std::fmt::Display for Reference {
 ///
 /// Fails if the image cannot be pulled, checked or unpacked.
 pub fn get(cache: &Path, reference: &Reference, pull: bool) -> anyhow::Result<Image> {
+    let _cache = lock(&cache_lock_path(cache), libc::LOCK_SH)?;
     let digest = match (pull, cached_digest(cache, reference)) {
         (false, Some(digest)) => digest,
         _ => self::pull(cache, reference)?,
@@ -156,6 +170,9 @@ fn cached_digest(cache: &Path, reference: &Reference) -> Option<String> {
 
 fn open(cache: &Path, digest: &str) -> anyhow::Result<Image> {
     let dir = image_dir(cache, digest);
+    let image_lock = lock(&dir, libc::LOCK_SH)?;
+    // Its modification time says when the image was last booted, for `prune --unused-days`.
+    File::create(dir.join(LAST_USED)).with_context(|| format!("image {digest}"))?;
     let config: ImageConfig = serde_json::from_slice(
         &fs::read(dir.join("config.json")).with_context(|| format!("image {digest}"))?,
     )
@@ -171,7 +188,148 @@ fn open(cache: &Path, digest: &str) -> anyhow::Result<Image> {
     Ok(Image {
         rootfs: dir.join("rootfs"),
         env,
+        _lock: image_lock,
     })
+}
+
+const LAST_USED: &str = "last-used";
+
+fn cache_lock_path(cache: &Path) -> PathBuf {
+    cache.join(".lock")
+}
+
+/// Opens `path`, a file or directory, creating a missing lock file, and takes `operation`, a
+/// flock(2) operation, on it.
+fn lock(path: &Path, operation: libc::c_int) -> anyhow::Result<File> {
+    let file = if path.is_dir() {
+        File::open(path)
+    } else {
+        if let Some(parent) = path.parent() {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
+        File::options().create(true).append(true).open(path)
+    }
+    .with_context(|| format!("opening {}", path.display()))?;
+    // SAFETY: flock takes a descriptor this function owns and an integer.
+    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), operation) } != 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("locking {}", path.display()));
+    }
+    Ok(file)
+}
+
+/// The images in `cache`, with the tags that name each.
+///
+/// # Errors
+///
+/// Fails if the cache cannot be read.
+pub fn list(cache: &Path) -> anyhow::Result<Vec<Cached>> {
+    let tags = tag_map(cache);
+    let mut images = Vec::new();
+    let entries = match fs::read_dir(cache) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(images),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", cache.display())),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(hex) = name.strip_prefix("sha256-") else {
+            continue;
+        };
+        let digest = format!("sha256:{hex}");
+        let last_used = fs::metadata(entry.path().join(LAST_USED))
+            .or_else(|_| entry.metadata())
+            .and_then(|m| m.modified())
+            .unwrap_or(UNIX_EPOCH);
+        images.push(Cached {
+            tags: tags
+                .iter()
+                .filter(|(_, d)| **d == digest)
+                .map(|(key, _)| key.replace('%', "/"))
+                .collect(),
+            bytes: disk_usage(&entry.path()),
+            digest,
+            last_used,
+        });
+    }
+    images.sort_by_key(|image| std::cmp::Reverse(image.last_used));
+    Ok(images)
+}
+
+/// Removes images no tag names, and with `unused_for`, those no run has booted for that long,
+/// with their tags. Images in use are kept, as are leftovers of pulls in progress. Returns what
+/// was removed.
+///
+/// # Errors
+///
+/// Fails if the cache cannot be locked or read.
+pub fn prune(cache: &Path, unused_for: Option<Duration>) -> anyhow::Result<Vec<Cached>> {
+    if !cache.is_dir() {
+        return Ok(Vec::new());
+    }
+    // No pull is storing or tagging an image while this holds.
+    let _cache = lock(&cache_lock_path(cache), libc::LOCK_EX)?;
+    for entry in fs::read_dir(cache)?.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("tmp-") {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+    let now = SystemTime::now();
+    let mut removed = Vec::new();
+    for image in list(cache)? {
+        let unused = unused_for
+            .is_some_and(|limit| now.duration_since(image.last_used).unwrap_or_default() >= limit);
+        if !image.tags.is_empty() && !unused {
+            continue;
+        }
+        let dir = image_dir(cache, &image.digest);
+        // A run holds the image: keep it.
+        let Ok(_held) = lock(&dir, libc::LOCK_EX | libc::LOCK_NB) else {
+            continue;
+        };
+        for tag in &image.tags {
+            let _ = fs::remove_file(cache.join("tags").join(tag.replace('/', "%")));
+        }
+        fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+        removed.push(image);
+    }
+    Ok(removed)
+}
+
+/// Each tag file's name and the digest it holds.
+fn tag_map(cache: &Path) -> Vec<(String, String)> {
+    let Ok(entries) = fs::read_dir(cache.join("tags")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .filter_map(|e| {
+            let digest = fs::read_to_string(e.path()).ok()?;
+            Some((
+                e.file_name().to_string_lossy().into_owned(),
+                digest.trim().to_owned(),
+            ))
+        })
+        .collect()
+}
+
+/// The bytes a directory's files take on disk, links not followed.
+fn disk_usage(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    let mut bytes = meta.blocks() * 512;
+    if meta.is_dir() {
+        for entry in fs::read_dir(path).into_iter().flatten().flatten() {
+            bytes += disk_usage(&entry.path());
+        }
+    }
+    bytes
 }
 
 fn image_dir(cache: &Path, digest: &str) -> PathBuf {
@@ -189,6 +347,7 @@ pub fn pull(cache: &Path, reference: &Reference) -> anyhow::Result<String> {
         .mode(0o700)
         .create(cache.join("tags"))
         .with_context(|| format!("creating {}", cache.display()))?;
+    let _cache = lock(&cache_lock_path(cache), libc::LOCK_SH)?;
     let mut registry = Registry::new(reference);
     let (digest, manifest) = registry.manifest(&reference.reference)?;
     let dir = image_dir(cache, &digest);

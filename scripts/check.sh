@@ -106,6 +106,12 @@ by_digest=$("$bin" run --workspace "$work/ws" --image-cache "$images" --image "a
 want_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 [ "$got" = "3.20 $want_path /x " ] && [ "$by_digest" = 3.20 ] && pass image \
   || fail "image: [$got] by digest [$by_digest] $(tail -3 "$work/err")"
+# A tagged image survives a plain prune; one unused for zero days does not.
+"$bin" prune --image-cache "$images" > /dev/null
+kept=$("$bin" images --image-cache "$images" | wc -l)
+"$bin" prune --image-cache "$images" --unused-days 0 > /dev/null
+[ "$kept" -eq 1 ] && [ -z "$("$bin" images --image-cache "$images")" ] && pass prune \
+  || fail "prune: $kept image(s) kept, then [$("$bin" images --image-cache "$images")]"
 
 # Standard input reaches the command with --stdin, intact and with its end; without it the
 # command's is empty, and a command that ignores endless input still finishes.

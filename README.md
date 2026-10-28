@@ -100,7 +100,9 @@ the contract has neither.
 
 `--image` takes the references Docker does: `node:22`, `python:3.12-slim`,
 `ghcr.io/org/tool:1.2`, or `name@sha256:...`. `pull REF` fetches an image ahead of time, or
-updates a tag to what it names now.
+updates a tag to what it names now. `images` lists what is cached, with sizes and last use.
+`prune` removes images no tag names, such as those a re-pulled tag moved away from, and with
+`--unused-days N` also those no run has booted for N days. Images in use are never removed.
 
 - An image is pulled once, checked against its digests, and kept under
   `/var/cache/peerspan-runtime/images` (`--image-cache`).
@@ -111,8 +113,7 @@ updates a tag to what it names now.
   a layer in the guest's memory and are gone when the run ends, and the image is never changed.
 - Image files are made readable by all on the host, because the VMM serves them as an
   unprivileged user, so the guest sees looser modes on them.
-- Not yet: private registries, zstd layers, platforms other than linux/amd64, and removing
-  old images.
+- Not yet: private registries, zstd layers, and platforms other than linux/amd64.
 
 ## Network
 
