@@ -49,7 +49,8 @@ NOTES
 glibc=$(for f in "$stage/peerspan-runtime" "$stage/libkrun.so.2"; do
   objdump -T "$f" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' ; done | sort -t. -k2 -n -u | tail -1)
 
-tar -C "$out" -czf "$out/$name.tar.gz" "$name"
+# Owned by root whoever builds it: root runs these files.
+tar -C "$out" --owner=0 --group=0 --numeric-owner -czf "$out/$name.tar.gz" "$name"
 (cd "$out" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
 rm -rf "$stage"
 echo "release $out/$name.tar.gz ($(du -h "$out/$name.tar.gz" | cut -f1)), needs ${glibc#GLIBC_} or later"
