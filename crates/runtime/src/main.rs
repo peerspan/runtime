@@ -5,6 +5,7 @@
 
 mod caplog;
 mod cgroup;
+mod disk;
 mod jail;
 mod krun;
 mod launcher;

@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tiny_http::{Header, Method, Request, Response, Server};
 
+use crate::disk::WorkspaceDisk;
 use crate::net::{self, Level};
 use crate::vm::{self, Event, Outcome, VmSpec};
 
@@ -86,6 +87,10 @@ pub struct ServeArgs {
     io_iops: u32,
     #[arg(long, default_value_t = 3600)]
     max_seconds: u32,
+    /// Disk space each run's workspace may take, in MiB.
+    #[arg(long, default_value_t = crate::disk::DEFAULT_SIZE_MIB,
+          value_parser = clap::value_parser!(u32).range(64..))]
+    workspace_mib: u32,
     #[arg(long, default_value_t = 1)]
     max_concurrent_runs: usize,
 }
@@ -183,6 +188,7 @@ pub fn serve(args: ServeArgs) -> anyhow::Result<()> {
             .with_context(|| format!("creating {}", dir.display()))?;
     }
     reachable_by_runs(&args.state)?;
+    crate::disk::remove_stale(&args.state.join("runs"));
     let _ = fs::remove_file(&args.socket);
     let server = Server::http_unix(&args.socket)
         .map_err(|e| anyhow::anyhow!("serving on {}: {e}", args.socket.display()))?;
@@ -360,9 +366,10 @@ fn validate(request: &RunRequest) -> Result<(), String> {
 /// Runs one VM and records its events; the run's thread.
 fn execute(runtime: &Runtime, run: &Run) {
     let request = &run.request;
-    let (outcome, results) = match prepare(run) {
+    let (outcome, results) = match prepare(run, runtime.args.workspace_mib) {
         Err(e) => (failed(run, &e), None),
-        Ok((workspace, mut results)) => {
+        // The workspace's file system goes at the end of this arm, before the run is finished.
+        Ok((workspace, _disk, mut results)) => {
             let spec = VmSpec {
                 workspace,
                 own_workspace: true,
@@ -459,15 +466,17 @@ fn failed(run: &Run, e: &anyhow::Error) -> Outcome {
     }
 }
 
-fn prepare(run: &Run) -> anyhow::Result<(PathBuf, ResultFiles)> {
+fn prepare(run: &Run, workspace_mib: u32) -> anyhow::Result<(PathBuf, WorkspaceDisk, ResultFiles)> {
     let _ = fs::remove_dir_all(&run.dir);
     fs::DirBuilder::new().mode(0o711).create(&run.dir)?;
     let workspace = run.dir.join("workspace");
     fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+    let disk = WorkspaceDisk::create(&run.dir.join(crate::disk::IMAGE), &workspace, workspace_mib)?;
     let results_dir = run.dir.join("results");
     fs::DirBuilder::new().mode(0o700).create(&results_dir)?;
     Ok((
         workspace,
+        disk,
         ResultFiles::new(results_dir, run.request.results)?,
     ))
 }

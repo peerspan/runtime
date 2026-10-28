@@ -158,8 +158,14 @@ workspace server's and passt's logs to 1 MiB each, each cut with a note, and und
 output log to the 100 MiB artifact limit, with changes larger than that left out, both files
 together, as the daemon would drop them.
 
-Setting all this up needs root, as Firecracker's jailer does. Not yet: a limit on the disk
-space a workspace may take.
+Under `serve`, each run's workspace is an ext4 file system of its own, 10 GiB by default
+(`--workspace-mib`), in a sparse image file beside it that takes only what the run writes, so a
+run can take no more of the host's disk than that and the guest sees "no space left" at the
+limit. The image is unmounted and removed when the run ends, and `serve` detaches any that an
+earlier `serve` left mounted when it starts. This needs `mkfs.ext4` and loop devices. `run`
+leaves the workspace's size to the disk holding it, since it is a directory of your own.
+
+Setting all this up needs root, as Firecracker's jailer does.
 `scripts/check.sh` inspects a running VM from the host to check the confinement above.
 
 ## Layout

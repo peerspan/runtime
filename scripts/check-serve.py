@@ -79,7 +79,7 @@ def main():
     server = subprocess.Popen([os.environ["PEERSPAN_RUNTIME_BIN"], "serve", "--socket", sock,
                                "--state", state, "--max-cpus", "2", "--max-memory-mib", "2048",
                                "--max-seconds", "120", "--max-concurrent-runs", "1",
-                               "--max-network", "internet"],
+                               "--max-network", "internet", "--workspace-mib", "256"],
                               stderr=subprocess.DEVNULL)
     try:
         for _ in range(100):
@@ -156,6 +156,18 @@ def main():
         names = [a["name"] for a in events[-1]["artifacts"]]
         check("changes-too-large", result["exit_code"] == 0
               and names == ["stdout.log", "stderr.log"], (result, names))
+
+        # A workspace holds what its file system's size allows, and is gone after the run.
+        status, _ = call(sock, "POST", "/v1/runs", request(
+            7, ["dd", "if=/dev/zero", "of=big", "bs=1M", "count=300"], results="none"))
+        events = follow(sock, run_id(7))
+        result = next(e["result"] for e in events if e["kind"] == "exited")
+        err = b"".join(base64.b64decode(e["data"]) for e in events if e["kind"] == "stderr")
+        mounted = [line for line in open("/proc/self/mountinfo") if state in line]
+        images = [run for run in os.listdir(os.path.join(state, "runs"))
+                  if os.path.exists(os.path.join(state, "runs", run, "workspace.img"))]
+        check("workspace-full", result["exit_code"] == 1 and b"No space left" in err
+              and not mounted and not images, (result, err, mounted, images))
 
         status, _ = call(sock, "DELETE", f"/v1/runs/{run_id(1)}")
         gone, _ = call(sock, "GET", f"/v1/runs/{run_id(1)}/events")
