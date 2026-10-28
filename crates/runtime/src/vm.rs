@@ -22,6 +22,7 @@ use std::os::unix::process::CommandExt;
 use anyhow::{Context, bail};
 use peerspan_runtime_protocol::{self as protocol, DATA_CHUNK, Message, WORKSPACE_TAG};
 
+use crate::caplog::CappedLog;
 use crate::cgroup::{self, IoRate, Limits, RunCgroup};
 use crate::net::{self, Level, RunFilter};
 use crate::phases;
@@ -41,8 +42,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const RUN_ID_BASE: u32 = 0x7000_0000;
 /// Low bits that vary between runs; a collision needs two concurrent runs with equal bits.
 const RUN_ID_MASK: u32 = 0x00ff_ffff;
-/// Console lines shown when the VM fails.
-const CONSOLE_TAIL_LINES: usize = 30;
+/// The most of the guest console kept on the host; the guest can write to it at will.
+const CONSOLE_LIMIT: u64 = 16 << 20;
+/// The most of the workspace server's and passt's logs kept, which a guest can make grow by
+/// provoking their errors.
+const SERVER_LOG_LIMIT: u64 = 1 << 20;
 
 /// How often the watchdog checks for cancellation and the timeout.
 const WATCH_INTERVAL: Duration = Duration::from_millis(50);
@@ -212,7 +216,8 @@ pub fn run(
     let server_listener = UnixListener::bind(&workspace_socket)
         .with_context(|| format!("binding {}", workspace_socket.display()))?;
     chown(&workspace_socket, id)?;
-    let server_log = run_dir.path.join("virtiofsd.log");
+    let (server_log, server_log_writer) =
+        CappedLog::create(&run_dir.path.join("virtiofsd.log"), SERVER_LOG_LIMIT)?;
     let mut server_command = Command::new(&options.virtiofsd);
     join_cgroup(&mut server_command, &cgroup);
     // Raised here, while still root: inside the namespace the server could not raise it.
@@ -242,7 +247,7 @@ pub fn run(
             .arg("--rlimit-nofile=0")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(File::create(&server_log)?)
+            .stderr(server_log_writer)
             .spawn()
             .with_context(|| format!("starting {}", options.virtiofsd.display()))?,
     );
@@ -258,6 +263,8 @@ pub fn run(
         let mut passt_command = Command::new(&options.passt);
         join_cgroup(&mut passt_command, &cgroup);
         pass_fd(&mut passt_command, passt_end.as_raw_fd(), PASST_FD);
+        let (passt_log, passt_log_writer) =
+            CappedLog::create(&run_dir.path.join("passt.log"), SERVER_LOG_LIMIT)?;
         let passt = ChildGuard(
             passt_command
                 .arg("--fd")
@@ -265,12 +272,12 @@ pub fn run(
                 .args(net::passt_args())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(File::create(run_dir.path.join("passt.log"))?)
+                .stderr(passt_log_writer)
                 .spawn()
                 .with_context(|| format!("starting {}", options.passt.display()))?,
         );
         drop(passt_end);
-        network = Some((guest_end, passt, filter));
+        network = Some((guest_end, (passt, passt_log), filter));
         mark("network");
     }
 
@@ -279,7 +286,7 @@ pub fn run(
         .with_context(|| format!("binding {}", agent_socket.display()))?;
     chown(&agent_socket, id)?;
 
-    let console = File::create(&console_path)
+    let (console, console_writer) = CappedLog::create(&console_path, CONSOLE_LIMIT)
         .with_context(|| format!("creating {}", console_path.display()))?;
     let (mut phase_reader, phase_writer) = io::pipe()?;
     let launched = Instant::now();
@@ -328,8 +335,8 @@ pub fn run(
                     .flat_map(|_| ["--net-fd".to_owned(), NET_FD.to_string()]),
             )
             .stdin(Stdio::null())
-            .stdout(console.try_clone()?)
-            .stderr(console)
+            .stdout(console_writer.try_clone()?)
+            .stderr(console_writer)
             .spawn()
             .context("starting the launcher")?,
     );
@@ -339,7 +346,7 @@ pub fn run(
     let stream = match accept_guest(&listener, &mut launcher.0, cancel) {
         Ok(stream) => stream,
         Err(e) => {
-            let e = e.context(console_tail(&console_path));
+            let e = e.context(console.tail("guest console"));
             // A server that could not start is the likelier cause; its log goes with the run.
             if let Ok(Some(_)) = wait_with_timeout(&mut server.0, SERVER_EXIT_GRACE) {
                 return Err(e.context(format!(
@@ -348,7 +355,7 @@ pub fn run(
                     owner.uid(),
                     owner.gid(),
                     workspace.display(),
-                    log_tail("its log", &server_log)
+                    server_log.tail("its log")
                 )));
             }
             return Err(e);
@@ -668,19 +675,6 @@ fn io_disks(workspace: &Path, guest: &GuestImage) -> Vec<(u32, u32)> {
     disks.sort_unstable();
     disks.dedup();
     disks
-}
-
-fn console_tail(path: &Path) -> String {
-    log_tail("guest console", path)
-}
-
-fn log_tail(what: &str, path: &Path) -> String {
-    let Ok(log) = fs::read_to_string(path) else {
-        return format!("no {what} at {}", path.display());
-    };
-    let lines: Vec<&str> = log.lines().collect();
-    let tail = lines[lines.len().saturating_sub(CONSOLE_TAIL_LINES)..].join("\n");
-    format!("{what} (last lines of {}):\n{tail}", path.display())
 }
 
 /// The files a guest boots from.

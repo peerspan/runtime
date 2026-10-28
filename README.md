@@ -153,6 +153,11 @@ files to other users. `run` serves a project directory as its owner, who must be
 it; `serve` gives each workspace it creates to the run's own user, so its `--state` directory
 must be searchable by other users.
 
+The files a run grows on the host are kept to a size: the guest console to 16 MiB and the
+workspace server's and passt's logs to 1 MiB each, each cut with a note, and under `serve` each
+output log to the 100 MiB artifact limit, with changes larger than that left out, both files
+together, as the daemon would drop them.
+
 Setting all this up needs root, as Firecracker's jailer does. Not yet: a limit on the disk
 space a workspace may take.
 `scripts/check.sh` inspects a running VM from the host to check the confinement above.

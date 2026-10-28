@@ -148,6 +148,15 @@ def main():
         result = next(e["result"] for e in events if e["kind"] == "exited")
         check("timeout", result["timed_out"] and result["exit_code"] is None, result)
 
+        # Changes larger than an artifact may be are left out, both files together.
+        status, _ = call(sock, "POST", "/v1/runs", request(
+            6, ["sh", "-c", "head -c 105000000 /dev/zero > big; echo done"], results="changes"))
+        events = follow(sock, run_id(6))
+        result = next(e["result"] for e in events if e["kind"] == "exited")
+        names = [a["name"] for a in events[-1]["artifacts"]]
+        check("changes-too-large", result["exit_code"] == 0
+              and names == ["stdout.log", "stderr.log"], (result, names))
+
         status, _ = call(sock, "DELETE", f"/v1/runs/{run_id(1)}")
         gone, _ = call(sock, "GET", f"/v1/runs/{run_id(1)}/events")
         check("delete", status == 200 and gone == 404

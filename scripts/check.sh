@@ -129,6 +129,15 @@ else
   fail "hostile-archive: exit $rc, $(cat "$work/err")"
 fi
 
+# The guest console is kept to 16 MiB on the host, however much the guest writes to it.
+rc=0
+"$bin" run --workspace "$work/ws" --console-log "$work/flood.log" -- \
+  sh -c 'head -c 24000000 /dev/zero | tr "\\0" x > /dev/console' > /dev/null 2>&1 || rc=$?
+size=$(stat -c %s "$work/flood.log")
+[ "$rc" -eq 0 ] && [ "$size" -le $(( (16 << 20) + 100 )) ] && grep -q "log cut at" "$work/flood.log" \
+  && pass console-limit || fail "console-limit: exit $rc, $size bytes"
+rm -f "$work/flood.log"
+
 # Disk I/O is capped: 60 MiB written and synced at 20 MiB/s takes about 3 seconds.
 start=$(date +%s%3N); rc=0
 "$bin" run --workspace "$work/ws" --io-mibps 20 -- \

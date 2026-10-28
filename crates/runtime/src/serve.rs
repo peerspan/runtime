@@ -32,8 +32,9 @@ use crate::vm::{self, Event, Outcome, VmSpec};
 const MAX_BODY: u64 = 1 << 20;
 /// Largest output chunk in one event, before base64.
 const CHUNK: usize = 16 * 1024;
-/// Each output log is cut at the artifact size limit.
-const LOG_LIMIT: u64 = 100 * 1024 * 1024;
+/// The largest artifact the daemon accepts. Each output log is cut there, and changes larger
+/// than it are left out, since the daemon would drop them.
+const ARTIFACT_LIMIT: u64 = 100 * 1024 * 1024;
 /// Longest wait a client may ask for on the events route.
 const MAX_WAIT: Duration = Duration::from_secs(25);
 
@@ -481,6 +482,8 @@ struct ResultFiles {
     deleted: Option<File>,
     stdout_bytes: u64,
     stderr_bytes: u64,
+    /// Bytes of `changes.tar` and `deleted.txt` together.
+    changes_bytes: u64,
 }
 
 impl ResultFiles {
@@ -500,6 +503,7 @@ impl ResultFiles {
             results,
             stdout_bytes: 0,
             stderr_bytes: 0,
+            changes_bytes: 0,
         })
     }
 
@@ -523,17 +527,36 @@ impl ResultFiles {
                 push_output(run, "stderr", data);
             }
             Event::Changes(data) => {
-                if let Some(file) = self.changes.as_mut() {
+                if self.count_changes(data)
+                    && let Some(file) = self.changes.as_mut()
+                {
                     file.write_all(data)?;
                 }
             }
             Event::Deleted(data) => {
-                if let Some(file) = self.deleted.as_mut() {
+                if self.count_changes(data)
+                    && let Some(file) = self.deleted.as_mut()
+                {
                     file.write_all(data)?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Counts `data` toward the changes, and whether to keep it. Changes that outgrow the
+    /// artifact limit are removed, both files together as the contract attaches them, so a guest
+    /// cannot fill the host's disk with them.
+    fn count_changes(&mut self, data: &[u8]) -> bool {
+        self.changes_bytes += data.len() as u64;
+        if self.changes_bytes <= ARTIFACT_LIMIT {
+            return true;
+        }
+        if self.changes.take().is_some() | self.deleted.take().is_some() {
+            let _ = fs::remove_file(self.dir.join("changes.tar"));
+            let _ = fs::remove_file(self.dir.join("deleted.txt"));
+        }
+        false
     }
 
     /// Closes the files, gives them to the daemon's user, and describes them in contract order.
@@ -570,7 +593,7 @@ impl ResultFiles {
 
 fn append_log(file: Option<&mut File>, written: u64, data: &[u8]) -> io::Result<()> {
     let Some(file) = file else { return Ok(()) };
-    let room = usize::try_from(LOG_LIMIT.saturating_sub(written)).unwrap_or(usize::MAX);
+    let room = usize::try_from(ARTIFACT_LIMIT.saturating_sub(written)).unwrap_or(usize::MAX);
     file.write_all(&data[..data.len().min(room)])
 }
 
