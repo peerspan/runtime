@@ -6,6 +6,7 @@
 Needs root and the environment scripts/check.sh needs; run by it.
 """
 import base64
+import glob
 import hashlib
 import http.client
 import io
@@ -76,16 +77,23 @@ def main():
     os.chmod(work, 0o711)
     sock = os.path.join(work, "runtime.sock")
     state = os.path.join(work, "state")
-    server = subprocess.Popen([os.environ["PEERSPAN_RUNTIME_BIN"], "serve", "--socket", sock,
-                               "--state", state, "--max-cpus", "2", "--max-memory-mib", "2048",
-                               "--max-seconds", "120", "--max-concurrent-runs", "1",
-                               "--max-network", "internet", "--workspace-mib", "256"],
-                              stderr=subprocess.DEVNULL)
-    try:
+    serve_argv = [os.environ["PEERSPAN_RUNTIME_BIN"], "serve", "--socket", sock,
+                  "--state", state, "--max-cpus", "2", "--max-memory-mib", "2048",
+                  "--max-seconds", "120", "--max-concurrent-runs", "1",
+                  "--max-network", "internet", "--workspace-mib", "256"]
+
+    def start():
+        if os.path.exists(sock):
+            os.remove(sock)
+        process = subprocess.Popen(serve_argv, stderr=subprocess.DEVNULL)
         for _ in range(100):
             if os.path.exists(sock):
                 break
             time.sleep(0.05)
+        return process
+
+    server = start()
+    try:
         status, info = call(sock, "GET", "/v1/runtime")
         check("runtime", status == 200 and info["max_cpus"] == 2 and info["running"] == 0, info)
 
@@ -173,6 +181,44 @@ def main():
         gone, _ = call(sock, "GET", f"/v1/runs/{run_id(1)}/events")
         check("delete", status == 200 and gone == 404
               and not os.path.exists(os.path.join(state, "runs", run_id(1))), (status, gone))
+        # A second serve may not share the state directory. A serve killed outright leaves its
+        # runs behind, and the next one removes them: their directories, workspaces and records.
+        status, _ = call(sock, "POST", "/v1/runs", request(8, ["sleep", "60"], results="none"))
+        time.sleep(3)
+        second = subprocess.run(serve_argv[:2] + ["--socket", sock + ".2"] + serve_argv[4:],
+                                capture_output=True, text=True, timeout=30)
+        check("one-per-state", second.returncode != 0 and "another serve" in second.stderr,
+              (second.returncode, second.stderr[-200:]))
+        server.kill()
+        server.wait()
+        server = start()
+        gone, _ = call(sock, "GET", f"/v1/runs/{run_id(8)}/events")
+        left = os.listdir(os.path.join(state, "runs"))
+        mounted = [line for line in open("/proc/self/mountinfo") if state in line]
+        cgroups = glob.glob("/sys/fs/cgroup/peerspan-runtime/run-*")
+        check("restart", status == 201 and gone == 404 and not left and not mounted
+              and not cgroups, (status, gone, left, mounted, cgroups))
+
+        # Runs side by side, each with its own archive and output.
+        server.kill()
+        server.wait()
+        serve_argv[serve_argv.index("--max-concurrent-runs") + 1] = "3"
+        server = start()
+        for n in (10, 11, 12):
+            path = os.path.join(work, f"ws{n}.tar")
+            with tarfile.open(path, "w") as t:
+                data = f"{n}\n".encode()
+                info = tarfile.TarInfo("n.txt")
+                info.size = len(data)
+                t.addfile(info, io.BytesIO(data))
+            call(sock, "POST", "/v1/runs", request(n, ["sh", "-c", "sleep 2; cat n.txt"],
+                                                  archive=path))
+        outputs = []
+        for n in (10, 11, 12):
+            events = follow(sock, run_id(n))
+            outputs.append(b"".join(base64.b64decode(e["data"]) for e in events
+                                    if e["kind"] == "stdout"))
+        check("concurrent", outputs == [b"10\n", b"11\n", b"12\n"], outputs)
     finally:
         server.kill()
         server.wait()

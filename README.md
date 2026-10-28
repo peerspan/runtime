@@ -93,7 +93,10 @@ Peerspan host repository specifies it; `scripts/check-serve.py` exercises it.
 `--image REF` sets the image every run boots. Host-wide limits are flags: `--max-cpus`, `--max-memory-mib`, `--max-seconds`,
 `--max-network`, `--max-concurrent-runs`, `--io-mibps`, `--io-iops` and `--workspace-mib`.
 Runs keep their state under `--state` (default `/var/lib/peerspan-runtime`), which must be
-searchable by other users. `--stdin` and `--combined-output` are not available here yet, since
+searchable by other users, and only one `serve` may use a state directory at a time. Runs
+last only as long as the `serve` that started them: a restarted `serve` removes what the last
+one left (run directories, workspaces, cgroups and network rules), and the daemon fails the
+tasks whose runs it no longer knows. `--stdin` and `--combined-output` are not available here yet, since
 the contract has neither.
 
 ## Images

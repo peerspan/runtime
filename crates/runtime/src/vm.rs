@@ -774,7 +774,7 @@ fn chown(path: &Path, id: u32) -> anyhow::Result<()> {
 
 /// Tears down runs whose supervisor died without doing it: their processes, network filters,
 /// cgroups and run directories. A run that cannot be cleaned up is reported, not fatal.
-fn remove_stale_runs(cgroup_root: &Path) {
+pub fn remove_stale_runs(cgroup_root: &Path) {
     let stale = match cgroup::stale(cgroup_root) {
         Ok(stale) if stale.is_empty() => return,
         Ok(stale) => stale,
