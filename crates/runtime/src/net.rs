@@ -180,7 +180,10 @@ impl Drop for RunFilter {
     fn drop(&mut self) {
         let script = self.0.delete_element() + &self.0.delete_chain();
         if let Err(e) = nft(&script) {
-            eprintln!("peerspan-runtime: removing the run's network filter: {e:#}");
+            crate::log::warn(
+                "could not remove a run's network filter",
+                &[("error", &format!("{e:#}"))],
+            );
         }
     }
 }

@@ -367,7 +367,7 @@ pub fn pull(cache: &Path, reference: &Reference) -> anyhow::Result<String> {
     let (digest, manifest) = registry.manifest(&reference.reference)?;
     let dir = image_dir(cache, &digest);
     if !dir.is_dir() {
-        eprintln!("peerspan-runtime: pulling {reference}");
+        crate::log::info("pulling an image", &[("image", &reference)]);
         let staging = cache.join(format!("tmp-{}-{}", std::process::id(), nanos()));
         let result = unpack(&mut registry, &manifest, &staging).and_then(|()| {
             match fs::rename(&staging, &dir) {

@@ -12,6 +12,7 @@ import http.client
 import io
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -82,10 +83,12 @@ def main():
                   "--max-seconds", "120", "--max-concurrent-runs", "1",
                   "--max-network", "internet", "--workspace-mib", "256"]
 
+    log_path = os.path.join(work, "serve.log")
+
     def start():
         if os.path.exists(sock):
             os.remove(sock)
-        process = subprocess.Popen(serve_argv, stderr=subprocess.DEVNULL)
+        process = subprocess.Popen(serve_argv, stderr=open(log_path, "a"))
         for _ in range(100):
             if os.path.exists(sock):
                 break
@@ -181,6 +184,21 @@ def main():
         gone, _ = call(sock, "GET", f"/v1/runs/{run_id(1)}/events")
         check("delete", status == 200 and gone == 404
               and not os.path.exists(os.path.join(state, "runs", run_id(1))), (status, gone))
+
+        # The log has one timestamped line per event, the first run's whole life among them,
+        # and nothing of what the runs were given beyond the program's name.
+        log = open(log_path).read()
+        lines = log.splitlines()
+        well_formed = all(re.match(r"\d{4}-\d\d-\d\dT[\d:.]+Z (info|warn) ", line)
+                          for line in lines)
+        # The repeat with different fields is refused under the same id.
+        first = [event for event in (re.sub(r"^\S+ \S+ ", "", line).split(" run=")[0]
+                                     for line in lines if f"run={run_id(1)}" in line)
+                 if event != "run refused"]
+        check("log", well_formed and first[:4] == ["run accepted", "run started", "run finished",
+                                                   "run deleted"]
+              and "run refused" in log and "input.txt" not in log and "GREETING" not in log,
+              (first, [line for line in lines if not re.match(r"\d{4}-", line)][:3]))
         # A second serve may not share the state directory. A serve killed outright leaves its
         # runs behind, and the next one removes them: their directories, workspaces and records.
         status, _ = call(sock, "POST", "/v1/runs", request(8, ["sleep", "60"], results="none"))

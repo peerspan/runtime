@@ -167,9 +167,9 @@ impl Drop for RunCgroup {
             }
             thread::sleep(Duration::from_millis(10));
         }
-        eprintln!(
-            "peerspan-runtime: could not remove cgroup {}",
-            self.path.display()
+        crate::log::warn(
+            "could not remove a cgroup",
+            &[("cgroup", &self.path.display())],
         );
     }
 }
