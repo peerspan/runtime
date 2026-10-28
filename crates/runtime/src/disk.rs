@@ -74,9 +74,9 @@ impl Drop for WorkspaceDisk {
             && !unmount(&self.mountpoint, 0)
             && !unmount(&self.mountpoint, libc::MNT_DETACH)
         {
-            eprintln!(
-                "peerspan-runtime: could not unmount {}",
-                self.mountpoint.display()
+            crate::log::warn(
+                "could not unmount a workspace",
+                &[("workspace", &self.mountpoint.display())],
             );
         }
         let _ = fs::remove_file(&self.image);
@@ -102,9 +102,9 @@ pub fn remove_stale(runs: &Path) {
         })
     {
         if unmount(&mountpoint, libc::MNT_DETACH) {
-            eprintln!(
-                "peerspan-runtime: detached {}, left by an earlier serve",
-                mountpoint.display()
+            crate::log::info(
+                "detached a workspace left by an earlier serve",
+                &[("workspace", &mountpoint.display())],
             );
         }
     }

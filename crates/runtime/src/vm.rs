@@ -383,7 +383,7 @@ pub fn run(
     }
     let shut_down = status.is_some();
     if !shut_down {
-        eprintln!("peerspan-runtime: the VM did not shut down; stopping it");
+        crate::log::warn("the VM did not shut down; stopping it", &[]);
     }
     mark("vm_exited");
     let progress = progress.into_inner().expect("lock poisoned");
@@ -779,7 +779,10 @@ pub fn remove_stale_runs(cgroup_root: &Path) {
         Ok(stale) if stale.is_empty() => return,
         Ok(stale) => stale,
         Err(e) => {
-            eprintln!("peerspan-runtime: looking for stale runs: {e:#}");
+            crate::log::warn(
+                "could not look for stale runs",
+                &[("error", &format!("{e:#}"))],
+            );
             return;
         }
     };
@@ -788,7 +791,10 @@ pub fn remove_stale_runs(cgroup_root: &Path) {
     }
     let paths: Vec<&Path> = stale.iter().map(RunCgroup::path).collect();
     if let Err(e) = net::remove_stale(&paths) {
-        eprintln!("peerspan-runtime: {e:#}");
+        crate::log::warn(
+            "could not remove stale network rules",
+            &[("error", &format!("{e:#}"))],
+        );
     }
     for cgroup in stale {
         let name = cgroup
@@ -799,9 +805,9 @@ pub fn remove_stale_runs(cgroup_root: &Path) {
         if let Some(id) = name.as_deref().and_then(|n| n.strip_prefix("run-")) {
             let _ = fs::remove_dir_all(RunDir::path_for(id));
         }
-        eprintln!(
-            "peerspan-runtime: removed {}, left by a supervisor that died",
-            name.unwrap_or_default()
+        crate::log::info(
+            "removed a run left by a supervisor that died",
+            &[("cgroup", &name.unwrap_or_default())],
         );
     }
 }

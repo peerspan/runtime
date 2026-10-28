@@ -12,6 +12,7 @@ mod image;
 mod jail;
 mod krun;
 mod launcher;
+mod log;
 mod net;
 mod phases;
 mod seccomp;

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
 use base64::Engine;
@@ -189,6 +189,7 @@ impl Run {
 ///
 /// Fails if the state directory or the socket cannot be set up.
 pub fn serve(args: ServeArgs) -> anyhow::Result<()> {
+    crate::log::structured();
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
         anyhow::bail!("peerspan-runtime must run as root to confine its VMs");
@@ -210,7 +211,6 @@ pub fn serve(args: ServeArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("serving on {}: {e}", args.socket.display()))?;
     fs::set_permissions(&args.socket, fs::Permissions::from_mode(0o600))?;
     std::os::unix::fs::chown(&args.socket, Some(args.client_uid), None)?;
-    eprintln!("peerspan-runtime: serving on {}", args.socket.display());
 
     let image = match &args.image {
         Some(name) => Some(crate::image::get(
@@ -225,6 +225,25 @@ pub fn serve(args: ServeArgs) -> anyhow::Result<()> {
         None => crate::bundle::guest()?,
     };
     let libkrun = args.libkrun.clone().unwrap_or_else(crate::bundle::libkrun);
+    let image_name = args.image.as_deref().unwrap_or("bundled");
+    crate::log::info(
+        "serving",
+        &[
+            ("version", &env!("CARGO_PKG_VERSION")),
+            ("socket", &args.socket.display()),
+            ("state", &args.state.display()),
+            ("guest", &guest.display()),
+            ("image", &image_name),
+            ("max_cpus", &args.max_cpus),
+            ("max_memory_mib", &args.max_memory_mib),
+            ("max_seconds", &args.max_seconds),
+            ("max_network", &args.max_network),
+            ("max_concurrent_runs", &args.max_concurrent_runs),
+            ("workspace_mib", &args.workspace_mib),
+            ("io_mibps", &args.io_mibps),
+            ("io_iops", &args.io_iops),
+        ],
+    );
     let runtime = Arc::new(Runtime {
         args,
         guest,
@@ -246,13 +265,29 @@ fn handle(runtime: &Arc<Runtime>, mut request: Request) {
     let (status, body) = match (request.method(), segments.as_slice()) {
         (Method::Get, ["v1", "runtime"]) => (200, runtime_info(runtime)),
         (Method::Post, ["v1", "runs"]) => match read_body(&mut request) {
-            Ok(body) => start(runtime, &body),
+            Ok(body) => {
+                let (status, record) = start(runtime, &body);
+                if status >= 400 {
+                    // The id as sent, if any, since the request may not have parsed.
+                    let id = serde_json::from_slice::<Value>(&body)
+                        .ok()
+                        .and_then(|v| v.get("run_id").and_then(Value::as_str).map(str::to_owned))
+                        .unwrap_or_default();
+                    let reason = record["error"].as_str().unwrap_or_default().to_owned();
+                    crate::log::info(
+                        "run refused",
+                        &[("run", &id), ("status", &status), ("reason", &reason)],
+                    );
+                }
+                (status, record)
+            }
             Err(e) => error(400, "invalid", &e),
         },
         (Method::Get, ["v1", "runs", id, "events"]) => events(runtime, id, query),
         (Method::Post, ["v1", "runs", id, "cancel"]) => match find(runtime, id) {
             Some(run) => {
                 run.cancel.store(true, Ordering::Relaxed);
+                crate::log::info("run cancelled", &[("run", &run.request.run_id)]);
                 (200, run.record())
             }
             None => not_found(),
@@ -343,7 +378,7 @@ fn start(runtime: &Arc<Runtime>, body: &[u8]) -> (u16, Value) {
     }
     let run = Arc::new(Run {
         dir: args.state.join("runs").join(&request.run_id),
-        created_at: rfc3339(SystemTime::now()),
+        created_at: crate::log::rfc3339(SystemTime::now()),
         request,
         cancel: AtomicBool::new(false),
         deleted: AtomicBool::new(false),
@@ -352,6 +387,25 @@ fn start(runtime: &Arc<Runtime>, body: &[u8]) -> (u16, Value) {
     });
     runs.insert(run.request.run_id.clone(), Arc::clone(&run));
     drop(runs);
+    let request = &run.request;
+    let results = format!("{:?}", request.results).to_lowercase();
+    // The program's name only: arguments and the environment may carry secrets.
+    let program = Path::new(&request.argv[0])
+        .file_name()
+        .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+    crate::log::info(
+        "run accepted",
+        &[
+            ("run", &request.run_id),
+            ("program", &program),
+            ("cpus", &request.resources.cpus),
+            ("memory_mib", &request.resources.memory_mib),
+            ("timeout_seconds", &request.resources.timeout_seconds),
+            ("network", &request.network),
+            ("results", &results),
+            ("archive", &request.workspace_archive.is_some()),
+        ],
+    );
 
     let record = run.record();
     let runtime = Arc::clone(runtime);
@@ -470,6 +524,7 @@ fn execute(runtime: &Runtime, run: &Run) {
             "error": outcome.error,
         },
     }));
+    log_finished(run, &outcome, stdout_bytes, stderr_bytes);
     let artifacts = results.map_or_else(Vec::new, |r| r.finish(runtime.args.client_uid));
     run.push(json!({"kind": "results", "artifacts": artifacts}));
     run.log.lock().expect("run log lock poisoned").finished = true;
@@ -477,6 +532,38 @@ fn execute(runtime: &Runtime, run: &Run) {
     if run.deleted.load(Ordering::Relaxed) {
         let _ = fs::remove_dir_all(&run.dir);
     }
+}
+
+/// Logs how a run ended, leaving out what it does not have, such as an exit code after a
+/// signal.
+fn log_finished(run: &Run, outcome: &Outcome, stdout_bytes: u64, stderr_bytes: u64) {
+    let mut fields: Vec<(&str, String)> = vec![("run", run.request.run_id.clone())];
+    if let Some(code) = outcome.exit_code {
+        fields.push(("exit_code", code.to_string()));
+    }
+    if let Some(signal) = outcome.signal {
+        fields.push(("signal", signal.to_string()));
+    }
+    if outcome.timed_out {
+        fields.push(("timed_out", "true".into()));
+    }
+    if let Some(error) = &outcome.error {
+        fields.push(("error", error.clone()));
+    }
+    fields.push(("duration_ms", outcome.duration.as_millis().to_string()));
+    if !outcome.metrics.connect.is_zero() {
+        fields.push(("boot_ms", outcome.metrics.connect.as_millis().to_string()));
+    }
+    if let Some(peak) = outcome.metrics.memory_peak_bytes {
+        fields.push(("memory_peak_mib", (peak >> 20).to_string()));
+    }
+    fields.push(("stdout_bytes", stdout_bytes.to_string()));
+    fields.push(("stderr_bytes", stderr_bytes.to_string()));
+    let fields: Vec<crate::log::Field<'_>> = fields
+        .iter()
+        .map(|(name, value)| (*name, value as &dyn std::fmt::Display))
+        .collect();
+    crate::log::info("run finished", &fields);
 }
 
 /// Locks the state directory for as long as this serve lasts, so that a second serve cannot
@@ -512,14 +599,17 @@ fn remove_earlier_runs(runs: &Path) {
     for entry in entries.flatten() {
         match fs::remove_dir_all(entry.path()) {
             Ok(()) => removed += 1,
-            Err(e) => eprintln!(
-                "peerspan-runtime: could not remove {}: {e}",
-                entry.path().display()
+            Err(e) => crate::log::warn(
+                "could not remove a run left by an earlier serve",
+                &[("dir", &entry.path().display()), ("error", &e)],
             ),
         }
     }
     if removed > 0 {
-        eprintln!("peerspan-runtime: removed {removed} run(s) left by an earlier serve");
+        crate::log::info(
+            "removed runs left by an earlier serve",
+            &[("runs", &removed)],
+        );
     }
 }
 
@@ -613,6 +703,7 @@ impl ResultFiles {
                     self.changes = Some(File::create(self.dir.join("changes.tar"))?);
                     self.deleted = Some(File::create(self.dir.join("deleted.txt"))?);
                 }
+                crate::log::info("run started", &[("run", &run.request.run_id)]);
                 run.push(json!({"kind": "started"}));
             }
             Event::Stdout(data) => {
@@ -759,6 +850,7 @@ fn delete(runtime: &Runtime, id: &str) -> (u16, Value) {
     };
     run.deleted.store(true, Ordering::Relaxed);
     run.cancel.store(true, Ordering::Relaxed);
+    crate::log::info("run deleted", &[("run", &id)]);
     if run.log.lock().expect("run log lock poisoned").finished {
         let _ = fs::remove_dir_all(&run.dir);
     }
@@ -780,39 +872,4 @@ fn not_found() -> (u16, Value) {
 
 fn error(status: u16, code: &str, message: &str) -> (u16, Value) {
     (status, json!({"code": code, "error": message}))
-}
-
-/// Formats a time as RFC 3339 in UTC, to the second.
-fn rfc3339(time: SystemTime) -> String {
-    let secs = time.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let (days, rem) = (secs / 86_400, secs % 86_400);
-    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
-    let z = i64::try_from(days).unwrap_or(0) + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        rem / 3_600,
-        rem % 3_600 / 60,
-        rem % 60
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rfc3339_formats_known_instants() {
-        let at = |secs| rfc3339(UNIX_EPOCH + Duration::from_secs(secs));
-        assert_eq!(at(0), "1970-01-01T00:00:00Z");
-        assert_eq!(at(951_782_400), "2000-02-29T00:00:00Z");
-        assert_eq!(at(1_793_090_096), "2026-10-27T08:34:56Z");
-    }
 }

@@ -99,6 +99,17 @@ one left (run directories, workspaces, cgroups and network rules), and the daemo
 tasks whose runs it no longer knows. `--stdin` and `--combined-output` are not available here yet, since
 the contract has neither.
 
+`serve` logs to standard error, which the systemd unit sends to the journal, one line per
+event with fields:
+
+```
+2026-10-28T06:42:20.225Z info run finished run=run_… exit_code=3 duration_ms=12 boot_ms=305 memory_peak_mib=36 stdout_bytes=3 stderr_bytes=0
+```
+
+It logs its settings at startup, each run accepted, refused, started, finished, cancelled or
+deleted, and what it cleans up. A run's arguments and environment are never logged, only its
+program's name.
+
 ## Images
 
 `--image` takes the references Docker does: `node:22`, `python:3.12-slim`,
