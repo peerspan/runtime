@@ -201,7 +201,10 @@ pub fn serve(args: ServeArgs) -> anyhow::Result<()> {
             .with_context(|| format!("creating {}", dir.display()))?;
     }
     reachable_by_runs(&args.state)?;
-    crate::disk::remove_stale(&args.state.join("runs"));
+    let _state_lock = lock_state(&args.state)?;
+    remove_earlier_runs(&args.state.join("runs"));
+    // Their processes, cgroups and network rules, now rather than at the next run's start.
+    vm::remove_stale_runs(&args.cgroup_root);
     let _ = fs::remove_file(&args.socket);
     let server = Server::http_unix(&args.socket)
         .map_err(|e| anyhow::anyhow!("serving on {}: {e}", args.socket.display()))?;
@@ -470,6 +473,50 @@ fn execute(runtime: &Runtime, run: &Run) {
     run.changed.notify_all();
     if run.deleted.load(Ordering::Relaxed) {
         let _ = fs::remove_dir_all(&run.dir);
+    }
+}
+
+/// Locks the state directory for as long as this serve lasts, so that a second serve cannot
+/// share it and remove this one's runs at its startup.
+fn lock_state(state: &Path) -> anyhow::Result<File> {
+    let dir = File::open(state).with_context(|| format!("opening {}", state.display()))?;
+    // SAFETY: flock takes a descriptor this function owns and an integer.
+    if unsafe {
+        libc::flock(
+            std::os::fd::AsRawFd::as_raw_fd(&dir),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+    } != 0
+    {
+        let e = io::Error::last_os_error();
+        if e.kind() == io::ErrorKind::WouldBlock {
+            anyhow::bail!("another serve is using {}", state.display());
+        }
+        return Err(e).with_context(|| format!("locking {}", state.display()));
+    }
+    Ok(dir)
+}
+
+/// Removes the runs an earlier serve left: runs live only as long as the serve that started
+/// them, and the daemon fails a task whose run this serve does not know, so nothing of theirs
+/// is still wanted. Their workspaces are unmounted first.
+fn remove_earlier_runs(runs: &Path) {
+    crate::disk::remove_stale(runs);
+    let Ok(entries) = fs::read_dir(runs) else {
+        return;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        match fs::remove_dir_all(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(e) => eprintln!(
+                "peerspan-runtime: could not remove {}: {e}",
+                entry.path().display()
+            ),
+        }
+    }
+    if removed > 0 {
+        eprintln!("peerspan-runtime: removed {removed} run(s) left by an earlier serve");
     }
 }
 

@@ -195,6 +195,24 @@ took=$(( $(date +%s) - start ))
 
 PEERSPAN_RUNTIME_BIN="$bin" python3 "$repo/scripts/check-serve.py" || failures=$((failures + 1))
 
+# Runs side by side: four at once, each with its own workspace and network, each seeing only
+# its own files, and none leaving a cgroup or network rule behind.
+pids=""
+for i in 1 2 3 4; do
+  mkdir -p "$work/c$i" && echo "$i" > "$work/c$i/id" && chown -R "$owner" "$work/c$i"
+  "$bin" run --workspace "$work/c$i" -- \
+    sh -c 'wget -q -O /dev/null http://example.com && echo "$(cat id) $(ls | wc -l)"' \
+    > "$work/c$i.out" 2>&1 &
+  pids="$pids $!"
+done
+rc=0
+for pid in $pids; do wait "$pid" || rc=$?; done
+got=$(cat "$work/c1.out" "$work/c2.out" "$work/c3.out" "$work/c4.out" | tr '\n' ' ')
+left=$(nft list table inet peerspan_runtime 2>/dev/null | grep -c 'chain run-' || true)
+[ "$rc" -eq 0 ] && [ "$got" = "1 1 2 1 3 1 4 1 " ] && [ "$(run_cgroups)" -le "$cgroups_before" ] \
+  && [ "$left" -eq 0 ] && pass concurrent \
+  || fail "concurrent: exit $rc, [$got], $(run_cgroups) cgroups, $left chains"
+
 # Inspect a running VM from the host: the jailed VMM and the workspace server.
 "$bin" run --workspace "$work/ws" -- sleep 4 > /dev/null 2>&1 &
 run_pid=$!
