@@ -82,7 +82,15 @@ else
   fail "env-and-cwd: exit $?"
 fi
 
-if check readonly-root 1 -- sh -c 'touch /etc/x'; then pass readonly-root; fi
+# Writes outside the workspace go to a layer that ends with the VM: they succeed, never reach
+# the image, and are gone in the next run.
+if check throwaway-root 0 -- sh -c 'echo x > /etc/peerspan-check && ls /root'; then
+  if [ -e "$PEERSPAN_RUNTIME_GUEST/rootfs/etc/peerspan-check" ]; then
+    fail "throwaway-root: the write reached the image"
+  elif check throwaway-root 1 -- test -e /etc/peerspan-check; then
+    pass throwaway-root
+  fi
+fi
 
 # Standard input reaches the command with --stdin, intact and with its end; without it the
 # command's is empty, and a command that ignores endless input still finishes.

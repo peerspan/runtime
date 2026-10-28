@@ -16,10 +16,8 @@ use peerspan_runtime_protocol::{
     GUEST_PREFIX6,
 };
 
-/// The read-only root filesystem keeps an empty file here for init to bind over.
+/// Written in the root's writable layer, replacing the image's, which may be a link elsewhere.
 const RESOLV_CONF: &str = "/etc/resolv.conf";
-/// Written on the guest's `/run` tmpfs, then bound over [`RESOLV_CONF`].
-const RESOLV_CONF_SOURCE: &str = "/run/resolv.conf";
 /// Off before the address is added, so it is usable at once rather than after duplicate
 /// address detection, which nothing else on the guest's link could fail.
 const ACCEPT_DAD: &str = "/proc/sys/net/ipv6/conf/eth0/accept_dad";
@@ -103,8 +101,12 @@ pub fn configure() -> io::Result<()> {
     configure_ipv6()?;
 
     let [a, b, c, d] = GUEST_DNS;
-    fs::write(RESOLV_CONF_SOURCE, format!("nameserver {a}.{b}.{c}.{d}\n"))?;
-    crate::mount(RESOLV_CONF_SOURCE, RESOLV_CONF, "", libc::MS_BIND)
+    match fs::remove_file(RESOLV_CONF) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    fs::write(RESOLV_CONF, format!("nameserver {a}.{b}.{c}.{d}\n"))
 }
 
 /// Adds `eth0`'s IPv6 address and the IPv6 default route, through the host's link-local

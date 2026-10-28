@@ -35,8 +35,10 @@ scripts/check.sh                              # end-to-end checks, as root
 
 ## `run`
 
-Runs one command in a fresh microVM with the workspace at `/workspace` and a read-only Alpine
-root, streams its output, and exits with its code.
+Runs one command in a fresh microVM with the workspace at `/workspace` and a minimal Alpine
+root, streams its output, and exits with its code. The root is writable, so package installs
+work, but writes outside the workspace go to a layer in the guest's memory and are gone when
+the run ends.
 
 | Option | Effect |
 | --- | --- |
@@ -134,7 +136,9 @@ leftover workspace images when it starts.
   against its SHA-256, from `allnoconfig` plus `guest/kernel.config`. It is GPL-2.0.
 - **passt:** `scripts/build-passt.sh` builds a pinned release, verified against its commit.
   It is GPL-2.0-or-later, with source at [passt.top](https://passt.top/passt).
-- **Root filesystem:** read-only Alpine.
+- **Root filesystem:** a minimal Alpine, under a writable layer in memory. Its files are made
+  readable by all on the host, because the VMM serves them as an unprivileged user, so the
+  guest sees looser modes on them.
 - **init:** `guest-init`, a static binary.
 
 ## Measuring

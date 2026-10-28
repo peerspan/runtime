@@ -37,6 +37,11 @@ use peerspan_runtime_protocol::{
 const MODULE_ORDER: &str = "/lib/modules/order";
 const MODULE_DIR: &str = "/lib/modules";
 const NEW_ROOT: &str = "/rootfs";
+/// The image, read-only, under the root.
+const IMAGE: &str = "/image";
+/// A tmpfs holding the root's writable layer, so writes outside the workspace last only as
+/// long as the VM and never reach the image.
+const LAYER: &str = "/layer";
 /// How long to keep retrying the vsock connection while the transport comes up.
 const CONNECT_ATTEMPTS: u32 = 100;
 const CONNECT_RETRY: Duration = Duration::from_millis(50);
@@ -133,7 +138,7 @@ fn run(mut phases: Phases) -> io::Result<()> {
     load_modules()?;
     phases.mark("modules");
 
-    mount(ROOTFS_TAG, NEW_ROOT, "virtiofs", libc::MS_RDONLY)?;
+    mount_root()?;
     mount(
         WORKSPACE_TAG,
         &format!("{NEW_ROOT}{WORKSPACE_PATH}"),
@@ -203,9 +208,50 @@ fn fail(stream: &mut File, reason: &str) -> io::Result<()> {
     .write_to(stream)
 }
 
+/// Mounts the root: the image, read-only, under a writable layer in memory. The directories
+/// the guest mounts over are made in the layer, so an image need not have them.
+fn mount_root() -> io::Result<()> {
+    for dir in [IMAGE, LAYER, NEW_ROOT] {
+        fs::create_dir_all(dir)?;
+    }
+    mount(ROOTFS_TAG, IMAGE, "virtiofs", libc::MS_RDONLY)?;
+    mount("tmpfs", LAYER, "tmpfs", 0)?;
+    fs::create_dir(format!("{LAYER}/upper"))?;
+    fs::create_dir(format!("{LAYER}/work"))?;
+    mount_with(
+        "overlay",
+        NEW_ROOT,
+        "overlay",
+        0,
+        &format!("lowerdir={IMAGE},upperdir={LAYER}/upper,workdir={LAYER}/work"),
+    )?;
+    for dir in [
+        WORKSPACE_PATH,
+        "/proc",
+        "/sys",
+        "/dev",
+        "/tmp",
+        "/run",
+        "/etc",
+    ] {
+        fs::create_dir_all(format!("{NEW_ROOT}{dir}"))?;
+    }
+    Ok(())
+}
+
 fn mount(source: &str, target: &str, fstype: &str, flags: libc::c_ulong) -> io::Result<()> {
+    mount_with(source, target, fstype, flags, "")
+}
+
+fn mount_with(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    flags: libc::c_ulong,
+    data: &str,
+) -> io::Result<()> {
     let c = |s: &str| CString::new(s).expect("mount arguments have no NUL bytes");
-    let (source_c, target_c, fstype_c) = (c(source), c(target), c(fstype));
+    let (source_c, target_c, fstype_c, data_c) = (c(source), c(target), c(fstype), c(data));
     // SAFETY: all pointers are valid NUL-terminated strings that outlive the call, and a null
     // data pointer is allowed.
     let rc = unsafe {
@@ -214,7 +260,11 @@ fn mount(source: &str, target: &str, fstype: &str, flags: libc::c_ulong) -> io::
             target_c.as_ptr(),
             fstype_c.as_ptr(),
             flags,
-            std::ptr::null(),
+            if data.is_empty() {
+                std::ptr::null()
+            } else {
+                data_c.as_ptr().cast()
+            },
         )
     };
     if rc != 0 {

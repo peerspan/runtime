@@ -82,8 +82,8 @@ fi
 rm -rf "$out/rootfs"
 mkdir -p "$out/rootfs"
 tar -xzf "$cache/$tarball" -C "$out/rootfs"
-mkdir -p "$out/rootfs/workspace"
-# Guest init binds the run's DNS settings over this file; the root filesystem is read-only.
-: > "$out/rootfs/etc/resolv.conf"
+# The VMM serves the root as an unprivileged user, so everything must be readable by others;
+# the guest then sees those looser modes on the image's own files.
+chmod -R a+rX "$out/rootfs"
 
 echo "guest image in $out (kernel $ver, $(wc -l < "$initramfs/lib/modules/order") modules)"
