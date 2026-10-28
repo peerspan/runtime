@@ -171,8 +171,7 @@ fn cached_digest(cache: &Path, reference: &Reference) -> Option<String> {
 fn open(cache: &Path, digest: &str) -> anyhow::Result<Image> {
     let dir = image_dir(cache, digest);
     let image_lock = lock(&dir, libc::LOCK_SH)?;
-    // Its modification time says when the image was last booted, for `prune --unused-days`.
-    File::create(dir.join(LAST_USED)).with_context(|| format!("image {digest}"))?;
+    mark_used(&dir).with_context(|| format!("image {digest}"))?;
     let config: ImageConfig = serde_json::from_slice(
         &fs::read(dir.join("config.json")).with_context(|| format!("image {digest}"))?,
     )
@@ -193,6 +192,22 @@ fn open(cache: &Path, digest: &str) -> anyhow::Result<Image> {
 }
 
 const LAST_USED: &str = "last-used";
+
+/// Records that a run is booting the image in `dir`: the file's modification time is what
+/// `prune --unused-days` goes by.
+fn mark_used(dir: &Path) -> io::Result<()> {
+    File::create(dir.join(LAST_USED)).map(drop)
+}
+
+impl Image {
+    /// Records that another run is booting this image, for one held across many runs, as
+    /// serve holds its image.
+    pub fn mark_used(&self) {
+        if let Some(dir) = self.rootfs.parent() {
+            let _ = mark_used(dir);
+        }
+    }
+}
 
 fn cache_lock_path(cache: &Path) -> PathBuf {
     cache.join(".lock")

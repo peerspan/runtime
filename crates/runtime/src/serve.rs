@@ -444,6 +444,9 @@ fn execute(runtime: &Runtime, run: &Run) {
                     combined_output: false,
                 },
             };
+            if let Some(image) = &runtime.image {
+                image.mark_used();
+            }
             let outcome = vm::run(&spec, &run.cancel, &mut |event| results.record(run, &event))
                 .unwrap_or_else(|e| failed(run, &e));
             (outcome, Some(results))
