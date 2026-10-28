@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright The Peerspan Authors
+#
+# serve, the local API the Peerspan host daemon drives. Settings go in
+# /etc/default/peerspan-runtime as PEERSPAN_RUNTIME_ARGS, for example
+#   PEERSPAN_RUNTIME_ARGS="--client-uid 1000 --image node:22"
+# where --client-uid is the user the daemon runs as.
+
+[Unit]
+Description=Peerspan runtime: microVMs for agent work
+Documentation=https://github.com/peerspan/runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=-/etc/default/peerspan-runtime
+ExecStart=/usr/local/bin/peerspan-runtime serve --socket /run/peerspan-runtime/runtime.sock $PEERSPAN_RUNTIME_ARGS
+RuntimeDirectory=peerspan-runtime
+StateDirectory=peerspan-runtime
+StateDirectoryMode=0711
+CacheDirectory=peerspan-runtime
+CacheDirectoryMode=0700
+LimitNOFILE=1048576
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

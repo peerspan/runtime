@@ -17,21 +17,48 @@ as a test suite, in a microVM on another of your own machines.
 
 Today: Linux x86_64 with KVM, run as root. macOS (Apple Silicon) is planned.
 
-## Quick start
+## Install
 
-Requirements: `/dev/kvm`, a kernel build toolchain (`flex`, `bison`, `bc`, `libelf-dev`), the
-`x86_64-unknown-linux-musl` Rust target, `virtiofsd`, `nft`, `mkfs.ext4`, and libkrun built from
-the `peerspan` branch of [peerspan/libkrun](https://github.com/peerspan/libkrun) with
-`make VHOST_USER=1 NET=1`.
+On Linux x86_64 with KVM, as root:
 
 ```sh
-scripts/build-guest.sh target/guest           # guest kernel, init and root filesystem
-scripts/build-passt.sh target/release         # pinned passt, beside the binary
-export PEERSPAN_RUNTIME_GUEST=$PWD/target/guest
-export PEERSPAN_LIBKRUN=/path/to/libkrun/target/release/libkrun.so.2.0.0
-cargo run --release -p peerspan-runtime -- run --image node:22 --workspace ~/src/project -- npm test
-scripts/check.sh                              # end-to-end checks, as root
+curl -fsSL https://raw.githubusercontent.com/peerspan/runtime/main/scripts/install.sh | sudo sh
+sudo peerspan-runtime run --image node:22 --workspace ~/src/project -- npm test
 ```
+
+A release bundles the runtime with libkrun, passt and the guest image. The host needs
+`virtiofsd`, `nft` and `mkfs.ext4` (on Debian and Ubuntu:
+`apt-get install virtiofsd nftables e2fsprogs`). `peerspan-runtime doctor` checks everything a
+run needs and says what to fix.
+
+- **Layout:** each version goes in `/usr/local/lib/peerspan-runtime/VERSION`, with `current`
+  linking the installed one and `/usr/local/bin/peerspan-runtime` linking its binary.
+- **Options:** `install.sh` takes `--version`, `--prefix`, `--from TARBALL` and
+  `--no-service`.
+- **Service:** where systemd runs, the `serve` unit is installed but not enabled. Its settings
+  go in `/etc/default/peerspan-runtime`, for example
+  `PEERSPAN_RUNTIME_ARGS="--client-uid 1000"`. Start it with
+  `systemctl enable --now peerspan-runtime`.
+
+## Build from source
+
+Needs a kernel build toolchain (`flex`, `bison`, `bc`, `libelf-dev`), `clang` and
+`libclang-dev` for libkrun, and the `x86_64-unknown-linux-musl` Rust target.
+
+```sh
+scripts/build-guest.sh target/release/guest   # guest kernel, init and root filesystem
+scripts/build-libkrun.sh target/release       # pinned libkrun, beside the binary
+scripts/build-passt.sh target/release         # pinned passt, beside the binary
+cargo build --release -p peerspan-runtime
+sudo target/release/peerspan-runtime doctor
+sudo scripts/check.sh                         # end-to-end checks
+```
+
+The runtime looks for libkrun, passt and the guest image beside its own binary.
+`--libkrun`, `--passt` and `--guest`, or `PEERSPAN_LIBKRUN`, `PEERSPAN_PASST` and
+`PEERSPAN_RUNTIME_GUEST`, name others. `scripts/build-release.sh OUT_DIR` builds a release
+tarball. Its binaries need the glibc of the host that built them, so build releases on the
+oldest distribution to support.
 
 ## `run`
 
