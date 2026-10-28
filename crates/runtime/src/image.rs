@@ -1,0 +1,694 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright The Peerspan Authors
+
+//! OCI images as guest root filesystems.
+//!
+//! An image is pulled once from its registry, checked against the digests its manifest names,
+//! unpacked, and kept under its manifest's digest; a tag maps to the digest it named when it
+//! was pulled, until it is pulled again. Layers are unpacked by a child that has chrooted into
+//! the new root, so no entry can reach outside it. The VMM serves the root as an unprivileged
+//! user, so everything in it is made readable by all, and the guest sees those modes.
+
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, bail};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
+/// Where images are kept unless set otherwise.
+pub const DEFAULT_CACHE: &str = "/var/cache/peerspan-runtime/images";
+const PLATFORM_OS: &str = "linux";
+const PLATFORM_ARCH: &str = "amd64";
+const MANIFEST_TYPES: &str = "application/vnd.oci.image.index.v1+json, \
+    application/vnd.docker.distribution.manifest.list.v2+json, \
+    application/vnd.oci.image.manifest.v1+json, \
+    application/vnd.docker.distribution.manifest.v2+json";
+
+/// An image ready to boot: its root and the environment its configuration sets.
+#[derive(Debug)]
+pub struct Image {
+    pub rootfs: PathBuf,
+    pub env: Vec<(String, String)>,
+}
+
+/// An image reference: `name[:tag]` or `name@digest`, with Docker Hub as the default registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reference {
+    registry: String,
+    repository: String,
+    /// A tag or a `sha256:` digest.
+    reference: String,
+}
+
+impl Reference {
+    /// Parses a reference as Docker does: `node:22` is `docker.io/library/node:22`.
+    ///
+    /// # Errors
+    ///
+    /// Fails for an empty name or a malformed digest.
+    pub fn parse(text: &str) -> anyhow::Result<Reference> {
+        let (name, reference) = if let Some((name, digest)) = text.split_once('@') {
+            if !is_digest(digest) {
+                bail!("{text}: a digest must be sha256: and 64 lowercase hex digits");
+            }
+            (name, digest.to_owned())
+        } else {
+            match text.rsplit_once(':') {
+                Some((name, tag)) if !tag.contains('/') => (name, tag.to_owned()),
+                _ => (text, "latest".to_owned()),
+            }
+        };
+        let (registry, repository) = match name.split_once('/') {
+            Some((first, rest))
+                if first.contains('.') || first.contains(':') || first == "localhost" =>
+            {
+                (first.to_owned(), rest.to_owned())
+            }
+            _ => ("docker.io".to_owned(), name.to_owned()),
+        };
+        let repository = if registry == "docker.io" && !repository.contains('/') {
+            format!("library/{repository}")
+        } else {
+            repository
+        };
+        if repository.is_empty() || reference.is_empty() {
+            bail!("{text} is not an image reference");
+        }
+        Ok(Reference {
+            registry,
+            repository,
+            reference,
+        })
+    }
+
+    fn api(&self) -> String {
+        let host = if self.registry == "docker.io" {
+            "registry-1.docker.io"
+        } else {
+            &self.registry
+        };
+        format!("https://{host}/v2/{}", self.repository)
+    }
+
+    /// A file name for the tag's entry in the cache.
+    fn key(&self) -> String {
+        format!("{}/{}:{}", self.registry, self.repository, self.reference).replace('/', "%")
+    }
+}
+
+impl std::fmt::Display for Reference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let separator = if is_digest(&self.reference) { '@' } else { ':' };
+        write!(
+            f,
+            "{}/{}{separator}{}",
+            self.registry, self.repository, self.reference
+        )
+    }
+}
+
+/// Returns the image `reference` names, pulling it first if the cache does not have it or
+/// `pull` is set.
+///
+/// # Errors
+///
+/// Fails if the image cannot be pulled, checked or unpacked.
+pub fn get(cache: &Path, reference: &Reference, pull: bool) -> anyhow::Result<Image> {
+    let digest = match (pull, cached_digest(cache, reference)) {
+        (false, Some(digest)) => digest,
+        _ => self::pull(cache, reference)?,
+    };
+    open(cache, &digest)
+}
+
+/// An image's environment with `overrides` applied, a later name replacing an earlier one.
+pub fn merge_env(
+    mut base: Vec<(String, String)>,
+    overrides: impl IntoIterator<Item = (String, String)>,
+) -> Vec<(String, String)> {
+    for (name, value) in overrides {
+        base.retain(|(existing, _)| *existing != name);
+        base.push((name, value));
+    }
+    base
+}
+
+fn cached_digest(cache: &Path, reference: &Reference) -> Option<String> {
+    let digest = if is_digest(&reference.reference) {
+        reference.reference.clone()
+    } else {
+        fs::read_to_string(cache.join("tags").join(reference.key())).ok()?
+    };
+    let digest = digest.trim().to_owned();
+    image_dir(cache, &digest).is_dir().then_some(digest)
+}
+
+fn open(cache: &Path, digest: &str) -> anyhow::Result<Image> {
+    let dir = image_dir(cache, digest);
+    let config: ImageConfig = serde_json::from_slice(
+        &fs::read(dir.join("config.json")).with_context(|| format!("image {digest}"))?,
+    )
+    .with_context(|| format!("image {digest}: config.json"))?;
+    let env = config
+        .config
+        .and_then(|c| c.env)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+    Ok(Image {
+        rootfs: dir.join("rootfs"),
+        env,
+    })
+}
+
+fn image_dir(cache: &Path, digest: &str) -> PathBuf {
+    cache.join(digest.replace(':', "-"))
+}
+
+/// Pulls `reference` into the cache and returns its manifest's digest.
+///
+/// # Errors
+///
+/// Fails if the registry refuses, a blob does not match its digest, or unpacking fails.
+pub fn pull(cache: &Path, reference: &Reference) -> anyhow::Result<String> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(cache.join("tags"))
+        .with_context(|| format!("creating {}", cache.display()))?;
+    let mut registry = Registry::new(reference);
+    let (digest, manifest) = registry.manifest(&reference.reference)?;
+    let dir = image_dir(cache, &digest);
+    if !dir.is_dir() {
+        eprintln!("peerspan-runtime: pulling {reference}");
+        let staging = cache.join(format!("tmp-{}-{}", std::process::id(), nanos()));
+        let result = unpack(&mut registry, &manifest, &staging).and_then(|()| {
+            match fs::rename(&staging, &dir) {
+                Ok(()) => Ok(()),
+                // Another pull of the same image finished first.
+                Err(_) if dir.is_dir() => Ok(()),
+                Err(e) => Err(e).context("storing the image"),
+            }
+        });
+        let _ = fs::remove_dir_all(&staging);
+        result.with_context(|| format!("pulling {reference}"))?;
+    }
+    if !is_digest(&reference.reference) {
+        let tags = cache.join("tags");
+        let staging = tags.join(format!(".{}-{}", reference.key(), nanos()));
+        fs::write(&staging, &digest)?;
+        fs::rename(&staging, tags.join(reference.key()))?;
+    }
+    Ok(digest)
+}
+
+/// Downloads `manifest`'s configuration and layers into `staging` and unpacks the layers.
+fn unpack(registry: &mut Registry, manifest: &Manifest, staging: &Path) -> anyhow::Result<()> {
+    fs::DirBuilder::new().mode(0o700).create(staging)?;
+    registry.blob(&manifest.config.digest, &staging.join("config.json"))?;
+    let mut layers = Vec::new();
+    for (i, layer) in manifest.layers.iter().enumerate() {
+        let compressed = match layer.media_type.as_str() {
+            t if t.ends_with("tar+gzip") || t.ends_with("tar.gzip") => true,
+            t if t.ends_with(".tar") || t.ends_with("tar") => false,
+            t if t.contains("zstd") => bail!("zstd-compressed layers are not supported yet ({t})"),
+            t => bail!("unsupported layer type {t}"),
+        };
+        let path = staging.join(format!("layer-{i}"));
+        registry.blob(&layer.digest, &path)?;
+        layers.push((path, compressed));
+    }
+    let rootfs = staging.join("rootfs");
+    fs::DirBuilder::new().mode(0o755).create(&rootfs)?;
+    let mut helper = Command::new(std::env::current_exe().context("locating this executable")?);
+    helper.arg("unpack-layers").arg("--root").arg(&rootfs);
+    for (path, compressed) in &layers {
+        let kind = if *compressed { "gzip" } else { "tar" };
+        helper
+            .arg("--layer")
+            .arg(format!("{kind}:{}", path.display()));
+    }
+    let status = helper.status().context("starting the layer unpacker")?;
+    for (path, _) in &layers {
+        let _ = fs::remove_file(path);
+    }
+    if !status.success() {
+        bail!("unpacking the layers failed ({status})");
+    }
+    Ok(())
+}
+
+/// A registry session for one repository, holding its token once one is needed.
+struct Registry<'r> {
+    reference: &'r Reference,
+    agent: ureq::Agent,
+    token: Option<String>,
+}
+
+impl<'r> Registry<'r> {
+    fn new(reference: &'r Reference) -> Self {
+        Registry {
+            reference,
+            agent: ureq::AgentBuilder::new()
+                .user_agent(concat!("peerspan-runtime/", env!("CARGO_PKG_VERSION")))
+                .build(),
+            token: None,
+        }
+    }
+
+    /// GETs `url`, fetching an anonymous token when the registry asks for one.
+    fn get(&mut self, url: &str, accept: &str) -> anyhow::Result<ureq::Response> {
+        for _ in 0..2 {
+            let mut request = self.agent.get(url).set("Accept", accept);
+            if let Some(token) = &self.token {
+                request = request.set("Authorization", &format!("Bearer {token}"));
+            }
+            match request.call() {
+                Ok(response) => return Ok(response),
+                Err(ureq::Error::Status(401, response)) if self.token.is_none() => {
+                    let challenge = response.header("www-authenticate").unwrap_or("").to_owned();
+                    self.token = Some(self.authenticate(&challenge)?);
+                }
+                Err(ureq::Error::Status(code, _)) => {
+                    bail!("{} answered {code} for {url}", self.reference.registry)
+                }
+                Err(e) => return Err(e).with_context(|| format!("fetching {url}")),
+            }
+        }
+        bail!("{} refused the token it issued", self.reference.registry)
+    }
+
+    /// Fetches an anonymous pull token from the realm a `Bearer` challenge names.
+    fn authenticate(&self, challenge: &str) -> anyhow::Result<String> {
+        let Some(params) = challenge.strip_prefix("Bearer ") else {
+            bail!(
+                "{} needs credentials, which are not supported yet",
+                self.reference.registry
+            );
+        };
+        let param = |name: &str| {
+            params.split(',').find_map(|part| {
+                let (key, value) = part.trim().split_once('=')?;
+                (key == name).then(|| value.trim_matches('"').to_owned())
+            })
+        };
+        let Some(realm) = param("realm") else {
+            bail!(
+                "{}: token challenge without a realm",
+                self.reference.registry
+            );
+        };
+        let scope = param("scope")
+            .unwrap_or_else(|| format!("repository:{}:pull", self.reference.repository));
+        let mut request = self.agent.get(&realm).query("scope", &scope);
+        if let Some(service) = param("service") {
+            request = request.query("service", &service);
+        }
+        let response: TokenResponse = serde_json::from_reader(
+            request
+                .call()
+                .with_context(|| format!("fetching a token from {realm}"))?
+                .into_reader()
+                .take(1 << 20),
+        )
+        .context("reading the token")?;
+        response
+            .token
+            .or(response.access_token)
+            .context("the token response has no token")
+    }
+
+    /// The image manifest for `reference`, a tag or digest, choosing linux/amd64 from an
+    /// index, with its digest.
+    fn manifest(&mut self, reference: &str) -> anyhow::Result<(String, Manifest)> {
+        let url = format!("{}/manifests/{reference}", self.reference.api());
+        let mut body = Vec::new();
+        self.get(&url, MANIFEST_TYPES)?
+            .into_reader()
+            .take(4 << 20)
+            .read_to_end(&mut body)?;
+        let digest = format!("sha256:{:x}", Sha256::digest(&body));
+        if is_digest(reference) && digest != reference {
+            bail!("the manifest for {reference} has digest {digest}");
+        }
+        let document: Document = serde_json::from_slice(&body).context("reading the manifest")?;
+        match document {
+            Document {
+                manifests: Some(entries),
+                ..
+            } => {
+                let Some(entry) = entries.iter().find(|m| {
+                    m.platform
+                        .as_ref()
+                        .is_some_and(|p| p.os == PLATFORM_OS && p.architecture == PLATFORM_ARCH)
+                }) else {
+                    bail!(
+                        "{} has no {PLATFORM_OS}/{PLATFORM_ARCH} image",
+                        self.reference
+                    );
+                };
+                let digest = entry.digest.clone();
+                self.manifest(&digest)
+            }
+            Document {
+                config: Some(config),
+                layers: Some(layers),
+                ..
+            } => Ok((digest, Manifest { config, layers })),
+            _ => bail!(
+                "{} is neither an image index nor a manifest",
+                self.reference
+            ),
+        }
+    }
+
+    /// Downloads blob `digest` to `path`, checking its digest.
+    fn blob(&mut self, digest: &str, path: &Path) -> anyhow::Result<()> {
+        if !is_digest(digest) {
+            bail!("unsupported blob digest {digest}");
+        }
+        let url = format!("{}/blobs/{digest}", self.reference.api());
+        let mut reader = self.get(&url, "*/*")?.into_reader();
+        let mut file = File::create(path)?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0; 256 << 10];
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .with_context(|| format!("downloading {digest}"))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            file.write_all(&buf[..n])?;
+        }
+        let got = format!("sha256:{:x}", hasher.finalize());
+        if got != digest {
+            bail!("blob {digest} arrived with digest {got}");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    token: Option<String>,
+    access_token: Option<String>,
+}
+
+/// An image index or an image manifest; which one is told by the fields present.
+#[derive(Deserialize)]
+struct Document {
+    manifests: Option<Vec<IndexEntry>>,
+    config: Option<Descriptor>,
+    layers: Option<Vec<Descriptor>>,
+}
+
+#[derive(Deserialize)]
+struct IndexEntry {
+    digest: String,
+    platform: Option<Platform>,
+}
+
+#[derive(Deserialize)]
+struct Platform {
+    os: String,
+    architecture: String,
+}
+
+#[derive(Deserialize)]
+struct Descriptor {
+    #[serde(rename = "mediaType", default)]
+    media_type: String,
+    digest: String,
+}
+
+struct Manifest {
+    config: Descriptor,
+    layers: Vec<Descriptor>,
+}
+
+#[derive(Deserialize)]
+struct ImageConfig {
+    config: Option<RunConfig>,
+}
+
+#[derive(Deserialize)]
+struct RunConfig {
+    #[serde(rename = "Env")]
+    env: Option<Vec<String>>,
+}
+
+fn is_digest(text: &str) -> bool {
+    text.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+fn nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
+}
+
+/// The `unpack-layers` child: opens each layer, chroots into `root`, and applies the layers in
+/// order, then makes everything readable by all.
+///
+/// # Errors
+///
+/// Fails if a layer cannot be opened or read, or the chroot fails.
+pub fn unpack_layers(root: &Path, layers: &[(PathBuf, bool)]) -> anyhow::Result<()> {
+    let files = layers
+        .iter()
+        .map(|(path, gzip)| Ok((File::open(path)?, *gzip)))
+        .collect::<io::Result<Vec<_>>>()
+        .context("opening the layers")?;
+    std::os::unix::fs::chroot(root).context("chroot into the new root")?;
+    std::env::set_current_dir("/")?;
+    for (file, gzip) in files {
+        let reader: Box<dyn Read> = if gzip {
+            Box::new(flate2::read::GzDecoder::new(io::BufReader::new(file)))
+        } else {
+            Box::new(io::BufReader::new(file))
+        };
+        apply_layer(Path::new("/"), reader).context("applying a layer")?;
+    }
+    make_readable(Path::new("/"))
+}
+
+/// Applies one layer to `root`, which is `/` once chrooted: its whiteouts remove what lower
+/// layers made.
+fn apply_layer(root: &Path, reader: impl Read) -> anyhow::Result<()> {
+    let mut archive = tar::Archive::new(reader);
+    archive.set_preserve_permissions(true);
+    archive.set_preserve_ownerships(true);
+    archive.set_preserve_mtime(true);
+    archive.set_overwrite(true);
+    archive.set_unpack_xattrs(false);
+    let mut written = std::collections::HashSet::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let Some(path) = clean_path(&entry.path()?) else {
+            continue;
+        };
+        let path = root.join(path.strip_prefix("/").unwrap_or(&path));
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let parent = path.parent().unwrap_or(root).to_owned();
+        if name == ".wh..wh..opq" {
+            for child in fs::read_dir(&parent).into_iter().flatten().flatten() {
+                if !written.contains(&child.path()) {
+                    remove(&child.path());
+                }
+            }
+            continue;
+        }
+        if let Some(hidden) = name.strip_prefix(".wh.") {
+            remove(&parent.join(hidden));
+            continue;
+        }
+        let kind = entry.header().entry_type();
+        if !(kind.is_file() || kind.is_dir() || kind.is_symlink() || kind.is_hard_link()) {
+            // Devices and FIFOs: the guest's /dev comes from devtmpfs.
+            continue;
+        }
+        fs::create_dir_all(&parent)?;
+        if let Ok(existing) = fs::symlink_metadata(&path)
+            && !(kind.is_dir() && existing.is_dir())
+        {
+            remove(&path);
+        }
+        entry
+            .unpack(&path)
+            .with_context(|| format!("unpacking {}", path.display()))?;
+        written.insert(path);
+    }
+    Ok(())
+}
+
+/// The entry's path made absolute, or None if it climbs with `..`.
+fn clean_path(path: &Path) -> Option<PathBuf> {
+    let mut clean = PathBuf::from("/");
+    for part in path.components() {
+        match part {
+            std::path::Component::Normal(part) => clean.push(part),
+            std::path::Component::CurDir | std::path::Component::RootDir => {}
+            _ => return None,
+        }
+    }
+    (clean != Path::new("/")).then_some(clean)
+}
+
+fn remove(path: &Path) {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => {
+            let _ = fs::remove_dir_all(path);
+        }
+        Ok(_) => {
+            let _ = fs::remove_file(path);
+        }
+        Err(_) => {}
+    }
+}
+
+/// Adds read permission for all, and search permission for all on directories and on files
+/// that anyone may execute, as `chmod -R a+rX` does. Links are left alone.
+fn make_readable(dir: &Path) -> anyhow::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        let mode = meta.permissions().mode();
+        let search = if meta.is_dir() || mode & 0o111 != 0 {
+            0o111
+        } else {
+            0
+        };
+        let wanted = mode | 0o444 | search;
+        if wanted != mode {
+            fs::set_permissions(entry.path(), fs::Permissions::from_mode(wanted & 0o7777))?;
+        }
+        if meta.is_dir() {
+            make_readable(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_references_as_docker_does() {
+        let r = Reference::parse("node:22").unwrap();
+        assert_eq!(r.to_string(), "docker.io/library/node:22");
+        assert_eq!(r.api(), "https://registry-1.docker.io/v2/library/node");
+        assert_eq!(Reference::parse("alpine").unwrap().reference, "latest");
+        let r = Reference::parse("ghcr.io/org/tool:1.2").unwrap();
+        assert_eq!(
+            (r.registry.as_str(), r.repository.as_str()),
+            ("ghcr.io", "org/tool")
+        );
+        let r = Reference::parse("localhost:5000/x").unwrap();
+        assert_eq!(
+            (r.registry.as_str(), r.reference.as_str()),
+            ("localhost:5000", "latest")
+        );
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let r = Reference::parse(&format!("user/app@{digest}")).unwrap();
+        assert_eq!(r.to_string(), format!("docker.io/user/app@{digest}"));
+        assert!(Reference::parse("app@sha256:short").is_err());
+    }
+
+    fn layer(entries: &[(&str, Option<&str>)]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, content) in entries {
+            let mut header = tar::Header::new_gnu();
+            // SAFETY: getuid and getgid have no preconditions.
+            let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+            header.set_uid(uid.into());
+            header.set_gid(gid.into());
+            header.set_mtime(0);
+            match content {
+                Some(data) => {
+                    header.set_entry_type(tar::EntryType::Regular);
+                    header.set_size(data.len() as u64);
+                    header.set_mode(0o600);
+                }
+                None => {
+                    header.set_entry_type(tar::EntryType::Directory);
+                    header.set_size(0);
+                    header.set_mode(0o700);
+                }
+            }
+            builder
+                .append_data(&mut header, path, content.unwrap_or("").as_bytes())
+                .unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn whiteouts_remove_what_lower_layers_made() {
+        let root = std::env::temp_dir().join(format!("peerspan-layers-{}", nanos()));
+        fs::create_dir(&root).unwrap();
+        let lower = layer(&[
+            ("a/x", Some("x")),
+            ("a/y", Some("y")),
+            ("b/old", Some("old")),
+            ("c/", None),
+        ]);
+        let upper = layer(&[
+            ("a/.wh.x", Some("")),
+            ("b/.wh..wh..opq", Some("")),
+            ("b/new", Some("new")),
+            (".wh.c", Some("")),
+        ]);
+        apply_layer(&root, &lower[..]).unwrap();
+        apply_layer(&root, &upper[..]).unwrap();
+        let names = |dir: &str| {
+            let mut names: Vec<String> = fs::read_dir(root.join(dir))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names("a"), ["y"]);
+        assert_eq!(names("b"), ["new"]);
+        assert!(!root.join("c").exists());
+        make_readable(&root).unwrap();
+        let mode = fs::metadata(root.join("a/y")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn layer_paths_cannot_climb_out() {
+        assert_eq!(
+            clean_path(Path::new("./etc/x")),
+            Some(PathBuf::from("/etc/x"))
+        );
+        assert_eq!(
+            clean_path(Path::new("/usr/bin")),
+            Some(PathBuf::from("/usr/bin"))
+        );
+        assert_eq!(clean_path(Path::new("a/../../etc")), None);
+        assert_eq!(clean_path(Path::new("./")), None);
+    }
+}

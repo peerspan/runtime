@@ -47,6 +47,13 @@ pub struct ServeArgs {
     /// Guest image directory holding `vmlinux`, `initramfs.cpio.gz` and `rootfs/`.
     #[arg(long, env = "PEERSPAN_RUNTIME_GUEST")]
     guest: PathBuf,
+    /// OCI image every run boots, such as `node:22`, pulled at startup if it is not here
+    /// [default: the guest image's own root, a minimal Alpine].
+    #[arg(long)]
+    image: Option<String>,
+    /// Where images are kept.
+    #[arg(long, default_value = crate::image::DEFAULT_CACHE)]
+    image_cache: PathBuf,
     /// libkrun shared library to load.
     #[arg(long, env = "PEERSPAN_LIBKRUN", default_value = "libkrun.so.2")]
     libkrun: PathBuf,
@@ -133,6 +140,8 @@ enum Results {
 
 struct Runtime {
     args: ServeArgs,
+    /// The image every run boots, resolved at startup.
+    image: Option<crate::image::Image>,
     runs: Mutex<HashMap<String, Arc<Run>>>,
 }
 
@@ -196,8 +205,17 @@ pub fn serve(args: ServeArgs) -> anyhow::Result<()> {
     std::os::unix::fs::chown(&args.socket, Some(args.client_uid), None)?;
     eprintln!("peerspan-runtime: serving on {}", args.socket.display());
 
+    let image = match &args.image {
+        Some(name) => Some(crate::image::get(
+            &args.image_cache,
+            &crate::image::Reference::parse(name)?,
+            false,
+        )?),
+        None => None,
+    };
     let runtime = Arc::new(Runtime {
         args,
+        image,
         runs: Mutex::new(HashMap::new()),
     });
     for request in server.incoming_requests() {
@@ -374,6 +392,7 @@ fn execute(runtime: &Runtime, run: &Run) {
                 workspace,
                 own_workspace: true,
                 stdin: None,
+                rootfs: runtime.image.as_ref().map(|i| i.rootfs.clone()),
                 archive: request.workspace_archive.clone(),
                 guest: runtime.args.guest.clone(),
                 libkrun: runtime.args.libkrun.clone(),
@@ -399,7 +418,13 @@ fn execute(runtime: &Runtime, run: &Run) {
                 command: peerspan_runtime_protocol::Command {
                     argv: request.argv.clone(),
                     cwd: request.cwd.clone(),
-                    env: request.env.clone().into_iter().collect(),
+                    env: crate::image::merge_env(
+                        runtime
+                            .image
+                            .as_ref()
+                            .map_or_else(Vec::new, |i| i.env.clone()),
+                        request.env.clone(),
+                    ),
                     archive: false,
                     collect_changes: request.results == Results::Changes,
                     network: false,

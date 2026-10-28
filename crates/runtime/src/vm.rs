@@ -66,6 +66,8 @@ pub struct VmSpec {
     /// empty one.
     pub stdin: Option<File>,
     pub guest: PathBuf,
+    /// A root filesystem to boot instead of the guest image's own, such as a pulled image's.
+    pub rootfs: Option<PathBuf>,
     pub libkrun: PathBuf,
     pub virtiofsd: PathBuf,
     /// The passt binary that carries the guest's network traffic.
@@ -178,7 +180,11 @@ pub fn run(
     }
     let workspace = fs::canonicalize(&options.workspace)
         .with_context(|| format!("workspace {}", options.workspace.display()))?;
-    let guest = GuestImage::open(&options.guest)?;
+    let mut guest = GuestImage::open(&options.guest)?;
+    if let Some(rootfs) = &options.rootfs {
+        guest.rootfs = fs::canonicalize(rootfs)
+            .with_context(|| format!("root filesystem {}", rootfs.display()))?;
+    }
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
         bail!("peerspan-runtime must run as root to confine its VMs");

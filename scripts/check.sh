@@ -92,6 +92,18 @@ if check throwaway-root 0 -- sh -c 'echo x > /etc/peerspan-check && ls /root'; t
   fi
 fi
 
+# OCI images: a pulled image boots, by tag and by the digest pull reports, with its own
+# environment under the run's. Needs Docker Hub.
+images="$work/images"
+digest=$("$bin" pull --image-cache "$images" alpine:3.20 2> "$work/err") || digest=""
+got=$("$bin" run --workspace "$work/ws" --image-cache "$images" --image alpine:3.20 --env HOME=/x -- \
+  sh -c 'cut -d. -f1,2 /etc/alpine-release; echo "$PATH $HOME"' 2>> "$work/err" | tr '\n' ' ') || true
+by_digest=$("$bin" run --workspace "$work/ws" --image-cache "$images" --image "alpine@$digest" -- \
+  cut -d. -f1,2 /etc/alpine-release 2>> "$work/err") || true
+want_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+[ "$got" = "3.20 $want_path /x " ] && [ "$by_digest" = 3.20 ] && pass image \
+  || fail "image: [$got] by digest [$by_digest] $(tail -3 "$work/err")"
+
 # Standard input reaches the command with --stdin, intact and with its end; without it the
 # command's is empty, and a command that ignores endless input still finishes.
 head -c 5000000 /dev/urandom > "$work/stdin.bin"
