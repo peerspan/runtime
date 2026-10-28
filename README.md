@@ -29,20 +29,20 @@ scripts/build-guest.sh target/guest           # guest kernel, init and root file
 scripts/build-passt.sh target/release         # pinned passt, beside the binary
 export PEERSPAN_RUNTIME_GUEST=$PWD/target/guest
 export PEERSPAN_LIBKRUN=/path/to/libkrun/target/release/libkrun.so.2.0.0
-cargo run --release -p peerspan-runtime -- run --workspace ~/src/project -- make test
+cargo run --release -p peerspan-runtime -- run --image node:22 --workspace ~/src/project -- npm test
 scripts/check.sh                              # end-to-end checks, as root
 ```
 
 ## `run`
 
-Runs one command in a fresh microVM with the workspace at `/workspace` and a minimal Alpine
-root, streams its output, and exits with its code. The root is writable, so package installs
-work, but writes outside the workspace go to a layer in the guest's memory and are gone when
-the run ends.
+Runs one command in a fresh microVM with the workspace at `/workspace`, streams its output, and
+exits with its code.
 
 | Option | Effect |
 | --- | --- |
 | `--workspace DIR` | The directory to mount at `/workspace` |
+| `--image REF` | OCI image to boot, such as `node:22` (default: a minimal Alpine); see Images |
+| `--pull` | Pull the image again, to update its tag |
 | `--archive FILE` | Unpack a tar or tar.gz into an empty workspace first |
 | `--results-dir DIR` | Write `changes.tar` and `deleted.txt`: what the command changed |
 | `--network LEVEL` | `none`, `internet` (default) or `internet+lan`; see Network |
@@ -63,11 +63,29 @@ ran. Archives may hold only directories, files and symbolic links, with no absol
 events, cancel it, collect its result files, delete it. The runtime task contract in the
 Peerspan host repository specifies it; `scripts/check-serve.py` exercises it.
 
-Host-wide limits are flags: `--max-cpus`, `--max-memory-mib`, `--max-seconds`,
+`--image REF` sets the image every run boots. Host-wide limits are flags: `--max-cpus`, `--max-memory-mib`, `--max-seconds`,
 `--max-network`, `--max-concurrent-runs`, `--io-mibps`, `--io-iops` and `--workspace-mib`.
 Runs keep their state under `--state` (default `/var/lib/peerspan-runtime`), which must be
 searchable by other users. `--stdin` and `--combined-output` are not available here yet, since
 the contract has neither.
+
+## Images
+
+`--image` takes the references Docker does: `node:22`, `python:3.12-slim`,
+`ghcr.io/org/tool:1.2`, or `name@sha256:...`. `pull REF` fetches an image ahead of time, or
+updates a tag to what it names now.
+
+- An image is pulled once, checked against its digests, and kept under
+  `/var/cache/peerspan-runtime/images` (`--image-cache`).
+- A tag keeps naming what it named when it was pulled, until it is pulled again.
+- The image's environment applies under `--env`. Its entrypoint, user and working directory
+  are ignored: the command runs as root in `--cwd`.
+- The root is writable: `apt-get`, `pip` and `npm -g` work. Writes outside the workspace go to
+  a layer in the guest's memory and are gone when the run ends, and the image is never changed.
+- Image files are made readable by all on the host, because the VMM serves them as an
+  unprivileged user, so the guest sees looser modes on them.
+- Not yet: private registries, zstd layers, platforms other than linux/amd64, and removing
+  old images.
 
 ## Network
 
@@ -136,9 +154,8 @@ leftover workspace images when it starts.
   against its SHA-256, from `allnoconfig` plus `guest/kernel.config`. It is GPL-2.0.
 - **passt:** `scripts/build-passt.sh` builds a pinned release, verified against its commit.
   It is GPL-2.0-or-later, with source at [passt.top](https://passt.top/passt).
-- **Root filesystem:** a minimal Alpine, under a writable layer in memory. Its files are made
-  readable by all on the host, because the VMM serves them as an unprivileged user, so the
-  guest sees looser modes on them.
+- **Root filesystem:** the run's image, or the bundled minimal Alpine, under a writable layer
+  in memory.
 - **init:** `guest-init`, a static binary.
 
 ## Measuring

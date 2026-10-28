@@ -6,6 +6,7 @@
 mod caplog;
 mod cgroup;
 mod disk;
+mod image;
 mod jail;
 mod krun;
 mod launcher;
@@ -41,12 +42,35 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Run a command in a new microVM with a workspace attached, and exit with its code.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Serve the local API the host daemon uses to run tasks.
     Serve(serve::ServeArgs),
+    /// Pull an OCI image, or update a tag to what it names now.
+    Pull(PullArgs),
     /// Boot one microVM; started by `run`, never by hand. Does not return.
     #[command(hide = true)]
     Launch(launcher::LaunchArgs),
+    /// Unpack an image's layers into a new root; started by `pull`, never by hand.
+    #[command(hide = true)]
+    UnpackLayers(UnpackLayersArgs),
+}
+
+#[derive(Debug, Args)]
+struct PullArgs {
+    /// The image, such as `node:22` or `ghcr.io/org/image@sha256:...`.
+    image: String,
+    /// Where images are kept.
+    #[arg(long, default_value = image::DEFAULT_CACHE)]
+    image_cache: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct UnpackLayersArgs {
+    #[arg(long)]
+    root: PathBuf,
+    /// A layer as `gzip:PATH` or `tar:PATH`, applied in the order given.
+    #[arg(long)]
+    layer: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -54,6 +78,16 @@ struct RunArgs {
     /// Host directory to mount at /workspace in the guest, writable.
     #[arg(long)]
     workspace: PathBuf,
+    /// OCI image to boot, such as `node:22`; pulled the first time [default: the guest image's
+    /// own root, a minimal Alpine].
+    #[arg(long)]
+    image: Option<String>,
+    /// Pull the image again even if it is already here, to update its tag.
+    #[arg(long)]
+    pull: bool,
+    /// Where images are kept.
+    #[arg(long, default_value = image::DEFAULT_CACHE)]
+    image_cache: PathBuf,
     /// Tar archive to unpack into the workspace inside the VM; the workspace must be empty.
     #[arg(long)]
     archive: Option<PathBuf>,
@@ -136,9 +170,16 @@ fn parse_env(s: &str) -> Result<(String, String), String> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Commands::Run(args) => run(args),
+        Commands::Run(args) => run(*args),
         Commands::Serve(args) => serve::serve(args).map(|()| 0),
         Commands::Launch(args) => launcher::launch(&args).map(|never| match never {}),
+        Commands::Pull(args) => image::Reference::parse(&args.image)
+            .and_then(|reference| image::pull(&args.image_cache, &reference))
+            .map(|digest| {
+                println!("{digest}");
+                0
+            }),
+        Commands::UnpackLayers(args) => unpack_layers(&args).map(|()| 0),
     };
     match result {
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
@@ -154,8 +195,30 @@ const EXIT_TIMED_OUT: i32 = 124;
 /// Exit code for a run whose command never ran, as shells use for a missing command.
 const EXIT_NOT_RUN: i32 = 127;
 
+fn unpack_layers(args: &UnpackLayersArgs) -> anyhow::Result<()> {
+    let layers = args
+        .layer
+        .iter()
+        .map(|layer| match layer.split_once(':') {
+            Some(("gzip", path)) => Ok((PathBuf::from(path), true)),
+            Some(("tar", path)) => Ok((PathBuf::from(path), false)),
+            _ => anyhow::bail!("--layer takes gzip:PATH or tar:PATH, not {layer}"),
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    image::unpack_layers(&args.root, &layers)
+}
+
 /// Runs one command, relaying its output, and returns the exit code to leave with.
 fn run(args: RunArgs) -> anyhow::Result<i32> {
+    let image = match &args.image {
+        Some(name) => Some(image::get(
+            &args.image_cache,
+            &image::Reference::parse(name)?,
+            args.pull,
+        )?),
+        None => None,
+    };
+    let (rootfs, image_env) = image.map_or((None, Vec::new()), |i| (Some(i.rootfs), i.env));
     let collect_changes = args.results_dir.is_some();
     let mut results = match &args.results_dir {
         Some(dir) => {
@@ -169,6 +232,7 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
     let spec = vm::VmSpec {
         workspace: args.workspace,
         own_workspace: false,
+        rootfs,
         stdin: if args.stdin {
             Some(File::from(io::stdin().as_fd().try_clone_to_owned()?))
         } else {
@@ -193,7 +257,7 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
         command: peerspan_runtime_protocol::Command {
             argv: args.command,
             cwd: args.cwd,
-            env: args.env,
+            env: image::merge_env(image_env, args.env),
             archive: false,
             collect_changes,
             network: false,
