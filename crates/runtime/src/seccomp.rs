@@ -7,8 +7,8 @@
 //! thread inherits it. Any other call kills the VMM, which the supervisor reports; the kernel
 //! log names the call. The list is what the VMM was seen to call across `scripts/check.sh`,
 //! the calls libkrun's read-only file server makes for the operations it serves, and calls the
-//! C and Rust runtimes make on rarer paths. Sockets are Unix sockets only, and threads cannot
-//! be cloned into new namespaces.
+//! C and Rust runtimes make on rarer paths. Sockets are Unix sockets only, threads cannot be
+//! cloned into new namespaces, and ioctl takes only the commands that build and run a VM.
 
 use std::collections::BTreeMap;
 
@@ -54,8 +54,7 @@ const ALLOWED: &[libc::c_long] = &[
     libc::SYS_getgid,
     libc::SYS_exit,
     libc::SYS_exit_group,
-    // Descriptors: KVM, eventfds, epoll, and the console log.
-    libc::SYS_ioctl,
+    // Descriptors: eventfds, epoll, and the console log.
     libc::SYS_eventfd2,
     libc::SYS_epoll_create1,
     libc::SYS_epoll_ctl,
@@ -99,6 +98,37 @@ const ALLOWED: &[libc::c_long] = &[
     libc::SYS_umask,
 ];
 
+/// ioctl commands the VMM may issue, on x86_64: KVM's, to build the VM and run its vCPUs, and
+/// the terminal check libkrun makes on its console. The VM's devices raise interrupts through
+/// eventfds and serve the guest's file ioctls themselves, so no others reach the kernel. Other
+/// architectures will need their own list.
+const IOCTLS: &[u32] = &[
+    0x5401,      // TCGETS
+    0xae00,      // KVM_GET_API_VERSION
+    0xae01,      // KVM_CREATE_VM
+    0xc004_ae02, // KVM_GET_MSR_INDEX_LIST
+    0xae03,      // KVM_CHECK_EXTENSION
+    0xae04,      // KVM_GET_VCPU_MMAP_SIZE
+    0xc008_ae05, // KVM_GET_SUPPORTED_CPUID
+    0xae41,      // KVM_CREATE_VCPU
+    0x4020_ae46, // KVM_SET_USER_MEMORY_REGION
+    0xae47,      // KVM_SET_TSS_ADDR
+    0xae60,      // KVM_CREATE_IRQCHIP
+    0xae71,      // KVM_REINJECT_CONTROL
+    0x4020_ae76, // KVM_IRQFD
+    0x4040_ae77, // KVM_CREATE_PIT2
+    0x4040_ae79, // KVM_IOEVENTFD
+    0xae80,      // KVM_RUN
+    0x4090_ae82, // KVM_SET_REGS
+    0x8138_ae83, // KVM_GET_SREGS
+    0x4138_ae84, // KVM_SET_SREGS
+    0x4008_ae89, // KVM_SET_MSRS
+    0x41a0_ae8d, // KVM_SET_FPU
+    0x8400_ae8e, // KVM_GET_LAPIC
+    0x4400_ae8f, // KVM_SET_LAPIC
+    0x4008_ae90, // KVM_SET_CPUID2
+];
+
 /// clone flags that create namespaces. `CLONE_NEWTIME` shares its bit with the exit signal in
 /// clone(2), so it cannot be checked there; it needs clone3 or unshare, which are refused.
 const CLONE_NAMESPACES: u64 = (libc::CLONE_NEWNS
@@ -124,6 +154,19 @@ fn programs() -> anyhow::Result<[BpfProgram; 2]> {
     };
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> =
         ALLOWED.iter().map(|&call| (call, Vec::new())).collect();
+    // The kernel takes the command as 32 bits, so only those are compared.
+    let ioctls = IOCTLS
+        .iter()
+        .map(|&cmd| {
+            SeccompRule::new(vec![SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                u64::from(cmd),
+            )?])
+        })
+        .collect::<Result<_, _>>()?;
+    rules.insert(libc::SYS_ioctl, ioctls);
     rules.insert(libc::SYS_socket, unix_only()?);
     rules.insert(libc::SYS_socketpair, unix_only()?);
     rules.insert(
@@ -225,6 +268,23 @@ mod tests {
         // SAFETY: execve with null arguments would fail; it only probes the filter.
         let exec = || unsafe { libc::execve(c"/bin/true".as_ptr(), [].as_ptr(), [].as_ptr()) };
         assert_eq!(filtered(exec), -libc::SIGSYS);
+    }
+
+    #[test]
+    fn ioctl_takes_only_listed_commands() {
+        let tcgets = || {
+            let mut termios = [0u8; 64];
+            // SAFETY: TCGETS writes at most a termios, under 64 bytes, to the buffer.
+            unsafe { libc::ioctl(0, libc::TCGETS, termios.as_mut_ptr()) };
+            0
+        };
+        assert_eq!(filtered(tcgets), 0);
+        let fionread = || {
+            let mut n: libc::c_int = 0;
+            // SAFETY: FIONREAD writes an int to the pointer.
+            unsafe { libc::ioctl(0, libc::FIONREAD, &raw mut n) }
+        };
+        assert_eq!(filtered(fionread), -libc::SIGSYS);
     }
 
     #[test]

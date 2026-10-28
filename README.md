@@ -123,8 +123,9 @@ is confined before libkrun sees any guest input:
 - a seccomp allow-list, installed before libkrun starts any thread: the calls the VMM was
   seen to make across `scripts/check.sh`, those libkrun's read-only file server makes, and
   those the C and Rust runtimes make on rarer paths, about 80 in all. Sockets are Unix sockets
-  only, `clone` cannot create namespaces, and `clone3`, whose flags seccomp cannot inspect,
-  fails so the C library falls back to `clone`. Any other call kills the VMM; the run fails
+  only, `ioctl` takes only the 23 KVM commands that build and run the VM and a terminal check,
+  `clone` cannot create namespaces, and `clone3`, whose flags seccomp cannot inspect, fails so
+  the C library falls back to `clone`. Any other call kills the VMM; the run fails
   saying so, and the kernel log names the call.
 
 Each run also gets its own cgroup v2, under `/sys/fs/cgroup/peerspan-runtime` by default
