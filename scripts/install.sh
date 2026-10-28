@@ -63,7 +63,10 @@ lib="$prefix/lib/peerspan-runtime"
 mkdir -p "$lib" "$prefix/bin"
 rm -rf "$lib/.$version.new"
 mkdir "$lib/.$version.new"
-tar -xzf "$from" -C "$lib/.$version.new" --strip-components=1
+tar -xzf "$from" -C "$lib/.$version.new" --strip-components=1 --no-same-owner
+# Root runs these files, so only root may change them, whatever the archive says.
+chown -R 0:0 "$lib/.$version.new"
+chmod -R go-w "$lib/.$version.new"
 rm -rf "$lib/$version"
 mv "$lib/.$version.new" "$lib/$version"
 ln -sfn "$version" "$lib/current"
