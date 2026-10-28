@@ -22,7 +22,7 @@ set -eu
 ALPINE_VERSION=3.22.7
 ALPINE_SHA256=57e364a241bab0699cd8a760c0fd7b270e9cbcbd3cee822cb2b07ca6d925c16c
 # Loaded in this order; a module missing from the kernel tree is assumed built in.
-MODULES="virtiofs vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport"
+MODULES="virtiofs overlay vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport"
 
 out=$1
 here=$(cd "$(dirname "$0")" && pwd)
