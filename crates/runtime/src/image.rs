@@ -10,7 +10,7 @@
 //! user, so everything in it is made readable by all, and the guest sees those modes.
 
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -56,6 +56,11 @@ impl Reference {
             if !is_digest(digest) {
                 bail!("{text}: a digest must be sha256: and 64 lowercase hex digits");
             }
+            // A tag beside the digest, as in `node:22@sha256:...`, is ignored, as Docker does.
+            let name = match name.rsplit_once(':') {
+                Some((untagged, tag)) if !tag.contains('/') => untagged,
+                _ => name,
+            };
             (name, digest.to_owned())
         } else {
             match text.rsplit_once(':') {
@@ -138,13 +143,14 @@ pub fn merge_env(
     base
 }
 
+/// The digest of the image `reference` names here: what a tag, or an index's digest, resolved
+/// to when it was pulled, or a manifest's digest itself.
 fn cached_digest(cache: &Path, reference: &Reference) -> Option<String> {
-    let digest = if is_digest(&reference.reference) {
-        reference.reference.clone()
-    } else {
-        fs::read_to_string(cache.join("tags").join(reference.key())).ok()?
+    let digest = match fs::read_to_string(cache.join("tags").join(reference.key())) {
+        Ok(digest) => digest.trim().to_owned(),
+        Err(_) if is_digest(&reference.reference) => reference.reference.clone(),
+        Err(_) => return None,
     };
-    let digest = digest.trim().to_owned();
     image_dir(cache, &digest).is_dir().then_some(digest)
 }
 
@@ -200,12 +206,11 @@ pub fn pull(cache: &Path, reference: &Reference) -> anyhow::Result<String> {
         let _ = fs::remove_dir_all(&staging);
         result.with_context(|| format!("pulling {reference}"))?;
     }
-    if !is_digest(&reference.reference) {
-        let tags = cache.join("tags");
-        let staging = tags.join(format!(".{}-{}", reference.key(), nanos()));
-        fs::write(&staging, &digest)?;
-        fs::rename(&staging, tags.join(reference.key()))?;
-    }
+    // Recorded for digests too: an index's digest resolves to a platform's manifest.
+    let tags = cache.join("tags");
+    let staging = tags.join(format!(".{}-{}", reference.key(), nanos()));
+    fs::write(&staging, &digest)?;
+    fs::rename(&staging, tags.join(reference.key()))?;
     Ok(digest)
 }
 
@@ -476,55 +481,63 @@ pub fn unpack_layers(root: &Path, layers: &[(PathBuf, bool)]) -> anyhow::Result<
     std::os::unix::fs::chroot(root).context("chroot into the new root")?;
     std::env::set_current_dir("/")?;
     for (file, gzip) in files {
-        let reader: Box<dyn Read> = if gzip {
-            Box::new(flate2::read::GzDecoder::new(io::BufReader::new(file)))
-        } else {
-            Box::new(io::BufReader::new(file))
+        let mut open = || -> io::Result<Box<dyn Read>> {
+            let mut file = file.try_clone()?;
+            file.rewind()?;
+            let file = io::BufReader::new(file);
+            Ok(if gzip {
+                Box::new(flate2::read::GzDecoder::new(file))
+            } else {
+                Box::new(file)
+            })
         };
-        apply_layer(Path::new("/"), reader).context("applying a layer")?;
+        apply_layer(Path::new("/"), &mut open).context("applying a layer")?;
     }
     make_readable(Path::new("/"))
 }
 
-/// Applies one layer to `root`, which is `/` once chrooted: its whiteouts remove what lower
-/// layers made.
-fn apply_layer(root: &Path, reader: impl Read) -> anyhow::Result<()> {
-    let mut archive = tar::Archive::new(reader);
+/// Applies one layer to `root`, which is `/` once chrooted. The layer is read twice, from
+/// `open`: first for its whiteouts, which remove what lower layers made wherever they come in
+/// the archive, then for its entries.
+fn apply_layer(
+    root: &Path,
+    open: &mut dyn FnMut() -> io::Result<Box<dyn Read>>,
+) -> anyhow::Result<()> {
+    let mut archive = tar::Archive::new(open()?);
+    for entry in archive.entries()? {
+        let entry = entry?;
+        let Some((path, whiteout)) = layer_path(root, &entry)? else {
+            continue;
+        };
+        match whiteout {
+            Some(Whiteout::Opaque) => {
+                let dir = path.parent().unwrap_or(root);
+                for child in fs::read_dir(dir).into_iter().flatten().flatten() {
+                    remove(&child.path());
+                }
+            }
+            Some(Whiteout::Removed(hidden)) => remove(&hidden),
+            None => {}
+        }
+    }
+
+    let mut archive = tar::Archive::new(open()?);
     archive.set_preserve_permissions(true);
     archive.set_preserve_ownerships(true);
     archive.set_preserve_mtime(true);
     archive.set_overwrite(true);
     archive.set_unpack_xattrs(false);
-    let mut written = std::collections::HashSet::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let Some(path) = clean_path(&entry.path()?) else {
+        let Some((path, None)) = layer_path(root, &entry)? else {
             continue;
         };
-        let path = root.join(path.strip_prefix("/").unwrap_or(&path));
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let parent = path.parent().unwrap_or(root).to_owned();
-        if name == ".wh..wh..opq" {
-            for child in fs::read_dir(&parent).into_iter().flatten().flatten() {
-                if !written.contains(&child.path()) {
-                    remove(&child.path());
-                }
-            }
-            continue;
-        }
-        if let Some(hidden) = name.strip_prefix(".wh.") {
-            remove(&parent.join(hidden));
-            continue;
-        }
         let kind = entry.header().entry_type();
         if !(kind.is_file() || kind.is_dir() || kind.is_symlink() || kind.is_hard_link()) {
             // Devices and FIFOs: the guest's /dev comes from devtmpfs.
             continue;
         }
-        fs::create_dir_all(&parent)?;
+        fs::create_dir_all(path.parent().unwrap_or(root))?;
         if let Ok(existing) = fs::symlink_metadata(&path)
             && !(kind.is_dir() && existing.is_dir())
         {
@@ -533,9 +546,39 @@ fn apply_layer(root: &Path, reader: impl Read) -> anyhow::Result<()> {
         entry
             .unpack(&path)
             .with_context(|| format!("unpacking {}", path.display()))?;
-        written.insert(path);
     }
     Ok(())
+}
+
+/// What a whiteout entry removes from lower layers.
+enum Whiteout {
+    /// Everything already in the entry's directory.
+    Opaque,
+    /// The path it names.
+    Removed(PathBuf),
+}
+
+/// An entry's path under `root`, and the whiteout it is, if any; None for a path that climbs
+/// out with `..`.
+fn layer_path<R: Read>(
+    root: &Path,
+    entry: &tar::Entry<'_, R>,
+) -> io::Result<Option<(PathBuf, Option<Whiteout>)>> {
+    let Some(path) = clean_path(&entry.path()?) else {
+        return Ok(None);
+    };
+    let path = root.join(path.strip_prefix("/").unwrap_or(&path));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let whiteout = if name == ".wh..wh..opq" {
+        Some(Whiteout::Opaque)
+    } else {
+        name.strip_prefix(".wh.")
+            .map(|hidden| Whiteout::Removed(path.parent().unwrap_or(root).join(hidden)))
+    };
+    Ok(Some((path, whiteout)))
 }
 
 /// The entry's path made absolute, or None if it climbs with `..`.
@@ -613,6 +656,13 @@ mod tests {
         let r = Reference::parse(&format!("user/app@{digest}")).unwrap();
         assert_eq!(r.to_string(), format!("docker.io/user/app@{digest}"));
         assert!(Reference::parse("app@sha256:short").is_err());
+        let r = Reference::parse(&format!("node:22@{digest}")).unwrap();
+        assert_eq!(r.to_string(), format!("docker.io/library/node@{digest}"));
+        let r = Reference::parse(&format!("localhost:5000/app:1@{digest}")).unwrap();
+        assert_eq!(
+            (r.registry.as_str(), r.repository.as_str()),
+            ("localhost:5000", "app")
+        );
     }
 
     fn layer(entries: &[(&str, Option<&str>)]) -> Vec<u8> {
@@ -643,6 +693,45 @@ mod tests {
         builder.into_inner().unwrap()
     }
 
+    fn apply(root: &Path, layer: &[u8]) {
+        let mut open =
+            || -> io::Result<Box<dyn Read>> { Ok(Box::new(io::Cursor::new(layer.to_vec()))) };
+        apply_layer(root, &mut open).unwrap();
+    }
+
+    fn names(root: &Path, dir: &str) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(root.join(dir))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn whiteouts_affect_only_lower_layers_wherever_they_come() {
+        let root = std::env::temp_dir().join(format!("peerspan-layers-{}", nanos()));
+        fs::create_dir(&root).unwrap();
+        apply(
+            &root,
+            &layer(&[("a/sub/old", Some("old")), ("b/keep/old", Some("old"))]),
+        );
+        apply(
+            &root,
+            &layer(&[
+                // Before the marker, and with no entry for its directory.
+                ("a/sub/new", Some("new")),
+                ("a/.wh..wh..opq", Some("")),
+                // A directory the layer lists itself still loses what was under it.
+                ("b/keep/", None),
+                ("b/.wh..wh..opq", Some("")),
+            ]),
+        );
+        assert_eq!(names(&root, "a/sub"), ["new"]);
+        assert!(names(&root, "b/keep").is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn whiteouts_remove_what_lower_layers_made() {
         let root = std::env::temp_dir().join(format!("peerspan-layers-{}", nanos()));
@@ -659,18 +748,10 @@ mod tests {
             ("b/new", Some("new")),
             (".wh.c", Some("")),
         ]);
-        apply_layer(&root, &lower[..]).unwrap();
-        apply_layer(&root, &upper[..]).unwrap();
-        let names = |dir: &str| {
-            let mut names: Vec<String> = fs::read_dir(root.join(dir))
-                .unwrap()
-                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                .collect();
-            names.sort();
-            names
-        };
-        assert_eq!(names("a"), ["y"]);
-        assert_eq!(names("b"), ["new"]);
+        apply(&root, &lower);
+        apply(&root, &upper);
+        assert_eq!(names(&root, "a"), ["y"]);
+        assert_eq!(names(&root, "b"), ["new"]);
         assert!(!root.join("c").exists());
         make_readable(&root).unwrap();
         let mode = fs::metadata(root.join("a/y")).unwrap().permissions().mode();
