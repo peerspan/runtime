@@ -38,6 +38,9 @@ check() {
 fail() { echo "FAIL $*"; failures=$((failures + 1)); }
 pass() { echo "ok   $1"; }
 
+# doctor finds everything these checks need.
+"$bin" doctor > "$work/out" 2>&1 && pass doctor || fail "doctor: $(grep FAIL "$work/out")"
+
 # The workspace belongs to a user other than root, as a project directory would, so the checks
 # run with the workspace server as that user. It must be able to reach the workspace.
 owner=4242:4343
