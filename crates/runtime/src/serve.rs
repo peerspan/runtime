@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::disk::WorkspaceDisk;
-use crate::net::{self, Level};
+use crate::net::Level;
 use crate::vm::{self, Event, Outcome, VmSpec};
 
 /// Largest request body accepted, as on the daemon's `admin.sock`.
@@ -44,9 +44,10 @@ pub struct ServeArgs {
     /// Unix socket to serve on; replaced if it exists.
     #[arg(long)]
     socket: PathBuf,
-    /// Guest image directory holding `vmlinux`, `initramfs.cpio.gz` and `rootfs/`.
+    /// Guest image directory holding `vmlinux`, `initramfs.cpio.gz` and `rootfs/` [default:
+    /// `guest/` beside this binary].
     #[arg(long, env = "PEERSPAN_RUNTIME_GUEST")]
-    guest: PathBuf,
+    guest: Option<PathBuf>,
     /// OCI image every run boots, such as `node:22`, pulled at startup if it is not here
     /// [default: the guest image's own root, a minimal Alpine].
     #[arg(long)]
@@ -54,9 +55,10 @@ pub struct ServeArgs {
     /// Where images are kept.
     #[arg(long, default_value = crate::image::DEFAULT_CACHE)]
     image_cache: PathBuf,
-    /// libkrun shared library to load.
-    #[arg(long, env = "PEERSPAN_LIBKRUN", default_value = "libkrun.so.2")]
-    libkrun: PathBuf,
+    /// libkrun shared library to load [default: `libkrun.so.2` beside this binary, or the
+    /// dynamic loader's].
+    #[arg(long, env = "PEERSPAN_LIBKRUN")]
+    libkrun: Option<PathBuf>,
     /// virtiofsd binary that serves workspaces.
     #[arg(
         long,
@@ -140,6 +142,8 @@ enum Results {
 
 struct Runtime {
     args: ServeArgs,
+    guest: PathBuf,
+    libkrun: PathBuf,
     /// The image every run boots, resolved at startup.
     image: Option<crate::image::Image>,
     runs: Mutex<HashMap<String, Arc<Run>>>,
@@ -213,8 +217,15 @@ pub fn serve(args: ServeArgs) -> anyhow::Result<()> {
         )?),
         None => None,
     };
+    let guest = match &args.guest {
+        Some(guest) => guest.clone(),
+        None => crate::bundle::guest()?,
+    };
+    let libkrun = args.libkrun.clone().unwrap_or_else(crate::bundle::libkrun);
     let runtime = Arc::new(Runtime {
         args,
+        guest,
+        libkrun,
         image,
         runs: Mutex::new(HashMap::new()),
     });
@@ -269,7 +280,7 @@ fn runtime_info(runtime: &Runtime) -> Value {
     let args = &runtime.args;
     json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "image": args.guest.display().to_string(),
+        "image": runtime.guest.display().to_string(),
         "max_cpus": args.max_cpus,
         "max_memory_mib": args.max_memory_mib,
         "max_seconds": args.max_seconds,
@@ -394,14 +405,14 @@ fn execute(runtime: &Runtime, run: &Run) {
                 stdin: None,
                 rootfs: runtime.image.as_ref().map(|i| i.rootfs.clone()),
                 archive: request.workspace_archive.clone(),
-                guest: runtime.args.guest.clone(),
-                libkrun: runtime.args.libkrun.clone(),
+                guest: runtime.guest.clone(),
+                libkrun: runtime.libkrun.clone(),
                 virtiofsd: runtime.args.virtiofsd.clone(),
                 passt: runtime
                     .args
                     .passt
                     .clone()
-                    .unwrap_or_else(net::bundled_passt),
+                    .unwrap_or_else(crate::bundle::passt),
                 network: request.network,
                 cpus: request.resources.cpus,
                 memory_mib: request.resources.memory_mib,

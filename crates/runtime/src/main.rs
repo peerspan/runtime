@@ -3,9 +3,11 @@
 
 //! `peerspan-runtime`: runs agent work in microVMs.
 
+mod bundle;
 mod caplog;
 mod cgroup;
 mod disk;
+mod doctor;
 mod image;
 mod jail;
 mod krun;
@@ -47,6 +49,8 @@ enum Commands {
     Serve(serve::ServeArgs),
     /// Pull an OCI image, or update a tag to what it names now.
     Pull(PullArgs),
+    /// Check that this host can run VMs, and say what to fix if it cannot.
+    Doctor(doctor::DoctorArgs),
     /// Boot one microVM; started by `run`, never by hand. Does not return.
     #[command(hide = true)]
     Launch(launcher::LaunchArgs),
@@ -106,12 +110,14 @@ struct RunArgs {
     /// cgroup v2 directory to create the run's cgroup in.
     #[arg(long, default_value = cgroup::DEFAULT_ROOT)]
     cgroup_root: PathBuf,
-    /// Guest image directory holding `vmlinux`, `initramfs.cpio.gz` and `rootfs/`.
+    /// Guest image directory holding `vmlinux`, `initramfs.cpio.gz` and `rootfs/` [default:
+    /// `guest/` beside this binary].
     #[arg(long, env = "PEERSPAN_RUNTIME_GUEST")]
-    guest: PathBuf,
-    /// libkrun shared library to load.
-    #[arg(long, env = "PEERSPAN_LIBKRUN", default_value = "libkrun.so.2")]
-    libkrun: PathBuf,
+    guest: Option<PathBuf>,
+    /// libkrun shared library to load [default: `libkrun.so.2` beside this binary, or the
+    /// dynamic loader's].
+    #[arg(long, env = "PEERSPAN_LIBKRUN")]
+    libkrun: Option<PathBuf>,
     /// virtiofsd binary that serves the workspace.
     #[arg(
         long,
@@ -180,6 +186,7 @@ fn main() -> ExitCode {
                 0
             }),
         Commands::UnpackLayers(args) => unpack_layers(&args).map(|()| 0),
+        Commands::Doctor(args) => Ok(if doctor::doctor(&args) { 0 } else { 1 }),
     };
     match result {
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
@@ -239,10 +246,13 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
             None
         },
         archive: args.archive,
-        guest: args.guest,
-        libkrun: args.libkrun,
+        guest: match args.guest {
+            Some(guest) => guest,
+            None => crate::bundle::guest()?,
+        },
+        libkrun: args.libkrun.unwrap_or_else(crate::bundle::libkrun),
         virtiofsd: args.virtiofsd,
-        passt: args.passt.unwrap_or_else(net::bundled_passt),
+        passt: args.passt.unwrap_or_else(crate::bundle::passt),
         network: args.network,
         cpus: args.cpus,
         memory_mib: args.memory_mib,
