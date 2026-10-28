@@ -2,194 +2,161 @@
 
 Peerspan's runtime: lightweight VMs for agent collaboration.
 
-The runtime runs agent work in microVMs on machines you own, and on machines your peers let
-you use. It is a separate process beside the Peerspan host daemon and peerfs, Peerspan's
-filesystem for agents: the daemon accepts a task and checks access, peerfs provides the
-workspace, and the runtime boots a microVM with that workspace attached and runs the work
-inside it. Every runtime the host launches is a microVM, including your own work on your own
-machines.
+The runtime runs agent work in microVMs, on your own machines and on machines your peers let
+you use. It sits beside the Peerspan host daemon and peerfs: the daemon accepts a task and
+checks access, peerfs provides the workspace, and the runtime boots a microVM with that
+workspace and runs the work inside it.
 
 The VMM is [libkrun](https://github.com/containers/libkrun), through a thin fork at
-[peerspan/libkrun](https://github.com/peerspan/libkrun), on Linux (KVM) and macOS (Apple
-Silicon).
+[peerspan/libkrun](https://github.com/peerspan/libkrun).
 
 ## Status
 
-Early development. Nothing here is usable yet. The first goal is one person running a
-delegated task's commands, such as a test suite, in a microVM on another of their own
-machines, with the results coming back to the agent that asked.
+Early development; not usable yet. The first goal is running a delegated task's commands, such
+as a test suite, in a microVM on another of your own machines.
 
-## Trying it
+Today: Linux x86_64 with KVM, run as root. macOS (Apple Silicon) is planned.
 
-Linux x86_64 with `/dev/kvm` only, for now, run as root (see Confinement). You need a kernel
-build toolchain (`flex`, `bison`, `bc`, `libelf-dev`) for the guest kernel, libkrun built from
-the `peerspan`
-branch of [peerspan/libkrun](https://github.com/peerspan/libkrun) with
-`make VHOST_USER=1 NET=1`, `virtiofsd`, `nft` (nftables), and the
-`x86_64-unknown-linux-musl` Rust target.
+## Quick start
+
+Requirements: `/dev/kvm`, a kernel build toolchain (`flex`, `bison`, `bc`, `libelf-dev`), the
+`x86_64-unknown-linux-musl` Rust target, `virtiofsd`, `nft`, `mkfs.ext4`, and libkrun built from
+the `peerspan` branch of [peerspan/libkrun](https://github.com/peerspan/libkrun) with
+`make VHOST_USER=1 NET=1`.
 
 ```sh
-scripts/build-guest.sh target/guest
+scripts/build-guest.sh target/guest           # guest kernel, init and root filesystem
+scripts/build-passt.sh target/release         # pinned passt, beside the binary
 export PEERSPAN_RUNTIME_GUEST=$PWD/target/guest
-scripts/build-passt.sh target/release
 export PEERSPAN_LIBKRUN=/path/to/libkrun/target/release/libkrun.so.2.0.0
 cargo run --release -p peerspan-runtime -- run --workspace ~/src/project -- make test
-scripts/check.sh   # end-to-end checks
+scripts/check.sh                              # end-to-end checks, as root
 ```
 
-`run` mounts the workspace at `/workspace` in a fresh microVM, with a read-only Alpine root
-filesystem, runs the command there, streams its output, and exits with its code (124 on
-`--timeout-seconds`, 127 if it never ran). `--archive FILE` unpacks a tar or tar.gz into an
-empty workspace inside the VM, refusing absolute paths, `..` and anything but directories,
-files and symbolic links; `--results-dir DIR` receives `changes.tar` and `deleted.txt`, what
-the command changed. Until peerfs serves workspaces, `virtiofsd` stands in for it.
-`--network` sets what the guest may reach (see Network). The command's standard input is empty
-unless `--stdin` passes the runtime's own to it, streamed as it arrives and closed at its end.
-Its standard output and error stream back separately, which cannot keep the order of writes
-between the two; `--combined-output` sends both to standard output, as `2>&1` does, in the order
-they were written. `serve` has neither yet: the runtime task contract has no standard input and
-keeps the streams apart.
+## `run`
+
+Runs one command in a fresh microVM with the workspace at `/workspace` and a read-only Alpine
+root, streams its output, and exits with its code.
+
+| Option | Effect |
+| --- | --- |
+| `--workspace DIR` | The directory to mount at `/workspace` |
+| `--archive FILE` | Unpack a tar or tar.gz into an empty workspace first |
+| `--results-dir DIR` | Write `changes.tar` and `deleted.txt`: what the command changed |
+| `--network LEVEL` | `none`, `internet` (default) or `internet+lan`; see Network |
+| `--stdin` | Pass this program's standard input to the command (otherwise empty) |
+| `--combined-output` | Send stderr to stdout, like `2>&1`, keeping the order of writes |
+| `--timeout-seconds N` | Stop the command after N seconds |
+| `--cpus`, `--memory-mib` | VM size (default 2 vCPUs, 1024 MiB) |
+| `--io-mibps`, `--io-iops` | Disk I/O caps (default 256 MiB/s, 10,000 IOPS) |
+| `--cwd`, `--env NAME=VALUE` | Working directory and environment |
+
+Exit codes: the command's own, 128 + N if a signal ended it, 124 on timeout, 127 if it never
+ran. Archives may hold only directories, files and symbolic links, with no absolute paths or
+`..`.
+
+## `serve`
 
 `serve --socket PATH` is the local API the Peerspan host daemon drives: start a run, follow its
-events with a long poll, cancel it, collect its result files and delete it. The runtime task
-contract in the Peerspan host repository specifies it; `scripts/check-serve.py` exercises it.
+events, cancel it, collect its result files, delete it. The runtime task contract in the
+Peerspan host repository specifies it; `scripts/check-serve.py` exercises it.
+
+Host-wide limits are flags: `--max-cpus`, `--max-memory-mib`, `--max-seconds`,
+`--max-network`, `--max-concurrent-runs`, `--io-mibps`, `--io-iops` and `--workspace-mib`.
+Runs keep their state under `--state` (default `/var/lib/peerspan-runtime`), which must be
+searchable by other users. `--stdin` and `--combined-output` are not available here yet, since
+the contract has neither.
 
 ## Network
 
-Each run has a network level:
-
 | Level | The guest reaches |
 | --- | --- |
-| `none` | Nothing: no network device, only loopback |
-| `internet` (the default for `run`) | Public addresses only |
+| `none` | Nothing; loopback only |
+| `internet` | Public addresses |
 | `internet+lan` | Public addresses and private ranges |
 
-At every level the guest is refused the host's own addresses, loopback, link-local addresses
-(including the cloud metadata service at 169.254.169.254) and multicast; `internet` also
-refuses private ranges (RFC 1918, shared address space, unique local IPv6). Refusals fail at
-once rather than time out. `serve` caps what a run may ask for with `--max-network` (default
-`internet`); a request without `network` gets `none`.
+- Always refused: the host's own addresses, loopback, link-local (including the cloud metadata
+  service at 169.254.169.254) and multicast. Refusals fail at once rather than time out.
+- DNS goes through the host's resolvers.
+- IPv4 and IPv6, with fixed guest addresses (10.0.2.15/24; fd50:5053::15/64), so boot needs no
+  DHCP.
+- `serve` defaults to `none` and caps requests at `--max-network` (default `internet`).
 
-A guest with a network gets a virtio-net device whose other end is a
-[passt](https://passt.top) process of its own, joined by a socket pair, so the VMM itself keeps
-its empty network namespace. passt carries the guest's traffic as ordinary host sockets, so
-the limits are enforced by the kernel: passt runs in the run's cgroup, and the runtime's
-nftables table (`inet peerspan_runtime`) sends traffic from each run's cgroup to a chain for
-its level, and rejects traffic from any other process in the runtime's cgroups, so a missing
-rule fails closed. DNS goes to passt, which forwards it to the host's resolvers, the one local
-address a guest may reach, on port 53 only. The guest's addresses are fixed (10.0.2.15/24,
-gateway 10.0.2.2, DNS 10.0.2.3; fd50:5053::15/64, gateway fe80::1), so booting needs no DHCP
-or router advertisements. The IPv6 address is unique local, so programs prefer IPv4 for names
-that have both, and reach IPv6-only ones through the host when it has IPv6; on a host without,
-they fail at once. The same limits apply in IPv6, including to IPv4 addresses behind the NAT64
-prefixes.
-
-The runtime ships with its own passt rather than the host's: `scripts/build-passt.sh` builds a
-pinned release, checked against its commit and linked statically, and the runtime looks for it
-beside its own binary (`--passt` or `PEERSPAN_PASST` to use another). passt is
-GPL-2.0-or-later; its source is the pinned commit at [passt.top](https://passt.top/passt).
-
-## Guest kernel
-
-`scripts/build-kernel.sh` builds the guest kernel: a pinned kernel.org longterm release,
-checked against its published SHA-256, configured by `guest/kernel.config` on top of
-`allnoconfig`, with everything the guest needs built in (virtio-mmio, the virtio console,
-virtio-fs, vsock, virtio-net, IPv4 and IPv6, and what programs expect of a kernel) and nothing else. It is cached by
-version and config. `build-guest.sh` uses it by default and copies the resolved config into
-the image beside `vmlinux`; `GUEST_ROOT=/` uses a distribution kernel and its modules instead.
-The kernel is GPL-2.0: its source is the pinned release and its configuration is
-`guest/kernel.config`.
-
-## Measuring
-
-`scripts/bench.py` boots a VM repeatedly (20 times by default, running `true`) and reports
-p50, p90 and the maximum of:
-
-- `connect_ms`: from starting the VM's process until the guest connects (VMM setup, kernel
-  boot and init);
-- `start_ms`: until the command starts;
-- `total_ms`: the whole run, through teardown;
-- `memory_peak_mib`: the most host memory the run's processes used, from its cgroup.
-
-`--record` appends the result to `bench/history.jsonl`, with the commit, the kernel and the
-settings, so each change can be compared with the last. `run --metrics FILE` writes one run's
-measurements.
+Each guest's traffic goes through its own [passt](https://passt.top) process and leaves as
+ordinary host sockets. An nftables table (`inet peerspan_runtime`) filters it by the run's
+cgroup and fails closed.
 
 ## Confinement
 
-libkrun's devices act with the authority of the process that runs them, so each VM's process
-is confined before libkrun sees any guest input:
+Setup needs root, as Firecracker's jailer does. Each VM's process is confined before libkrun
+sees any guest input:
 
-- new mount, PID, network, IPC and UTS namespaces, so it has no network and sees only itself;
-- a `pivot_root` into a root holding only the guest's read-only root filesystem, kernel and
-  initramfs, the run's two sockets, `/dev/kvm`, and its own `/proc`;
-- its own user and group, a fresh ID per run with only the `kvm` group, no capabilities,
-  `no_new_privs`, and not dumpable;
-- a seccomp allow-list, installed before libkrun starts any thread: the calls the VMM was
-  seen to make across `scripts/check.sh`, those libkrun's read-only file server makes, and
-  those the C and Rust runtimes make on rarer paths, about 80 in all. Sockets are Unix sockets
-  only, `ioctl` takes only the 23 KVM commands that build and run the VM and a terminal check,
-  `clone` cannot create namespaces, and `clone3`, whose flags seccomp cannot inspect, fails so
-  the C library falls back to `clone`. Any other call kills the VMM; the run fails
-  saying so, and the kernel log names the call.
+- **Namespaces:** new mount, PID, network, IPC and UTS namespaces.
+- **Filesystem:** a `pivot_root` into a root holding only the guest image, the run's sockets,
+  `/dev/kvm` and its own `/proc`.
+- **Identity:** a fresh user per run, in the `kvm` group only, with no capabilities, under
+  `no_new_privs`.
+- **seccomp:** an allow-list of about 80 system calls. Sockets must be Unix sockets, `ioctl`
+  takes only the KVM commands a VM needs, and `clone` cannot create namespaces. Any other call
+  kills the VMM, and the run says so.
 
-Each run also gets its own cgroup v2, under `/sys/fs/cgroup/peerspan-runtime` by default
-(`--cgroup-root`), which the VMM, the workspace server and passt join before they run any code
-of their own. It caps their memory at the guest's plus 256 MiB with no swap, their CPU time at the
-run's vCPUs, their processes and threads at 512, and their disk I/O on the disks holding the
-workspace and the guest image at 256 MiB/s and 10,000 operations a second, each for reading and
-for writing (`--io-mibps` and `--io-iops`, on `run` and, for every run, on `serve`). A run that
-exceeds its memory is killed and reports so. Disk I/O is capped only where a block device holds
-the files: not on tmpfs, overlayfs or btrfs, whose files report device numbers of their own. Stopping a run, by cancellation or timeout, kills the whole cgroup, which is
-removed afterwards.
+The workspace server (`virtiofsd`, until peerfs replaces it) runs as the workspace's owner, in
+a user namespace where that user is root:
+- The guest's root owns the owner's files.
+- New files belong to the owner on the host.
+- Other users' files show as `nobody`.
 
-A supervisor killed outright cannot tear its run down. Every process of a run dies with it,
-and a supervisor holds a lock on its run's cgroup for as long as the run lasts, so the next
-run on the host finds runs whose lock is free and removes their cgroups, network filters and
-run directories.
+`serve` gives each workspace it creates to the run's own user.
 
-The workspace server runs in a user namespace of its own in which root is the workspace's
-owner on the host, and no other user exists. There it builds `virtiofsd`'s namespace sandbox
-and seccomp filter as usual, so its file access stays inside the workspace, but it holds no
-privilege on the host and acts only as that user. In the guest, root owns the owner's files,
-and files the guest creates belong to the owner on the host. Files of other users show as
-`nobody` and are writable only as their permissions allow anyone, and the guest cannot give
-files to other users. `run` serves a project directory as its owner, who must be able to reach
-it; `serve` gives each workspace it creates to the run's own user, so its `--state` directory
-must be searchable by other users.
+### Limits
 
-The files a run grows on the host are kept to a size: the guest console to 16 MiB and the
-workspace server's and passt's logs to 1 MiB each, each cut with a note, and under `serve` each
-output log to the 100 MiB artifact limit, with changes larger than that left out, both files
-together, as the daemon would drop them.
+Each run gets a cgroup (under `/sys/fs/cgroup/peerspan-runtime` by default) holding the VMM, the
+workspace server and passt.
 
-Under `serve`, each run's workspace is an ext4 file system of its own, 10 GiB by default
-(`--workspace-mib`), in a sparse image file beside it that takes only what the run writes, so a
-run can take no more of the host's disk than that and the guest sees "no space left" at the
-limit. The image is unmounted and removed when the run ends, and `serve` detaches any that an
-earlier `serve` left mounted when it starts. This needs `mkfs.ext4` and loop devices. `run`
-leaves the workspace's size to the disk holding it, since it is a directory of your own.
+| Resource | Limit |
+| --- | --- |
+| Memory | The guest's plus 256 MiB, no swap; exceeding it kills the run |
+| CPU | The run's vCPUs |
+| Processes and threads | 512 |
+| Disk I/O | 256 MiB/s and 10,000 IOPS each way, on the disks behind the workspace and guest image (not tmpfs, overlayfs or btrfs) |
+| Workspace size (`serve`) | 10 GiB, an ext4 image per run |
+| Guest console log | 16 MiB |
+| Server logs | 1 MiB each |
+| Output and changes (`serve`) | 100 MiB each; larger changes are left out |
 
-Setting all this up needs root, as Firecracker's jailer does.
-`scripts/check.sh` inspects a running VM from the host to check the confinement above.
+Stopping a run kills its whole cgroup. If a supervisor dies, the next run on the host removes
+its leftovers: processes, cgroup, network rules and run directory. `serve` also unmounts
+leftover workspace images when it starts.
+
+## Guest
+
+- **Kernel:** `scripts/build-kernel.sh` builds a pinned kernel.org longterm release, verified
+  against its SHA-256, from `allnoconfig` plus `guest/kernel.config`. It is GPL-2.0.
+- **passt:** `scripts/build-passt.sh` builds a pinned release, verified against its commit.
+  It is GPL-2.0-or-later, with source at [passt.top](https://passt.top/passt).
+- **Root filesystem:** read-only Alpine.
+- **init:** `guest-init`, a static binary.
+
+## Measuring
+
+`scripts/bench.py` boots VMs repeatedly and reports p50, p90 and maximum boot time (`connect_ms`,
+`start_ms`, `total_ms`) and peak host memory. `--record` appends the result to
+`bench/history.jsonl`. `run --metrics FILE` writes one run's measurements.
 
 ## Layout
 
-- `crates/runtime`: the `peerspan-runtime` binary. `vm.rs` runs one VM; `run` and `serve` are
-  its two front ends; `launch` is the per-VM child that confines itself and boots libkrun,
-  which takes over its process.
-- `crates/guest-init`: PID 1 in the guest, a static binary that mounts the filesystems,
-  unpacks the workspace archive, runs the command, streams its output back over vsock, and
-  reports what it changed.
-- `crates/protocol`: the framing the two speak.
-- `scripts/`: the guest image build and end-to-end checks.
+| Path | What it holds |
+| --- | --- |
+| `crates/runtime` | The `peerspan-runtime` binary. `vm.rs` runs one VM; `run` and `serve` are its front ends; `launch` confines itself and boots libkrun |
+| `crates/guest-init` | The guest's PID 1: mounts, unpacks the workspace, runs the command, streams output over vsock |
+| `crates/protocol` | The framing host and guest speak |
+| `scripts/` | Guest image builds, benchmarks and end-to-end checks |
 
 ## Contributing
 
-We welcome bug reports, feature requests and design feedback as
-[issues](https://github.com/peerspan/runtime/issues/new/choose). We do not accept code
-contributions from outside Peerspan, and pull requests from outside are closed. See
-[CONTRIBUTING.md](CONTRIBUTING.md).
+Bug reports, feature requests and design feedback are welcome as
+[issues](https://github.com/peerspan/runtime/issues/new/choose). We do not accept outside code
+contributions; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
