@@ -51,6 +51,10 @@ enum Commands {
     Pull(PullArgs),
     /// Check that this host can run VMs, and say what to fix if it cannot.
     Doctor(doctor::DoctorArgs),
+    /// List the images pulled here.
+    Images(ImagesArgs),
+    /// Remove images no tag names, or, with --unused-days, those no run has booted lately.
+    Prune(PruneArgs),
     /// Boot one microVM; started by `run`, never by hand. Does not return.
     #[command(hide = true)]
     Launch(launcher::LaunchArgs),
@@ -63,6 +67,23 @@ enum Commands {
 struct PullArgs {
     /// The image, such as `node:22` or `ghcr.io/org/image@sha256:...`.
     image: String,
+    /// Where images are kept.
+    #[arg(long, default_value = image::DEFAULT_CACHE)]
+    image_cache: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct ImagesArgs {
+    /// Where images are kept.
+    #[arg(long, default_value = image::DEFAULT_CACHE)]
+    image_cache: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct PruneArgs {
+    /// Also remove images no run has booted for this many days, and their tags.
+    #[arg(long)]
+    unused_days: Option<u64>,
     /// Where images are kept.
     #[arg(long, default_value = image::DEFAULT_CACHE)]
     image_cache: PathBuf,
@@ -187,6 +208,8 @@ fn main() -> ExitCode {
             }),
         Commands::UnpackLayers(args) => unpack_layers(&args).map(|()| 0),
         Commands::Doctor(args) => Ok(if doctor::doctor(&args) { 0 } else { 1 }),
+        Commands::Images(args) => images(&args).map(|()| 0),
+        Commands::Prune(args) => prune(&args).map(|()| 0),
     };
     match result {
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
@@ -201,6 +224,39 @@ fn main() -> ExitCode {
 const EXIT_TIMED_OUT: i32 = 124;
 /// Exit code for a run whose command never ran, as shells use for a missing command.
 const EXIT_NOT_RUN: i32 = 127;
+
+fn images(args: &ImagesArgs) -> anyhow::Result<()> {
+    let now = std::time::SystemTime::now();
+    for cached in image::list(&args.image_cache)? {
+        let days = now
+            .duration_since(cached.last_used)
+            .map_or(0, |d| d.as_secs() / 86_400);
+        let tags = if cached.tags.is_empty() {
+            "(untagged)".to_owned()
+        } else {
+            cached.tags.join(", ")
+        };
+        println!(
+            "{}  {:>6} MiB  used {days}d ago  {tags}",
+            cached.digest,
+            cached.bytes >> 20
+        );
+    }
+    Ok(())
+}
+
+fn prune(args: &PruneArgs) -> anyhow::Result<()> {
+    let unused_for = args
+        .unused_days
+        .map(|days| Duration::from_secs(days.saturating_mul(86_400)));
+    let removed = image::prune(&args.image_cache, unused_for)?;
+    let bytes: u64 = removed.iter().map(|i| i.bytes).sum();
+    for image in &removed {
+        println!("removed {}", image.digest);
+    }
+    println!("freed {} MiB", bytes >> 20);
+    Ok(())
+}
 
 fn unpack_layers(args: &UnpackLayersArgs) -> anyhow::Result<()> {
     let layers = args
@@ -225,7 +281,10 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
         )?),
         None => None,
     };
-    let (rootfs, image_env) = image.map_or((None, Vec::new()), |i| (Some(i.rootfs), i.env));
+    // The image stays held, and so kept from `prune`, until the run ends.
+    let (rootfs, image_env) = image.as_ref().map_or((None, Vec::new()), |i| {
+        (Some(i.rootfs.clone()), i.env.clone())
+    });
     let collect_changes = args.results_dir.is_some();
     let mut results = match &args.results_dir {
         Some(dir) => {
