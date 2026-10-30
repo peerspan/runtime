@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, bail};
+use rustix::mount::UnmountFlags;
 
 /// Default size of each workspace.
 pub const DEFAULT_SIZE_MIB: u32 = 10 * 1024;
@@ -71,8 +72,8 @@ impl Drop for WorkspaceDisk {
         // The run's processes are gone, so the file system is idle; detaching covers the rare
         // straggler, and the loop device is freed once the last user lets go.
         if self.mounted
-            && !unmount(&self.mountpoint, 0)
-            && !unmount(&self.mountpoint, libc::MNT_DETACH)
+            && !unmount(&self.mountpoint, UnmountFlags::empty())
+            && !unmount(&self.mountpoint, UnmountFlags::DETACH)
         {
             crate::log::warn(
                 "could not unmount a workspace",
@@ -101,7 +102,7 @@ pub fn remove_stale(runs: &Path) {
                 && point.parent().and_then(Path::parent) == Some(&runs)
         })
     {
-        if unmount(&mountpoint, libc::MNT_DETACH) {
+        if unmount(&mountpoint, UnmountFlags::DETACH) {
             crate::log::info(
                 "detached a workspace left by an earlier serve",
                 &[("workspace", &mountpoint.display())],
@@ -116,12 +117,8 @@ pub fn remove_stale(runs: &Path) {
     }
 }
 
-fn unmount(path: &Path, flags: libc::c_int) -> bool {
-    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: the path is a valid NUL-terminated string.
-    unsafe { libc::umount2(path.as_ptr(), flags) == 0 }
+fn unmount(path: &Path, flags: UnmountFlags) -> bool {
+    rustix::mount::unmount(path, flags).is_ok()
 }
 
 /// Undoes mountinfo's octal escapes of space, tab, newline and backslash.

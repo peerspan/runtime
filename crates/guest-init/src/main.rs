@@ -20,7 +20,7 @@
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, PipeReader, Read, Write};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::fs as unix_fs;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -32,6 +32,9 @@ use std::time::Duration;
 use peerspan_runtime_protocol::{
     AGENT_PORT, Command, Message, ROOTFS_TAG, WORKSPACE_PATH, WORKSPACE_TAG,
 };
+use rustix::fs::{Mode, OFlags};
+use rustix::mount::MountFlags;
+use rustix::net::{AddressFamily, SocketFlags, SocketType};
 
 /// Modules to load, one file name per line, in dependency order.
 const MODULE_ORDER: &str = "/lib/modules/order";
@@ -55,8 +58,7 @@ const CONSOLE_WAIT: Duration = Duration::from_secs(5);
 
 #[cfg_attr(not(test), unsafe(no_mangle))]
 extern "C" fn main(_argc: libc::c_int, _argv: *const *const libc::c_char) -> libc::c_int {
-    // SAFETY: getpid takes no arguments and cannot fail.
-    if unsafe { libc::getpid() } != 1 {
+    if !rustix::process::getpid().is_init() {
         eprintln!("peerspan-guest-init: not PID 1; it runs only as a VM's init");
         return 1;
     }
@@ -72,45 +74,36 @@ extern "C" fn main(_argc: libc::c_int, _argv: *const *const libc::c_char) -> lib
         Ok(Err(e)) => eprintln!("peerspan-guest-init: {e}"),
         Err(_) => eprintln!("peerspan-guest-init: panicked"),
     }
-    // SAFETY: sync takes no arguments and cannot fail.
-    unsafe { libc::sync() };
+    rustix::fs::sync();
     // PID 1 must not exit, or the kernel panics; rebooting ends the VM instead.
-    // SAFETY: reboot with a valid command constant; we are PID 1 in the VM, checked above.
-    unsafe { libc::reboot(libc::RB_AUTOBOOT) };
+    let _ = rustix::system::reboot(rustix::system::RebootCommand::Restart);
     0
 }
 
 /// Mounts `/dev` and points descriptors 0 to 2 at the console, or at `/dev/null` if the
 /// console does not appear in time.
 fn attach_console() {
-    let _ = mount("devtmpfs", "/dev", "devtmpfs", 0);
+    let _ = mount("devtmpfs", "/dev", "devtmpfs", MountFlags::empty());
     let deadline = std::time::Instant::now() + CONSOLE_WAIT;
-    let fd = loop {
-        // SAFETY: the path is a valid NUL-terminated string.
-        let fd = unsafe { libc::open(c"/dev/console".as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
-        if fd >= 0 || std::time::Instant::now() >= deadline {
-            break fd;
+    let flags = OFlags::RDWR | OFlags::NOCTTY;
+    let console = loop {
+        match rustix::fs::open("/dev/console", flags, Mode::empty()) {
+            Ok(fd) => break Some(fd),
+            Err(_) if std::time::Instant::now() >= deadline => break None,
+            Err(_) => thread::sleep(Duration::from_millis(5)),
         }
-        thread::sleep(Duration::from_millis(5));
     };
-    let fd = if fd >= 0 {
-        fd
-    } else {
-        // SAFETY: as above.
-        unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) }
-    };
-    if fd < 0 {
+    let Some(fd) =
+        console.or_else(|| rustix::fs::open("/dev/null", OFlags::RDWR, Mode::empty()).ok())
+    else {
         return;
-    }
-    for target in 0..=2 {
-        if fd != target {
-            // SAFETY: dup2 on descriptors this process owns.
-            unsafe { libc::dup2(fd, target) };
-        }
-    }
-    if fd > 2 {
-        // SAFETY: fd is ours and no longer needed.
-        unsafe { libc::close(fd) };
+    };
+    let _ = rustix::stdio::dup2_stdin(&fd);
+    let _ = rustix::stdio::dup2_stdout(&fd);
+    let _ = rustix::stdio::dup2_stderr(&fd);
+    // With no descriptors open at boot, the console may itself be 0, 1 or 2, which must stay.
+    if fd.as_raw_fd() <= 2 {
+        let _ = fd.into_raw_fd();
     }
 }
 
@@ -120,12 +113,7 @@ struct Phases(Vec<(String, u64)>);
 
 impl Phases {
     fn mark(&mut self, name: &str) {
-        let mut now = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: now is a valid out-pointer.
-        unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &raw mut now) };
+        let now = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
         let micros = u64::try_from(now.tv_sec).unwrap_or(0) * 1_000_000
             + u64::try_from(now.tv_nsec).unwrap_or(0) / 1_000;
         self.0.push((name.to_owned(), micros));
@@ -133,8 +121,8 @@ impl Phases {
 }
 
 fn run(mut phases: Phases) -> io::Result<()> {
-    mount("proc", "/proc", "proc", 0)?;
-    mount("sysfs", "/sys", "sysfs", 0)?;
+    mount("proc", "/proc", "proc", MountFlags::empty())?;
+    mount("sysfs", "/sys", "sysfs", MountFlags::empty())?;
     load_modules()?;
     phases.mark("modules");
 
@@ -143,13 +131,38 @@ fn run(mut phases: Phases) -> io::Result<()> {
         WORKSPACE_TAG,
         &format!("{NEW_ROOT}{WORKSPACE_PATH}"),
         "virtiofs",
-        0,
+        MountFlags::empty(),
     )?;
-    mount("proc", &format!("{NEW_ROOT}/proc"), "proc", 0)?;
-    mount("sysfs", &format!("{NEW_ROOT}/sys"), "sysfs", 0)?;
-    mount("devtmpfs", &format!("{NEW_ROOT}/dev"), "devtmpfs", 0)?;
-    mount("tmpfs", &format!("{NEW_ROOT}/tmp"), "tmpfs", 0)?;
-    mount("tmpfs", &format!("{NEW_ROOT}/run"), "tmpfs", 0)?;
+    mount(
+        "proc",
+        &format!("{NEW_ROOT}/proc"),
+        "proc",
+        MountFlags::empty(),
+    )?;
+    mount(
+        "sysfs",
+        &format!("{NEW_ROOT}/sys"),
+        "sysfs",
+        MountFlags::empty(),
+    )?;
+    mount(
+        "devtmpfs",
+        &format!("{NEW_ROOT}/dev"),
+        "devtmpfs",
+        MountFlags::empty(),
+    )?;
+    mount(
+        "tmpfs",
+        &format!("{NEW_ROOT}/tmp"),
+        "tmpfs",
+        MountFlags::empty(),
+    )?;
+    mount(
+        "tmpfs",
+        &format!("{NEW_ROOT}/run"),
+        "tmpfs",
+        MountFlags::empty(),
+    )?;
     unix_fs::chroot(NEW_ROOT)?;
     std::env::set_current_dir("/")?;
     net::loopback_up()?;
@@ -214,15 +227,15 @@ fn mount_root() -> io::Result<()> {
     for dir in [IMAGE, LAYER, NEW_ROOT] {
         fs::create_dir_all(dir)?;
     }
-    mount(ROOTFS_TAG, IMAGE, "virtiofs", libc::MS_RDONLY)?;
-    mount("tmpfs", LAYER, "tmpfs", 0)?;
+    mount(ROOTFS_TAG, IMAGE, "virtiofs", MountFlags::RDONLY)?;
+    mount("tmpfs", LAYER, "tmpfs", MountFlags::empty())?;
     fs::create_dir(format!("{LAYER}/upper"))?;
     fs::create_dir(format!("{LAYER}/work"))?;
     mount_with(
         "overlay",
         NEW_ROOT,
         "overlay",
-        0,
+        MountFlags::empty(),
         &format!("lowerdir={IMAGE},upperdir={LAYER}/upper,workdir={LAYER}/work"),
     )?;
     for dir in [
@@ -239,7 +252,7 @@ fn mount_root() -> io::Result<()> {
     Ok(())
 }
 
-fn mount(source: &str, target: &str, fstype: &str, flags: libc::c_ulong) -> io::Result<()> {
+fn mount(source: &str, target: &str, fstype: &str, flags: MountFlags) -> io::Result<()> {
     mount_with(source, target, fstype, flags, "")
 }
 
@@ -247,34 +260,15 @@ fn mount_with(
     source: &str,
     target: &str,
     fstype: &str,
-    flags: libc::c_ulong,
+    flags: MountFlags,
     data: &str,
 ) -> io::Result<()> {
-    let c = |s: &str| CString::new(s).expect("mount arguments have no NUL bytes");
-    let (source_c, target_c, fstype_c, data_c) = (c(source), c(target), c(fstype), c(data));
-    // SAFETY: all pointers are valid NUL-terminated strings that outlive the call, and a null
-    // data pointer is allowed.
-    let rc = unsafe {
-        libc::mount(
-            source_c.as_ptr(),
-            target_c.as_ptr(),
-            fstype_c.as_ptr(),
-            flags,
-            if data.is_empty() {
-                std::ptr::null()
-            } else {
-                data_c.as_ptr().cast()
-            },
-        )
-    };
-    if rc != 0 {
-        let e = io::Error::last_os_error();
-        return Err(io::Error::new(
-            e.kind(),
-            format!("mount {source} on {target}: {e}"),
-        ));
-    }
-    Ok(())
+    let data = CString::new(data).expect("mount data has no NUL bytes");
+    let data = (!data.is_empty()).then_some(data.as_c_str());
+    rustix::mount::mount(source, target, fstype, flags, data).map_err(|e| {
+        let e = io::Error::from(e);
+        io::Error::new(e.kind(), format!("mount {source} on {target}: {e}"))
+    })
 }
 
 fn load_modules() -> io::Result<()> {
@@ -285,19 +279,12 @@ fn load_modules() -> io::Result<()> {
     };
     for name in order.lines().filter(|line| !line.is_empty()) {
         let file = File::open(format!("{MODULE_DIR}/{name}"))?;
-        // SAFETY: finit_module reads from a valid open descriptor with an empty, NUL-terminated
-        // parameter string and no flags.
-        let rc = unsafe {
-            libc::syscall(
-                libc::SYS_finit_module,
-                std::os::fd::AsRawFd::as_raw_fd(&file),
-                c"".as_ptr(),
-                0,
-            )
-        };
-        if rc != 0 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() != Some(libc::EEXIST) {
+        match rustix::system::finit_module(&file, c"", 0) {
+            Ok(()) => {}
+            // Built in, or loaded already.
+            Err(e) if e == rustix::io::Errno::EXIST => {}
+            Err(e) => {
+                let e = io::Error::from(e);
                 return Err(io::Error::new(e.kind(), format!("load module {name}: {e}")));
             }
         }
@@ -322,13 +309,12 @@ fn connect_host(port: u32) -> io::Result<File> {
 }
 
 fn connect_vsock(cid: u32, port: u32) -> io::Result<File> {
-    // SAFETY: socket has no memory-safety preconditions.
-    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: fd is a freshly created socket that nothing else owns.
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let fd = rustix::net::socket_with(
+        AddressFamily::VSOCK,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )?;
     // SAFETY: sockaddr_vm is plain data, and all-zero is a valid starting value.
     let mut addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
     addr.svm_family = libc::sa_family_t::try_from(libc::AF_VSOCK).expect("AF_VSOCK fits");

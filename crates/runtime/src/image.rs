@@ -17,6 +17,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
+use rustix::fs::{FlockOperation, flock};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -137,7 +138,7 @@ impl std::fmt::Display for Reference {
 ///
 /// Fails if the image cannot be pulled, checked or unpacked.
 pub fn get(cache: &Path, reference: &Reference, pull: bool) -> anyhow::Result<Image> {
-    let _cache = lock(&cache_lock_path(cache), libc::LOCK_SH)?;
+    let _cache = lock(&cache_lock_path(cache), FlockOperation::LockShared)?;
     let digest = match (pull, cached_digest(cache, reference)) {
         (false, Some(digest)) => digest,
         _ => self::pull(cache, reference)?,
@@ -170,7 +171,7 @@ fn cached_digest(cache: &Path, reference: &Reference) -> Option<String> {
 
 fn open(cache: &Path, digest: &str) -> anyhow::Result<Image> {
     let dir = image_dir(cache, digest);
-    let image_lock = lock(&dir, libc::LOCK_SH)?;
+    let image_lock = lock(&dir, FlockOperation::LockShared)?;
     mark_used(&dir).with_context(|| format!("image {digest}"))?;
     let config: ImageConfig = serde_json::from_slice(
         &fs::read(dir.join("config.json")).with_context(|| format!("image {digest}"))?,
@@ -215,7 +216,7 @@ fn cache_lock_path(cache: &Path) -> PathBuf {
 
 /// Opens `path`, a file or directory, creating a missing lock file, and takes `operation`, a
 /// flock(2) operation, on it.
-fn lock(path: &Path, operation: libc::c_int) -> anyhow::Result<File> {
+fn lock(path: &Path, operation: FlockOperation) -> anyhow::Result<File> {
     let file = if path.is_dir() {
         File::open(path)
     } else {
@@ -228,11 +229,7 @@ fn lock(path: &Path, operation: libc::c_int) -> anyhow::Result<File> {
         File::options().create(true).append(true).open(path)
     }
     .with_context(|| format!("opening {}", path.display()))?;
-    // SAFETY: flock takes a descriptor this function owns and an integer.
-    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), operation) } != 0 {
-        return Err(io::Error::last_os_error())
-            .with_context(|| format!("locking {}", path.display()));
-    }
+    flock(&file, operation).with_context(|| format!("locking {}", path.display()))?;
     Ok(file)
 }
 
@@ -286,7 +283,7 @@ pub fn prune(cache: &Path, unused_for: Option<Duration>) -> anyhow::Result<Vec<C
         return Ok(Vec::new());
     }
     // No pull is storing or tagging an image while this holds.
-    let _cache = lock(&cache_lock_path(cache), libc::LOCK_EX)?;
+    let _cache = lock(&cache_lock_path(cache), FlockOperation::LockExclusive)?;
     for entry in fs::read_dir(cache)?.flatten() {
         if entry.file_name().to_string_lossy().starts_with("tmp-") {
             let _ = fs::remove_dir_all(entry.path());
@@ -302,7 +299,7 @@ pub fn prune(cache: &Path, unused_for: Option<Duration>) -> anyhow::Result<Vec<C
         }
         let dir = image_dir(cache, &image.digest);
         // A run holds the image: keep it.
-        let Ok(_held) = lock(&dir, libc::LOCK_EX | libc::LOCK_NB) else {
+        let Ok(_held) = lock(&dir, FlockOperation::NonBlockingLockExclusive) else {
             continue;
         };
         for tag in &image.tags {
@@ -362,7 +359,7 @@ pub fn pull(cache: &Path, reference: &Reference) -> anyhow::Result<String> {
         .mode(0o700)
         .create(cache.join("tags"))
         .with_context(|| format!("creating {}", cache.display()))?;
-    let _cache = lock(&cache_lock_path(cache), libc::LOCK_SH)?;
+    let _cache = lock(&cache_lock_path(cache), FlockOperation::LockShared)?;
     let mut registry = Registry::new(reference);
     let (digest, manifest) = registry.manifest(&reference.reference)?;
     let dir = image_dir(cache, &digest);
@@ -843,10 +840,8 @@ mod tests {
         let mut builder = tar::Builder::new(Vec::new());
         for (path, content) in entries {
             let mut header = tar::Header::new_gnu();
-            // SAFETY: getuid and getgid have no preconditions.
-            let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-            header.set_uid(uid.into());
-            header.set_gid(gid.into());
+            header.set_uid(rustix::process::getuid().as_raw().into());
+            header.set_gid(rustix::process::getgid().as_raw().into());
             header.set_mtime(0);
             match content {
                 Some(data) => {

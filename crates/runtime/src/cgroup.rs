@@ -22,6 +22,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use rustix::fs::{FlockOperation, flock};
 
 /// Where runs' cgroups go by default: a child of the root cgroup, which may hold processes
 /// itself, so nothing else has to move.
@@ -76,10 +77,10 @@ impl RunCgroup {
     /// the run must not start without its limits.
     pub fn create(root: &Path, name: &str, limits: &Limits) -> anyhow::Result<RunCgroup> {
         prepare_root(root)?;
-        let root_lock = lock(root, libc::LOCK_SH)?;
+        let root_lock = lock(root, FlockOperation::LockShared)?;
         let path = root.join(name);
         fs::create_dir(&path).with_context(|| format!("creating cgroup {}", path.display()))?;
-        let lock = lock(&path, libc::LOCK_EX | libc::LOCK_NB)?;
+        let lock = lock(&path, FlockOperation::NonBlockingLockExclusive)?;
         drop(root_lock);
         let cgroup = RunCgroup::open(path, lock)?;
         let memory = u64::from(limits.guest_memory_mib) * (1 << 20) + OVERHEAD_BYTES;
@@ -186,7 +187,7 @@ pub fn stale(root: &Path) -> anyhow::Result<Vec<RunCgroup>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
         Err(e) => return Err(e).with_context(|| format!("reading {}", root.display())),
     };
-    let _root_lock = lock(root, libc::LOCK_EX)?;
+    let _root_lock = lock(root, FlockOperation::LockExclusive)?;
     let mut stale = vec![];
     for entry in entries {
         let entry = entry?;
@@ -194,7 +195,7 @@ pub fn stale(root: &Path) -> anyhow::Result<Vec<RunCgroup>> {
             continue;
         }
         // A cgroup removed since the listing is someone else's finished run.
-        if let Ok(lock) = lock(&entry.path(), libc::LOCK_EX | libc::LOCK_NB) {
+        if let Ok(lock) = lock(&entry.path(), FlockOperation::NonBlockingLockExclusive) {
             stale.push(RunCgroup::open(entry.path(), lock)?);
         }
     }
@@ -222,18 +223,14 @@ pub fn disk_of(path: &Path) -> Option<(u32, u32)> {
     Some((major.parse().ok()?, minor.parse().ok()?))
 }
 
-/// Opens directory `path` and takes `operation`, a flock(2) operation, on it.
-fn lock(path: &Path, operation: libc::c_int) -> anyhow::Result<File> {
+/// Opens directory `path` and takes `operation`, a flock(2) lock, on it.
+fn lock(path: &Path, operation: FlockOperation) -> anyhow::Result<File> {
     let dir = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
-    // SAFETY: flock takes a descriptor this function owns and an integer.
-    if unsafe { libc::flock(dir.as_raw_fd(), operation) } != 0 {
-        return Err(io::Error::last_os_error())
-            .with_context(|| format!("locking {}", path.display()));
-    }
+    flock(&dir, operation).with_context(|| format!("locking {}", path.display()))?;
     Ok(dir)
 }
 

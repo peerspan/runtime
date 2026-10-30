@@ -9,7 +9,7 @@ use std::fs;
 use std::io;
 use std::mem;
 use std::net::Ipv6Addr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 
 use peerspan_runtime_protocol::{
     GUEST_ADDRESS, GUEST_ADDRESS6, GUEST_DNS, GUEST_GATEWAY, GUEST_GATEWAY6, GUEST_PREFIX,
@@ -112,7 +112,7 @@ pub fn configure() -> io::Result<()> {
 /// Adds `eth0`'s IPv6 address and the IPv6 default route, through the host's link-local
 /// address on `eth0`.
 fn configure_ipv6() -> io::Result<()> {
-    let socket = socket(libc::AF_INET6)?;
+    let socket = socket(rustix::net::AddressFamily::INET6)?;
     let index = interface_ioctl(&socket, "eth0", libc::SIOCGIFINDEX, |_| {})?;
     // SAFETY: SIOCGIFINDEX filled in the index member.
     let ifindex = unsafe { index.ifr_ifru.ifru_ifindex };
@@ -154,17 +154,20 @@ fn configure_ipv6() -> io::Result<()> {
 }
 
 fn control_socket() -> io::Result<OwnedFd> {
-    socket(libc::AF_INET)
+    socket(rustix::net::AddressFamily::INET)
 }
 
-fn socket(family: libc::c_int) -> io::Result<OwnedFd> {
-    // SAFETY: socket has no memory preconditions.
-    let fd = unsafe { libc::socket(family, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return Err(context("opening a control socket"));
-    }
-    // SAFETY: fd is a new descriptor that nothing else owns.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+fn socket(family: rustix::net::AddressFamily) -> io::Result<OwnedFd> {
+    rustix::net::socket_with(
+        family,
+        rustix::net::SocketType::DGRAM,
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )
+    .map_err(|e| {
+        let e = io::Error::from(e);
+        io::Error::new(e.kind(), format!("opening a control socket: {e}"))
+    })
 }
 
 fn set_up(socket: &OwnedFd, name: &str) -> io::Result<()> {

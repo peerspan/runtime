@@ -82,8 +82,7 @@ fn platform() -> Found {
 }
 
 fn root() -> Found {
-    // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } == 0 {
+    if rustix::process::geteuid().is_root() {
         Ok("running as root".into())
     } else {
         Err(
