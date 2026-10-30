@@ -190,8 +190,7 @@ impl Run {
 /// Fails if the state directory or the socket cannot be set up.
 pub fn serve(args: ServeArgs) -> anyhow::Result<()> {
     crate::log::structured();
-    // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } != 0 {
+    if !rustix::process::geteuid().is_root() {
         anyhow::bail!("peerspan-runtime must run as root to confine its VMs");
     }
     for dir in [args.state.clone(), args.state.join("runs")] {
@@ -583,21 +582,13 @@ fn log_finished(run: &Run, outcome: &Outcome, stdout_bytes: u64, stderr_bytes: u
 /// share it and remove this one's runs at its startup.
 fn lock_state(state: &Path) -> anyhow::Result<File> {
     let dir = File::open(state).with_context(|| format!("opening {}", state.display()))?;
-    // SAFETY: flock takes a descriptor this function owns and an integer.
-    if unsafe {
-        libc::flock(
-            std::os::fd::AsRawFd::as_raw_fd(&dir),
-            libc::LOCK_EX | libc::LOCK_NB,
-        )
-    } != 0
-    {
-        let e = io::Error::last_os_error();
-        if e.kind() == io::ErrorKind::WouldBlock {
-            anyhow::bail!("another serve is using {}", state.display());
+    match rustix::fs::flock(&dir, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(dir),
+        Err(e) if e == rustix::io::Errno::WOULDBLOCK => {
+            anyhow::bail!("another serve is using {}", state.display())
         }
-        return Err(e).with_context(|| format!("locking {}", state.display()));
+        Err(e) => Err(e).with_context(|| format!("locking {}", state.display())),
     }
-    Ok(dir)
 }
 
 /// Removes the runs an earlier serve left: runs live only as long as the serve that started

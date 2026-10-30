@@ -12,12 +12,7 @@ use std::os::fd::{FromRawFd, RawFd};
 
 /// The host's monotonic clock, in nanoseconds; the same clock in every process.
 pub fn monotonic_ns() -> u64 {
-    let mut now = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: now is a valid out-pointer.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut now) };
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     u64::try_from(now.tv_sec).unwrap_or(0) * 1_000_000_000 + u64::try_from(now.tv_nsec).unwrap_or(0)
 }
 

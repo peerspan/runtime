@@ -7,7 +7,7 @@
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read};
 use std::net::Shutdown;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -21,6 +21,8 @@ use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, bail};
 use peerspan_runtime_protocol::{self as protocol, DATA_CHUNK, Message, WORKSPACE_TAG};
+
+use rustix::process::{Resource, Rlimit, Signal, setrlimit};
 
 use crate::caplog::CappedLog;
 use crate::cgroup::{self, IoRate, Limits, RunCgroup};
@@ -185,8 +187,7 @@ pub fn run(
         guest.rootfs = fs::canonicalize(rootfs)
             .with_context(|| format!("root filesystem {}", rootfs.display()))?;
     }
-    // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } != 0 {
+    if !rustix::process::geteuid().is_root() {
         bail!("peerspan-runtime must run as root to confine its VMs");
     }
     remove_stale_runs(&options.cgroup_root);
@@ -231,18 +232,14 @@ pub fn run(
     join_cgroup(&mut server_command, &cgroup);
     // Raised here, while still root: inside the namespace the server could not raise it.
     let open_files = open_files_limit();
-    // SAFETY: the hook only calls setrlimit(2), which is async-signal-safe.
+    // SAFETY: the hook only makes a system call, which is async-signal-safe.
     unsafe {
         server_command.pre_exec(move || {
-            let limit = libc::rlimit {
-                rlim_cur: open_files,
-                rlim_max: open_files,
+            let limit = Rlimit {
+                current: Some(open_files),
+                maximum: Some(open_files),
             };
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            }
+            Ok(setrlimit(Resource::Nofile, limit)?)
         });
     }
     server_namespace.enter(&mut server_command);
@@ -588,14 +585,12 @@ const SERVER_FD: RawFd = 3;
 
 /// The open files the workspace server may hold, one per file the guest has looked up: what
 /// virtiofsd sets for itself when it runs as root.
-fn open_files_limit() -> libc::rlim_t {
-    const VIRTIOFSD_DEFAULT: libc::rlim_t = 1_000_000;
+fn open_files_limit() -> u64 {
+    const VIRTIOFSD_DEFAULT: u64 = 1_000_000;
     fs::read_to_string("/proc/sys/fs/nr_open")
         .ok()
         .and_then(|n| n.trim().parse().ok())
-        .map_or(VIRTIOFSD_DEFAULT, |max: libc::rlim_t| {
-            max.min(VIRTIOFSD_DEFAULT)
-        })
+        .map_or(VIRTIOFSD_DEFAULT, |max: u64| max.min(VIRTIOFSD_DEFAULT))
 }
 
 /// Makes `fd` available to `command`'s process as `target`.
@@ -624,19 +619,17 @@ fn pass_fd(command: &mut Command, fd: RawFd, target: RawFd) {
 /// Puts a child in the run's cgroup, and has it killed if the supervisor dies first.
 fn join_cgroup<'cmd>(command: &'cmd mut Command, cgroup: &RunCgroup) -> &'cmd mut Command {
     let fd = cgroup.procs_fd();
-    // SAFETY: getpid has no preconditions.
-    let supervisor = unsafe { libc::getpid() };
-    // SAFETY: the hook only calls write(2), prctl(2) and getppid(2), which are
-    // async-signal-safe, and the descriptor stays open until after the child has started.
+    let supervisor = rustix::process::getpid();
+    // SAFETY: the hook makes only system calls, which are async-signal-safe, and the
+    // descriptor stays open until after the child has started.
     unsafe {
         command.pre_exec(move || {
-            if libc::write(fd, b"0".as_ptr().cast(), 1) != 1
-                || libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0
-            {
-                return Err(io::Error::last_os_error());
+            if rustix::io::write(BorrowedFd::borrow_raw(fd), b"0")? != 1 {
+                return Err(io::Error::from(ErrorKind::WriteZero));
             }
+            rustix::process::set_parent_process_death_signal(Some(Signal::KILL))?;
             // The supervisor died before the death signal was set.
-            if libc::getppid() != supervisor {
+            if rustix::process::getppid() != Some(supervisor) {
                 return Err(io::Error::from(ErrorKind::Interrupted));
             }
             Ok(())

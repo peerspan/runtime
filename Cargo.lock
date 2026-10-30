@@ -472,6 +472,7 @@ dependencies = [
  "flate2",
  "libc",
  "peerspan-runtime-protocol",
+ "rustix",
  "sha2",
  "tar",
 ]
@@ -487,6 +488,7 @@ dependencies = [
  "libc",
  "libloading",
  "peerspan-runtime-protocol",
+ "rustix",
  "seccompiler",
  "serde",
  "serde_json",

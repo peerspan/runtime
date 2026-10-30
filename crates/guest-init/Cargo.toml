@@ -11,6 +11,7 @@ publish.workspace = true
 flate2 = "1"
 libc = "0.2"
 peerspan-runtime-protocol.workspace = true
+rustix = { version = "1.1", default-features = false, features = ["std", "process", "fs", "mount", "system", "time", "stdio", "net"] }
 sha2 = "0.10"
 tar = "0.4"
 
