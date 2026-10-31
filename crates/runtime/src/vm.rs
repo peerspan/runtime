@@ -56,9 +56,9 @@ const WATCH_INTERVAL: Duration = Duration::from_millis(50);
 /// One command to run in one VM.
 #[derive(Debug)]
 pub struct VmSpec {
-    /// Host directory shared as the guest's workspace. With an archive it must be empty.
-    pub workspace: PathBuf,
-    /// Give the workspace directory to the run's own user first. The guest's root acts on the
+    /// What the guest gets as its workspace.
+    pub workspace: Workspace,
+    /// Give a workspace directory to the run's own user first. The guest's root acts on the
     /// host as the directory's owner, so this keeps a workspace the runtime created for the run
     /// from being served as root.
     pub own_workspace: bool,
@@ -89,6 +89,28 @@ pub struct VmSpec {
     pub kernel_args: Option<String>,
     /// The command; its `archive` flag is set from `archive` above.
     pub command: protocol::Command,
+}
+
+/// Where the guest's workspace comes from.
+#[derive(Debug)]
+pub enum Workspace {
+    /// A host directory, served by `virtiofsd` confined to it. With an archive it must be
+    /// empty.
+    Directory(PathBuf),
+    /// A workspace of a peerfs space, served by the space's peerfs server as a vhost-user-fs
+    /// device, so the guest's changes land in the workspace's history.
+    Peerfs(PeerfsWorkspace),
+}
+
+/// A peerfs workspace, and how to reach the server of its space.
+#[derive(Debug)]
+pub struct PeerfsWorkspace {
+    /// The `peerfs` binary.
+    pub peerfs: PathBuf,
+    /// The space's directory.
+    pub space: PathBuf,
+    /// The workspace's name.
+    pub name: String,
 }
 
 /// Something the run reported.
@@ -172,16 +194,30 @@ pub fn run(
     let began_ns = phases::monotonic_ns();
     let mut stamps: Vec<(String, u64)> = Vec::new();
     let mut mark = |name: &str| stamps.push((name.to_owned(), phases::monotonic_ns()));
-    if let Some(archive) = &options.archive
-        && fs::read_dir(&options.workspace)?.next().is_some()
-    {
-        bail!(
-            "the workspace must be empty to unpack {} into it",
-            archive.display()
-        );
-    }
-    let workspace = fs::canonicalize(&options.workspace)
-        .with_context(|| format!("workspace {}", options.workspace.display()))?;
+    let workspace_path = match &options.workspace {
+        Workspace::Directory(dir) => {
+            if let Some(archive) = &options.archive
+                && fs::read_dir(dir)?.next().is_some()
+            {
+                bail!(
+                    "the workspace must be empty to unpack {} into it",
+                    archive.display()
+                );
+            }
+            dir
+        }
+        Workspace::Peerfs(peerfs) => {
+            if options.archive.is_some() {
+                bail!(
+                    "an archive is unpacked only into a workspace directory, not a peerfs workspace"
+                );
+            }
+            &peerfs.space
+        }
+    };
+    // The workspace directory, or the peerfs space holding the workspace.
+    let workspace = fs::canonicalize(workspace_path)
+        .with_context(|| format!("workspace {}", workspace_path.display()))?;
     let mut guest = GuestImage::open(&options.guest)?;
     if let Some(rootfs) = &options.rootfs {
         guest.rootfs = fs::canonicalize(rootfs)
@@ -214,50 +250,19 @@ pub fn run(
         .clone()
         .unwrap_or_else(|| run_dir.path.join("console.log"));
 
-    // The workspace server is root in a user namespace where root is the workspace's owner, so
-    // the guest's root acts on the host as that user and no other. It cannot reach the run's
-    // socket directory, so it listens on a socket created for it.
-    if options.own_workspace {
-        chown(&workspace, id)?;
-    }
-    let owner = fs::metadata(&workspace)?;
-    let server_namespace = UserNamespace::new(owner.uid(), owner.gid())?;
     let workspace_socket = sockets.join(WORKSPACE_SOCKET);
-    let server_listener = UnixListener::bind(&workspace_socket)
-        .with_context(|| format!("binding {}", workspace_socket.display()))?;
+    let mut server = match &options.workspace {
+        Workspace::Directory(_) => {
+            if options.own_workspace {
+                chown(&workspace, id)?;
+            }
+            start_virtiofsd(options, &workspace, &workspace_socket, &cgroup, &run_dir)?
+        }
+        Workspace::Peerfs(peerfs) => WorkspaceServer::Peerfs {
+            _mount: PeerfsMount::new(peerfs, &workspace_socket)?,
+        },
+    };
     chown(&workspace_socket, id)?;
-    let (server_log, server_log_writer) =
-        CappedLog::create(&run_dir.path.join("virtiofsd.log"), SERVER_LOG_LIMIT)?;
-    let mut server_command = Command::new(&options.virtiofsd);
-    join_cgroup(&mut server_command, &cgroup);
-    // Raised here, while still root: inside the namespace the server could not raise it.
-    let open_files = open_files_limit();
-    // SAFETY: the hook only makes a system call, which is async-signal-safe.
-    unsafe {
-        server_command.pre_exec(move || {
-            let limit = Rlimit {
-                current: Some(open_files),
-                maximum: Some(open_files),
-            };
-            Ok(setrlimit(Resource::Nofile, limit)?)
-        });
-    }
-    server_namespace.enter(&mut server_command);
-    pass_fd(&mut server_command, server_listener.as_raw_fd(), SERVER_FD);
-    let mut server = ChildGuard(
-        server_command
-            .arg(format!("--fd={SERVER_FD}"))
-            .arg(format!("--shared-dir={}", workspace.display()))
-            .arg(format!("--tag={WORKSPACE_TAG}"))
-            .arg("--cache=auto")
-            .arg("--rlimit-nofile=0")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(server_log_writer)
-            .spawn()
-            .with_context(|| format!("starting {}", options.virtiofsd.display()))?,
-    );
-    drop((server_listener, server_namespace));
     mark("workspace_server");
 
     // Declared after the cgroup and dropped before it: passt first, then the filter, which
@@ -354,14 +359,16 @@ pub fn run(
         Err(e) => {
             let e = e.context(console.tail("guest console"));
             // A server that could not start is the likelier cause; its log goes with the run.
-            if let Ok(Some(_)) = wait_with_timeout(&mut server.0, SERVER_EXIT_GRACE) {
+            if let WorkspaceServer::Virtiofsd { child, log, owner } = &mut server
+                && let Ok(Some(_)) = wait_with_timeout(&mut child.0, SERVER_EXIT_GRACE)
+            {
                 return Err(e.context(format!(
                     "the workspace server, which runs as the workspace's owner (user {}, group \
                      {}) and must be able to reach {}, failed; {}",
                     owner.uid(),
                     owner.gid(),
                     workspace.display(),
-                    server_log.tail("its log")
+                    log.tail("its log")
                 )));
             }
             return Err(e);
@@ -812,6 +819,141 @@ impl Drop for RunDir {
 }
 
 /// Kills and reaps a child process when dropped.
+/// What serves the guest's workspace, stopped when dropped.
+enum WorkspaceServer {
+    /// `virtiofsd` for a workspace directory, as the directory's owner, with its log and that
+    /// owner for reporting a failure to start.
+    Virtiofsd {
+        child: ChildGuard,
+        log: CappedLog,
+        owner: fs::Metadata,
+    },
+    /// A peerfs server's vhost-user device, held to be unmounted when dropped.
+    Peerfs { _mount: PeerfsMount },
+}
+
+/// Starts `virtiofsd` on `workspace`, listening at `socket`. It is root in a user namespace
+/// where root is the workspace's owner, so the guest's root acts on the host as that user and
+/// no other. It cannot reach the run's socket directory, so it gets a socket created for it.
+fn start_virtiofsd(
+    options: &VmSpec,
+    workspace: &Path,
+    socket: &Path,
+    cgroup: &RunCgroup,
+    run_dir: &RunDir,
+) -> anyhow::Result<WorkspaceServer> {
+    let owner = fs::metadata(workspace)?;
+    let server_namespace = UserNamespace::new(owner.uid(), owner.gid())?;
+    let server_listener =
+        UnixListener::bind(socket).with_context(|| format!("binding {}", socket.display()))?;
+    let (log, server_log_writer) =
+        CappedLog::create(&run_dir.path.join("virtiofsd.log"), SERVER_LOG_LIMIT)?;
+    let mut server_command = Command::new(&options.virtiofsd);
+    join_cgroup(&mut server_command, cgroup);
+    // Raised here, while still root: inside the namespace the server could not raise it.
+    let open_files = open_files_limit();
+    // SAFETY: the hook only makes a system call, which is async-signal-safe.
+    unsafe {
+        server_command.pre_exec(move || {
+            let limit = Rlimit {
+                current: Some(open_files),
+                maximum: Some(open_files),
+            };
+            Ok(setrlimit(Resource::Nofile, limit)?)
+        });
+    }
+    server_namespace.enter(&mut server_command);
+    pass_fd(&mut server_command, server_listener.as_raw_fd(), SERVER_FD);
+    let child = ChildGuard(
+        server_command
+            .arg(format!("--fd={SERVER_FD}"))
+            .arg(format!("--shared-dir={}", workspace.display()))
+            .arg(format!("--tag={WORKSPACE_TAG}"))
+            .arg("--cache=auto")
+            .arg("--rlimit-nofile=0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(server_log_writer)
+            .spawn()
+            .with_context(|| format!("starting {}", options.virtiofsd.display()))?,
+    );
+    Ok(WorkspaceServer::Virtiofsd { child, log, owner })
+}
+
+/// How long to keep asking peerfs to unmount while it still sees the VM connected.
+const PEERFS_UNMOUNT_WAIT: Duration = Duration::from_secs(5);
+
+/// A peerfs workspace served at a run's workspace socket by the space's peerfs server, which
+/// the `peerfs` command reaches and starts if none runs. The server must be able to create the
+/// socket in the run's directory, as it can when it runs as root.
+struct PeerfsMount {
+    peerfs: PathBuf,
+    space: PathBuf,
+    name: String,
+}
+
+impl PeerfsMount {
+    fn new(workspace: &PeerfsWorkspace, socket: &Path) -> anyhow::Result<Self> {
+        let output = peerfs_command(&workspace.peerfs, &workspace.space)
+            .args(["ws", "mount", &workspace.name])
+            .arg(socket)
+            .args(["--vhost-user", "--tag", WORKSPACE_TAG])
+            .output()
+            .with_context(|| format!("starting {}", workspace.peerfs.display()))?;
+        if !output.status.success() {
+            bail!(
+                "peerfs could not serve workspace {}: {}",
+                workspace.name,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        // Only now, so a mount that failed is not unmounted.
+        Ok(Self {
+            peerfs: workspace.peerfs.clone(),
+            space: workspace.space.clone(),
+            name: workspace.name.clone(),
+        })
+    }
+}
+
+/// `peerfs` run for the space at `space`.
+fn peerfs_command(peerfs: &Path, space: &Path) -> Command {
+    let mut command = Command::new(peerfs);
+    command.arg("--space").arg(space).stdin(Stdio::null());
+    command
+}
+
+impl Drop for PeerfsMount {
+    fn drop(&mut self) {
+        // The device stays busy until it sees the VMM hang up, which follows the launcher's
+        // exit closely.
+        let deadline = Instant::now() + PEERFS_UNMOUNT_WAIT;
+        loop {
+            let unmounted = peerfs_command(&self.peerfs, &self.space)
+                .args(["ws", "unmount", &self.name])
+                .output();
+            match unmounted {
+                Ok(output) if output.status.success() => return,
+                Ok(output) if Instant::now() < deadline => {
+                    let _ = output;
+                    thread::sleep(POLL_INTERVAL);
+                }
+                failed => {
+                    let detail = match failed {
+                        Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                        Err(e) => e.to_string(),
+                    };
+                    crate::log::warn(
+                        "peerfs did not unmount the workspace",
+                        &[("workspace", &self.name), ("error", &detail)],
+                    );
+                    return;
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ChildGuard(Child);
 

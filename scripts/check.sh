@@ -7,7 +7,8 @@
 # at it, PEERSPAN_LIBKRUN pointing at a libkrun built with `make VHOST_USER=1 NET=1`, passt
 # from scripts/build-passt.sh beside the runtime binary or named by PEERSPAN_PASST, and nft and
 # ip on PATH.
-# PEERSPAN_RUNTIME_BIN names a built binary; without it the script builds one.
+# PEERSPAN_RUNTIME_BIN names a built binary; without it the script builds one. PEERSPAN_PEERFS
+# naming a peerfs binary adds a check of a peerfs workspace.
 set -eu
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -198,6 +199,26 @@ start=$(date +%s); rc=0
 "$bin" run --workspace "$work/ws" --timeout-seconds 1 -- sleep 60 > /dev/null 2>&1 || rc=$?
 took=$(( $(date +%s) - start ))
 [ "$rc" -eq 124 ] && [ "$took" -lt 15 ] && pass timeout || fail "timeout: exit $rc after ${took}s"
+
+# A peerfs workspace, with PEERSPAN_PEERFS naming a peerfs binary: the guest reads the
+# branch's files, its writes reach the workspace, a second run sees the first's, and each run
+# leaves nothing mounted.
+if [ -n "${PEERSPAN_PEERFS:-}" ]; then
+  space="$work/peerfs-space"
+  mkdir -p "$work/peerfs-src" && echo branch > "$work/peerfs-src/a.txt"
+  pf() { "$PEERSPAN_PEERFS" --space "$space" "$@"; }
+  pf init > /dev/null && pf import "$work/peerfs-src" -m base > /dev/null \
+    && pf ws create agent > /dev/null
+  rc=0
+  for i in 1 2; do
+    "$bin" run --peerfs-workspace agent --peerfs-space "$space" -- \
+      sh -c "cat a.txt runs 2>/dev/null; echo run$i >> runs" > "$work/out" 2>&1 || rc=$?
+  done
+  [ "$rc" -eq 0 ] && [ "$(cat "$work/out")" = "$(printf 'branch\nrun1')" ] \
+    && [ "$(pf ws read agent runs)" = "$(printf 'run1\nrun2')" ] && [ -z "$(pf mounts)" ] \
+    && pass peerfs || fail "peerfs: exit $rc, $(tail -3 "$work/out")"
+  pf stop > /dev/null
+fi
 
 PEERSPAN_RUNTIME_BIN="$bin" python3 "$repo/scripts/check-serve.py" || failures=$((failures + 1))
 

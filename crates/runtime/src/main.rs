@@ -28,7 +28,7 @@ use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 
 use clap::{Args, Parser, Subcommand};
 
@@ -102,8 +102,19 @@ struct UnpackLayersArgs {
 #[derive(Debug, Args)]
 struct RunArgs {
     /// Host directory to mount at /workspace in the guest, writable.
-    #[arg(long)]
-    workspace: PathBuf,
+    #[arg(long, required_unless_present = "peerfs_workspace")]
+    workspace: Option<PathBuf>,
+    /// Instead of a directory, a workspace of a peerfs space (`--peerfs-space`), served by
+    /// that space's peerfs server, so what the guest changes lands in the workspace's
+    /// history. Experimental: the peerfs server is not confined per VM as virtiofsd is.
+    #[arg(long, conflicts_with_all = ["workspace", "archive"], requires = "peerfs_space")]
+    peerfs_workspace: Option<String>,
+    /// The peerfs space holding `--peerfs-workspace`.
+    #[arg(long, env = "PEERFS_SPACE")]
+    peerfs_space: Option<PathBuf>,
+    /// The peerfs binary, for `--peerfs-workspace`.
+    #[arg(long, env = "PEERSPAN_PEERFS", default_value = "peerfs")]
+    peerfs: PathBuf,
     /// OCI image to boot, such as `node:22`; pulled the first time [default: the guest image's
     /// own root, a minimal Alpine].
     #[arg(long)]
@@ -296,8 +307,19 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
         }
         None => None,
     };
+    let workspace = match (args.workspace, args.peerfs_workspace) {
+        (_, Some(name)) => vm::Workspace::Peerfs(vm::PeerfsWorkspace {
+            peerfs: args.peerfs,
+            space: args
+                .peerfs_space
+                .context("--peerfs-workspace needs --peerfs-space")?,
+            name,
+        }),
+        (Some(dir), None) => vm::Workspace::Directory(dir),
+        (None, None) => bail!("give --workspace or --peerfs-workspace"),
+    };
     let spec = vm::VmSpec {
-        workspace: args.workspace,
+        workspace,
         own_workspace: false,
         rootfs,
         stdin: if args.stdin {

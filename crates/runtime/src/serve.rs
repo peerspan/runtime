@@ -469,7 +469,7 @@ fn execute(runtime: &Runtime, run: &Run) {
         // The workspace's file system goes at the end of this arm, before the run is finished.
         Ok((workspace, _disk, mut results)) => {
             let spec = VmSpec {
-                workspace,
+                workspace: vm::Workspace::Directory(workspace),
                 own_workspace: true,
                 stdin: None,
                 rootfs: runtime.image.as_ref().map(|i| i.rootfs.clone()),

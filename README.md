@@ -68,6 +68,7 @@ exits with its code.
 | Option | Effect |
 | --- | --- |
 | `--workspace DIR` | The directory to mount at `/workspace` |
+| `--peerfs-workspace NAME` | Instead, a peerfs workspace, from the space `--peerfs-space` (or `PEERFS_SPACE`); experimental, see below |
 | `--image REF` | OCI image to boot, such as `node:22` (default: a minimal Alpine); see Images |
 | `--pull` | Pull the image again, to update its tag |
 | `--archive FILE` | Unpack a tar or tar.gz into an empty workspace first |
@@ -83,6 +84,15 @@ exits with its code.
 Exit codes: the command's own, 128 + N if a signal ended it, 124 on timeout, 127 if it never
 ran. Archives may hold only directories, files and symbolic links, with no absolute paths or
 `..`.
+
+With `--peerfs-workspace`, the space's peerfs server serves the workspace to the VM as a
+vhost-user-fs device in place of `virtiofsd`, so what the command changes lands in the
+workspace's history, where `peerfs ws snapshot` and `ws commit` take it. The runtime asks
+`peerfs` (`--peerfs` or `PEERSPAN_PEERFS`) to serve the workspace at the run's socket and to stop
+when the VM exits; peerfs starts a server for the space if none runs, and that server must be
+able to create the socket in the run's directory, as it can as root. It is opt-in because the
+peerfs server is not confined per VM as `virtiofsd` is (see Confinement). `--archive` takes a
+workspace directory only, and `serve` does not offer peerfs workspaces yet.
 
 ## `serve`
 
@@ -162,13 +172,19 @@ sees any guest input:
   takes only the KVM commands a VM needs, and `clone` cannot create namespaces. Any other call
   kills the VMM, and the run says so.
 
-The workspace server (`virtiofsd`, until peerfs replaces it) runs as the workspace's owner, in
-a user namespace where that user is root:
+The workspace server for a directory, `virtiofsd`, runs as the workspace's owner, in a user
+namespace where that user is root:
 - The guest's root owns the owner's files.
 - New files belong to the owner on the host.
 - Other users' files show as `nobody`.
 
 `serve` gives each workspace it creates to the run's own user.
+
+A peerfs workspace is served by the space's peerfs server, which is not confined this way: it
+serves every VM given one of its space's workspaces, and holds all of the space's workspaces and
+its signing key. peerfs never reaches outside its own store, but a fault in how it handles a
+guest's requests would expose the whole space, where a fault in `virtiofsd` exposes one
+workspace. Confining it per VM comes before peerfs workspaces become the default.
 
 ### Limits
 
