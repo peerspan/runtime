@@ -104,9 +104,9 @@ struct RunArgs {
     /// Host directory to mount at /workspace in the guest, writable.
     #[arg(long, required_unless_present = "peerfs_workspace")]
     workspace: Option<PathBuf>,
-    /// Instead of a directory, a workspace of a peerfs space (`--peerfs-space`), served by
-    /// that space's peerfs server, so what the guest changes lands in the workspace's
-    /// history. Experimental: the peerfs server is not confined per VM as virtiofsd is.
+    /// Instead of a directory, a workspace of a peerfs space (`--peerfs-space`), served by a
+    /// confined peerfs process of the run's own, so what the guest changes lands in the
+    /// workspace's history. Needs a peerfs that has `ws vhost-user`.
     #[arg(long, conflicts_with_all = ["workspace", "archive"], requires = "peerfs_space")]
     peerfs_workspace: Option<String>,
     /// The peerfs space holding `--peerfs-workspace`.

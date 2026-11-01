@@ -201,8 +201,8 @@ took=$(( $(date +%s) - start ))
 [ "$rc" -eq 124 ] && [ "$took" -lt 15 ] && pass timeout || fail "timeout: exit $rc after ${took}s"
 
 # A peerfs workspace, with PEERSPAN_PEERFS naming a peerfs binary: the guest reads the
-# branch's files, its writes reach the workspace, a second run sees the first's, and each run
-# leaves nothing mounted.
+# branch's files, its writes reach the workspace through the confined server's system calls, a
+# second run sees the first's, and each run gives the workspace back, so the server can read it.
 if [ -n "${PEERSPAN_PEERFS:-}" ]; then
   space="$work/peerfs-space"
   mkdir -p "$work/peerfs-src" && echo branch > "$work/peerfs-src/a.txt"
@@ -212,10 +212,13 @@ if [ -n "${PEERSPAN_PEERFS:-}" ]; then
   rc=0
   for i in 1 2; do
     "$bin" run --peerfs-workspace agent --peerfs-space "$space" -- \
-      sh -c "cat a.txt runs 2>/dev/null; echo run$i >> runs" > "$work/out" 2>&1 || rc=$?
+      sh -c "cat a.txt runs 2>/dev/null; echo run$i >> runs; mkdir -p d/e && echo x > d/f \
+        && mv d/f d/e/g && ln -sf e/g d/l && ln -f d/e/g d/h && chmod 600 d/h && rm d/h" \
+      > "$work/out" 2>&1 || rc=$?
   done
   [ "$rc" -eq 0 ] && [ "$(cat "$work/out")" = "$(printf 'branch\nrun1')" ] \
-    && [ "$(pf ws read agent runs)" = "$(printf 'run1\nrun2')" ] && [ -z "$(pf mounts)" ] \
+    && [ "$(pf ws read agent runs)" = "$(printf 'run1\nrun2')" ] \
+    && [ "$(pf ws read agent d/e/g)" = x ] \
     && pass peerfs || fail "peerfs: exit $rc, $(tail -3 "$work/out")"
   pf stop > /dev/null
 fi

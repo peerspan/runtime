@@ -97,8 +97,8 @@ pub enum Workspace {
     /// A host directory, served by `virtiofsd` confined to it. With an archive it must be
     /// empty.
     Directory(PathBuf),
-    /// A workspace of a peerfs space, served by the space's peerfs server as a vhost-user-fs
-    /// device, so the guest's changes land in the workspace's history.
+    /// A workspace of a peerfs space, served by a confined peerfs process of the run's own as
+    /// a vhost-user-fs device, so the guest's changes land in the workspace's history.
     Peerfs(PeerfsWorkspace),
 }
 
@@ -258,9 +258,7 @@ pub fn run(
             }
             start_virtiofsd(options, &workspace, &workspace_socket, &cgroup, &run_dir)?
         }
-        Workspace::Peerfs(peerfs) => WorkspaceServer::Peerfs {
-            _mount: PeerfsMount::new(peerfs, &workspace_socket)?,
-        },
+        Workspace::Peerfs(peerfs) => start_peerfs(peerfs, &workspace_socket, &cgroup, &run_dir)?,
     };
     chown(&workspace_socket, id)?;
     mark("workspace_server");
@@ -369,6 +367,14 @@ pub fn run(
                     owner.gid(),
                     workspace.display(),
                     log.tail("its log")
+                )));
+            }
+            if let WorkspaceServer::Peerfs(peerfs) = &mut server
+                && let Ok(Some(_)) = wait_with_timeout(&mut peerfs.child, SERVER_EXIT_GRACE)
+            {
+                return Err(e.context(format!(
+                    "the peerfs workspace server failed; {}",
+                    peerfs.log.tail("its log")
                 )));
             }
             return Err(e);
@@ -828,8 +834,8 @@ enum WorkspaceServer {
         log: CappedLog,
         owner: fs::Metadata,
     },
-    /// A peerfs server's vhost-user device, held to be unmounted when dropped.
-    Peerfs { _mount: PeerfsMount },
+    /// A confined peerfs process serving a peerfs workspace.
+    Peerfs(PeerfsServer),
 }
 
 /// Starts `virtiofsd` on `workspace`, listening at `socket`. It is root in a user namespace
@@ -880,40 +886,71 @@ fn start_virtiofsd(
     Ok(WorkspaceServer::Virtiofsd { child, log, owner })
 }
 
-/// How long to keep asking peerfs to unmount while it still sees the VM connected.
-const PEERFS_UNMOUNT_WAIT: Duration = Duration::from_secs(5);
+/// How long a peerfs workspace server has to give the workspace back once the VM is gone, and
+/// to start serving, which may include starting the space's server.
+const PEERFS_EXIT_WAIT: Duration = Duration::from_secs(5);
+const PEERFS_START_WAIT: Duration = Duration::from_secs(15);
 
-/// A peerfs workspace served at a run's workspace socket by the space's peerfs server, which
-/// the `peerfs` command reaches and starts if none runs. The server must be able to create the
-/// socket in the run's directory, as it can when it runs as root.
-struct PeerfsMount {
-    peerfs: PathBuf,
-    space: PathBuf,
-    name: String,
-}
-
-impl PeerfsMount {
-    fn new(workspace: &PeerfsWorkspace, socket: &Path) -> anyhow::Result<Self> {
-        let output = peerfs_command(&workspace.peerfs, &workspace.space)
-            .args(["ws", "mount", &workspace.name])
-            .arg(socket)
-            .args(["--vhost-user", "--tag", WORKSPACE_TAG])
-            .output()
-            .with_context(|| format!("starting {}", workspace.peerfs.display()))?;
-        if !output.status.success() {
+/// Starts `peerfs ws vhost-user` for `workspace` at `socket`: a process of the run's own, in
+/// its cgroup, which borrows the workspace from the space's server and confines itself to it
+/// before the guest is served. The space's server is started first if none runs, outside the
+/// run's cgroup, since it outlives the run.
+fn start_peerfs(
+    workspace: &PeerfsWorkspace,
+    socket: &Path,
+    cgroup: &RunCgroup,
+    run_dir: &RunDir,
+) -> anyhow::Result<WorkspaceServer> {
+    let output = peerfs_command(&workspace.peerfs, &workspace.space)
+        .args(["ws", "list"])
+        .output()
+        .with_context(|| format!("starting {}", workspace.peerfs.display()))?;
+    if !output.status.success() {
+        bail!(
+            "peerfs could not reach space {}: {}",
+            workspace.space.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let (log, log_writer) = CappedLog::create(&run_dir.path.join("peerfs.log"), SERVER_LOG_LIMIT)?;
+    let mut command = peerfs_command(&workspace.peerfs, &workspace.space);
+    join_cgroup(&mut command, cgroup);
+    let mut child = command
+        .args(["ws", "vhost-user", &workspace.name])
+        .arg(socket)
+        .args(["--tag", WORKSPACE_TAG])
+        .stdout(Stdio::null())
+        .stderr(log_writer)
+        .spawn()
+        .with_context(|| format!("starting {}", workspace.peerfs.display()))?;
+    // Ready once it has borrowed the workspace and bound the socket.
+    let deadline = Instant::now() + PEERFS_START_WAIT;
+    while !socket.exists() {
+        if child.try_wait()?.is_some() {
             bail!(
-                "peerfs could not serve workspace {}: {}",
+                "peerfs could not serve workspace {}; {}",
                 workspace.name,
-                String::from_utf8_lossy(&output.stderr).trim()
+                log.tail("its log")
             );
         }
-        // Only now, so a mount that failed is not unmounted.
-        Ok(Self {
-            peerfs: workspace.peerfs.clone(),
-            space: workspace.space.clone(),
-            name: workspace.name.clone(),
-        })
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "peerfs did not start serving workspace {} within {}s; {}",
+                workspace.name,
+                PEERFS_START_WAIT.as_secs(),
+                log.tail("its log")
+            );
+        }
+        thread::sleep(POLL_INTERVAL);
     }
+    let server = PeerfsServer {
+        child,
+        log,
+        name: workspace.name.clone(),
+    };
+    Ok(WorkspaceServer::Peerfs(server))
 }
 
 /// `peerfs` run for the space at `space`.
@@ -923,33 +960,35 @@ fn peerfs_command(peerfs: &Path, space: &Path) -> Command {
     command
 }
 
-impl Drop for PeerfsMount {
+/// A run's peerfs workspace server. It exits by itself once the VMM hangs up, giving the
+/// workspace back to the space's server; dropping waits for that, and kills it after
+/// [`PEERFS_EXIT_WAIT`].
+struct PeerfsServer {
+    child: Child,
+    log: CappedLog,
+    name: String,
+}
+
+impl Drop for PeerfsServer {
     fn drop(&mut self) {
-        // The device stays busy until it sees the VMM hang up, which follows the launcher's
-        // exit closely.
-        let deadline = Instant::now() + PEERFS_UNMOUNT_WAIT;
-        loop {
-            let unmounted = peerfs_command(&self.peerfs, &self.space)
-                .args(["ws", "unmount", &self.name])
-                .output();
-            match unmounted {
-                Ok(output) if output.status.success() => return,
-                Ok(output) if Instant::now() < deadline => {
-                    let _ = output;
-                    thread::sleep(POLL_INTERVAL);
-                }
-                failed => {
-                    let detail = match failed {
-                        Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-                        Err(e) => e.to_string(),
-                    };
-                    crate::log::warn(
-                        "peerfs did not unmount the workspace",
-                        &[("workspace", &self.name), ("error", &detail)],
-                    );
-                    return;
-                }
+        let status = match wait_with_timeout(&mut self.child, PEERFS_EXIT_WAIT) {
+            Ok(Some(status)) => Some(status),
+            _ => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                None
             }
+        };
+        if !status.is_some_and(|status| status.success()) {
+            let ended = status.map_or_else(|| "killed".to_owned(), |status| status.to_string());
+            crate::log::warn(
+                "the peerfs workspace server did not exit cleanly",
+                &[
+                    ("workspace", &self.name),
+                    ("status", &ended),
+                    ("log", &self.log.tail("its log")),
+                ],
+            );
         }
     }
 }

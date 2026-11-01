@@ -68,7 +68,7 @@ exits with its code.
 | Option | Effect |
 | --- | --- |
 | `--workspace DIR` | The directory to mount at `/workspace` |
-| `--peerfs-workspace NAME` | Instead, a peerfs workspace, from the space `--peerfs-space` (or `PEERFS_SPACE`); experimental, see below |
+| `--peerfs-workspace NAME` | Instead, a peerfs workspace, from the space `--peerfs-space` (or `PEERFS_SPACE`); see below |
 | `--image REF` | OCI image to boot, such as `node:22` (default: a minimal Alpine); see Images |
 | `--pull` | Pull the image again, to update its tag |
 | `--archive FILE` | Unpack a tar or tar.gz into an empty workspace first |
@@ -85,14 +85,14 @@ Exit codes: the command's own, 128 + N if a signal ended it, 124 on timeout, 127
 ran. Archives may hold only directories, files and symbolic links, with no absolute paths or
 `..`.
 
-With `--peerfs-workspace`, the space's peerfs server serves the workspace to the VM as a
+With `--peerfs-workspace`, a peerfs process of the run's own serves the workspace to the VM as a
 vhost-user-fs device in place of `virtiofsd`, so what the command changes lands in the
-workspace's history, where `peerfs ws snapshot` and `ws commit` take it. The runtime asks
-`peerfs` (`--peerfs` or `PEERSPAN_PEERFS`) to serve the workspace at the run's socket and to stop
-when the VM exits; peerfs starts a server for the space if none runs, and that server must be
-able to create the socket in the run's directory, as it can as root. It is opt-in because the
-peerfs server is not confined per VM as `virtiofsd` is (see Confinement). `--archive` takes a
-workspace directory only, and `serve` does not offer peerfs workspaces yet.
+workspace's history, where `peerfs ws snapshot` and `ws commit` take it. The runtime starts the
+space's peerfs server if none runs, then runs `peerfs ws vhost-user` (`--peerfs` or
+`PEERSPAN_PEERFS`) in the run's cgroup. That process borrows the workspace from the server,
+which refuses other changes to it until the run ends, and confines itself before serving the
+guest (see Confinement). A workspace serves one run at a time. `--archive` takes a workspace
+directory only, and `serve` does not offer peerfs workspaces yet.
 
 ## `serve`
 
@@ -180,11 +180,12 @@ namespace where that user is root:
 
 `serve` gives each workspace it creates to the run's own user.
 
-A peerfs workspace is served by the space's peerfs server, which is not confined this way: it
-serves every VM given one of its space's workspaces, and holds all of the space's workspaces and
-its signing key. peerfs never reaches outside its own store, but a fault in how it handles a
-guest's requests would expose the whole space, where a fault in `virtiofsd` exposes one
-workspace. Confining it per VM comes before peerfs workspaces become the default.
+A peerfs workspace's server confines itself the same way before it reads anything the guest
+sends: new user, mount, network, IPC and UTS namespaces; a root holding only the space's objects,
+read-only, and the run's workspace; one capability, to override permissions on its own user's
+files; and a seccomp allow-list. A fault in it exposes that workspace and the space's stored
+history, which never holds peerfs's secret-class files, but not the space's other workspaces or
+its signing key.
 
 ### Limits
 
