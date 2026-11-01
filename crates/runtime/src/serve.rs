@@ -102,6 +102,13 @@ pub struct ServeArgs {
     workspace_mib: u32,
     #[arg(long, default_value_t = 1)]
     max_concurrent_runs: usize,
+    /// A peerfs space whose workspaces runs may name instead of an archive, served by a
+    /// confined peerfs process of each run's own [default: none, so runs may not].
+    #[arg(long, env = "PEERFS_SPACE")]
+    peerfs_space: Option<PathBuf>,
+    /// The peerfs binary, for `--peerfs-space`.
+    #[arg(long, env = "PEERSPAN_PEERFS", default_value = "peerfs")]
+    peerfs: PathBuf,
 }
 
 /// `POST /v1/runs`.
@@ -118,6 +125,10 @@ struct RunRequest {
     /// What the guest may reach; none when the request does not say.
     #[serde(default = "no_network")]
     network: Level,
+    /// A workspace of the `--peerfs-space` to serve at `/workspace`, in place of an archive;
+    /// what the command changes lands in the workspace's history. Not in the contract yet.
+    #[serde(default)]
+    peerfs_workspace: Option<String>,
 }
 
 fn no_network() -> Level {
@@ -241,6 +252,13 @@ pub fn serve(args: ServeArgs) -> anyhow::Result<()> {
             ("workspace_mib", &args.workspace_mib),
             ("io_mibps", &args.io_mibps),
             ("io_iops", &args.io_iops),
+            (
+                "peerfs_space",
+                &args
+                    .peerfs_space
+                    .as_ref()
+                    .map_or_else(|| "none".into(), |space| space.display().to_string()),
+            ),
         ],
     );
     let runtime = Arc::new(Runtime {
@@ -357,6 +375,9 @@ fn start(runtime: &Arc<Runtime>, body: &[u8]) -> (u16, Value) {
     {
         return error(422, "too_large", "resources exceed this runtime's maximums");
     }
+    if request.peerfs_workspace.is_some() && args.peerfs_space.is_none() {
+        return error(400, "invalid", "this runtime serves no peerfs space");
+    }
     if request.network > args.max_network {
         return error(
             422,
@@ -411,6 +432,10 @@ fn start(runtime: &Arc<Runtime>, body: &[u8]) -> (u16, Value) {
             ("network", &request.network),
             ("results", &results),
             ("archive", &request.workspace_archive.is_some()),
+            (
+                "peerfs_workspace",
+                &request.peerfs_workspace.as_deref().unwrap_or("none"),
+            ),
         ],
     );
 
@@ -458,18 +483,53 @@ fn validate(request: &RunRequest) -> Result<(), String> {
             archive.display()
         ));
     }
+    if let Some(name) = &request.peerfs_workspace {
+        if name.is_empty()
+            || name.len() > 255
+            || name == "."
+            || name == ".."
+            || name.contains(['/', '\0'])
+        {
+            return Err("peerfs_workspace must be a workspace's name".into());
+        }
+        if request.workspace_archive.is_some() {
+            return Err("a run takes workspace_archive or peerfs_workspace, not both".into());
+        }
+        // Without an archive the guest would report every file as changed; the workspace's
+        // history holds what the command changed.
+        if request.results == Results::Changes {
+            return Err("results changes is not available with peerfs_workspace".into());
+        }
+    }
     Ok(())
 }
 
 /// Runs one VM and records its events; the run's thread.
 fn execute(runtime: &Runtime, run: &Run) {
     let request = &run.request;
-    let (outcome, results) = match prepare(run, runtime.args.workspace_mib) {
+    let peerfs = request
+        .peerfs_workspace
+        .as_ref()
+        .map(|name| vm::PeerfsWorkspace {
+            peerfs: runtime.args.peerfs.clone(),
+            space: runtime
+                .args
+                .peerfs_space
+                .clone()
+                .expect("checked when the run was accepted"),
+            name: name.clone(),
+        });
+    let (outcome, results) = match prepare(run, runtime.args.workspace_mib, peerfs.is_none()) {
         Err(e) => (failed(run, &e), None),
         // The workspace's file system goes at the end of this arm, before the run is finished.
         Ok((workspace, _disk, mut results)) => {
+            let workspace = match (peerfs, workspace) {
+                (Some(peerfs), _) => vm::Workspace::Peerfs(peerfs),
+                (None, Some(dir)) => vm::Workspace::Directory(dir),
+                (None, None) => unreachable!("prepare makes a directory without peerfs"),
+            };
             let spec = VmSpec {
-                workspace: vm::Workspace::Directory(workspace),
+                workspace,
                 own_workspace: true,
                 stdin: None,
                 rootfs: runtime.image.as_ref().map(|i| i.rootfs.clone()),
@@ -650,12 +710,24 @@ fn failed(run: &Run, e: &anyhow::Error) -> Outcome {
     }
 }
 
-fn prepare(run: &Run, workspace_mib: u32) -> anyhow::Result<(PathBuf, WorkspaceDisk, ResultFiles)> {
+/// Makes the run's directory and result files, and, with `directory`, its workspace: a
+/// directory on a file system of its own.
+fn prepare(
+    run: &Run,
+    workspace_mib: u32,
+    directory: bool,
+) -> anyhow::Result<(Option<PathBuf>, Option<WorkspaceDisk>, ResultFiles)> {
     let _ = fs::remove_dir_all(&run.dir);
     fs::DirBuilder::new().mode(0o711).create(&run.dir)?;
-    let workspace = run.dir.join("workspace");
-    fs::DirBuilder::new().mode(0o700).create(&workspace)?;
-    let disk = WorkspaceDisk::create(&run.dir.join(crate::disk::IMAGE), &workspace, workspace_mib)?;
+    let (workspace, disk) = if directory {
+        let workspace = run.dir.join("workspace");
+        fs::DirBuilder::new().mode(0o700).create(&workspace)?;
+        let disk =
+            WorkspaceDisk::create(&run.dir.join(crate::disk::IMAGE), &workspace, workspace_mib)?;
+        (Some(workspace), Some(disk))
+    } else {
+        (None, None)
+    };
     let results_dir = run.dir.join("results");
     fs::DirBuilder::new().mode(0o700).create(&results_dir)?;
     Ok((

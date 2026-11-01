@@ -242,6 +242,51 @@ def main():
             outputs.append(b"".join(base64.b64decode(e["data"]) for e in events
                                     if e["kind"] == "stdout"))
         check("concurrent", outputs == [b"10\n", b"11\n", b"12\n"], outputs)
+
+        # A peerfs workspace is refused unless serve names a space.
+        status, _ = call(sock, "POST", "/v1/runs",
+                         {**request(20, ["true"]), "peerfs_workspace": "agent"})
+        check("peerfs-no-space", status == 400, status)
+
+        # With PEERSPAN_PEERFS naming a peerfs binary: a run on a workspace of the space reads
+        # its branch's files and its writes land in the workspace. It takes no archive and gives
+        # no changes, which the workspace's history holds.
+        peerfs = os.environ.get("PEERSPAN_PEERFS")
+        if peerfs:
+            space = os.path.join(work, "peerfs-space")
+            src = os.path.join(work, "peerfs-src")
+            os.mkdir(src)
+            open(os.path.join(src, "a.txt"), "w").write("branch\n")
+
+            def pf(*argv):
+                return subprocess.run([peerfs, "--space", space, *argv], check=True,
+                                      capture_output=True, text=True).stdout
+            pf("init")
+            pf("import", src, "-m", "base")
+            pf("ws", "create", "agent")
+            server.kill()
+            server.wait()
+            serve_argv += ["--peerfs-space", space, "--peerfs", peerfs]
+            server = start()
+            try:
+                body = {**request(21, ["sh", "-c", "cat a.txt; echo y > b.txt"]),
+                        "peerfs_workspace": "agent"}
+                status, _ = call(sock, "POST", "/v1/runs", body)
+                events = follow(sock, run_id(21))
+                out = b"".join(base64.b64decode(e["data"]) for e in events
+                               if e["kind"] == "stdout")
+                result = next(e["result"] for e in events if e["kind"] == "exited")
+                check("peerfs-run", status == 201 and result["exit_code"] == 0
+                      and out == b"branch\n" and pf("ws", "read", "agent", "b.txt") == "y\n",
+                      (status, result, out))
+                refused = [call(sock, "POST", "/v1/runs", {**request(n, ["true"], **fields),
+                                                           "peerfs_workspace": name})[0]
+                           for n, name, fields in [(22, "agent", {"results": "changes"}),
+                                                   (23, "agent", {"archive": archive}),
+                                                   (24, "../agent", {})]]
+                check("peerfs-refused", refused == [400, 400, 400], refused)
+            finally:
+                pf("stop")
     finally:
         server.kill()
         server.wait()

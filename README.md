@@ -91,8 +91,8 @@ workspace's history, where `peerfs ws snapshot` and `ws commit` take it. The run
 space's peerfs server if none runs, then runs `peerfs ws vhost-user` (`--peerfs` or
 `PEERSPAN_PEERFS`) in the run's cgroup. That process borrows the workspace from the server,
 which refuses other changes to it until the run ends, and confines itself before serving the
-guest (see Confinement). A workspace serves one run at a time. `--archive` takes a workspace
-directory only, and `serve` does not offer peerfs workspaces yet.
+guest (see Confinement). A workspace serves one run at a time. `--archive` and `--results-dir`
+take a workspace directory only: the workspace's history holds what the command changed.
 
 ## `serve`
 
@@ -108,6 +108,11 @@ last only as long as the `serve` that started them: a restarted `serve` removes 
 one left (run directories, workspaces, cgroups and network rules), and the daemon fails the
 tasks whose runs it no longer knows. `--stdin` and `--combined-output` are not available here yet, since
 the contract has neither.
+
+`serve --peerfs-space DIR` lets a run name a workspace of that space with `peerfs_workspace`
+in place of `workspace_archive`, served as `run --peerfs-workspace` serves it. Such a run
+takes `results` `none` or `output`, and the workspace's size is not capped. The contract has
+no peerfs workspaces yet, so the daemon does not send the field.
 
 `serve` logs to standard error, which the systemd unit sends to the journal, one line per
 event with fields:

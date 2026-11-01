@@ -107,7 +107,7 @@ struct RunArgs {
     /// Instead of a directory, a workspace of a peerfs space (`--peerfs-space`), served by a
     /// confined peerfs process of the run's own, so what the guest changes lands in the
     /// workspace's history. Needs a peerfs that has `ws vhost-user`.
-    #[arg(long, conflicts_with_all = ["workspace", "archive"], requires = "peerfs_space")]
+    #[arg(long, conflicts_with_all = ["workspace", "archive", "results_dir"], requires = "peerfs_space")]
     peerfs_workspace: Option<String>,
     /// The peerfs space holding `--peerfs-workspace`.
     #[arg(long, env = "PEERFS_SPACE")]
