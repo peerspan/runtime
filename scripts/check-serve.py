@@ -302,6 +302,29 @@ def main():
                 check("peerfs-unchanged", status == 201 and result["exit_code"] == 0
                       and result["snapshot"] is None, (status, result))
                 check("peerfs-held", held == 429, held)
+
+                # A deleted run holds its workspace until it has given it back and taken its
+                # snapshot, so the next run has nothing of it to snapshot before its command,
+                # and its own snapshot follows the deleted run's.
+                call(sock, "POST", "/v1/runs", {**request(27, ["sh", "-c", "echo c > c.txt; sleep 60"]),
+                                                "peerfs_workspace": "agent"})
+                time.sleep(3)
+                call(sock, "DELETE", f"/v1/runs/{run_id(27)}")
+                body = {**request(28, ["sh", "-c", "echo d > d.txt"]), "peerfs_workspace": "agent"}
+                first, _ = call(sock, "POST", "/v1/runs", body)
+                status = first
+                for _ in range(60):
+                    if status != 429:
+                        break
+                    time.sleep(0.5)
+                    status, _ = call(sock, "POST", "/v1/runs", body)
+                follow(sock, run_id(28))
+                messages = [line.split(": ", 1)[1] for line in
+                            pf("ws", "snapshots", "agent").splitlines()[:2]]
+                check("peerfs-held-after-delete", first == 429 and status == 201
+                      and messages == ["After a peerspan-runtime run: exit 0",
+                                       "After a peerspan-runtime run: signal 9"],
+                      (first, status, messages))
                 refused = [call(sock, "POST", "/v1/runs", {**request(n, ["true"], **fields),
                                                            "peerfs_workspace": name})[0]
                            for n, name, fields in [(22, "agent", {"results": "changes"}),

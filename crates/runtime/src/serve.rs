@@ -6,7 +6,7 @@
 //!
 //! Runs live in memory; a restarted runtime knows none of them, and the daemon fails their tasks.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -158,6 +158,9 @@ struct Runtime {
     /// The image every run boots, resolved at startup.
     image: Option<crate::image::Image>,
     runs: Mutex<HashMap<String, Arc<Run>>>,
+    /// The peerfs workspaces runs hold, from acceptance until the run has given the workspace
+    /// back and snapshotted it, even if it is deleted meanwhile. Locked after `runs`.
+    held: Mutex<HashSet<String>>,
 }
 
 struct Run {
@@ -267,6 +270,7 @@ pub fn serve(args: ServeArgs) -> anyhow::Result<()> {
         libkrun,
         image,
         runs: Mutex::new(HashMap::new()),
+        held: Mutex::new(HashSet::new()),
     });
     for request in server.incoming_requests() {
         let runtime = Arc::clone(&runtime);
@@ -407,10 +411,11 @@ fn start(runtime: &Arc<Runtime>, body: &[u8]) -> (u16, Value) {
     }
     // Runs on one peerfs workspace take turns.
     if let Some(name) = &request.peerfs_workspace
-        && runs.values().any(|run| {
-            run.request.peerfs_workspace.as_ref() == Some(name)
-                && !run.log.lock().expect("run log lock poisoned").finished
-        })
+        && !runtime
+            .held
+            .lock()
+            .expect("held lock poisoned")
+            .insert(name.clone())
     {
         return error(429, "busy", "another run holds the peerfs workspace");
     }
@@ -591,6 +596,14 @@ fn execute(runtime: &Runtime, run: &Run) {
             (outcome, Some(results))
         }
     };
+    // The workspace is given back and snapshotted, so the next run on it may start.
+    if let Some(name) = &request.peerfs_workspace {
+        runtime
+            .held
+            .lock()
+            .expect("held lock poisoned")
+            .remove(name);
+    }
     let (stdout_bytes, stderr_bytes) = results
         .as_ref()
         .map_or((0, 0), |r| (r.stdout_bytes, r.stderr_bytes));
