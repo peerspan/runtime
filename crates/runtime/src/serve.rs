@@ -349,6 +349,7 @@ fn runtime_info(runtime: &Runtime) -> Value {
         "max_seconds": args.max_seconds,
         "max_concurrent_runs": args.max_concurrent_runs,
         "running": running(runtime),
+        "peerfs": args.peerfs_space.is_some(),
     })
 }
 
@@ -376,7 +377,7 @@ fn start(runtime: &Arc<Runtime>, body: &[u8]) -> (u16, Value) {
         return error(422, "too_large", "resources exceed this runtime's maximums");
     }
     if request.peerfs_workspace.is_some() && args.peerfs_space.is_none() {
-        return error(400, "invalid", "this runtime serves no peerfs space");
+        return error(422, "unavailable", "this runtime serves no peerfs space");
     }
     if request.network > args.max_network {
         return error(
@@ -403,6 +404,15 @@ fn start(runtime: &Arc<Runtime>, body: &[u8]) -> (u16, Value) {
         .count();
     if busy >= args.max_concurrent_runs {
         return error(429, "busy", "every run slot is in use");
+    }
+    // Runs on one peerfs workspace take turns.
+    if let Some(name) = &request.peerfs_workspace
+        && runs.values().any(|run| {
+            run.request.peerfs_workspace.as_ref() == Some(name)
+                && !run.log.lock().expect("run log lock poisoned").finished
+        })
+    {
+        return error(429, "busy", "another run holds the peerfs workspace");
     }
     let run = Arc::new(Run {
         dir: args.state.join("runs").join(&request.run_id),
@@ -594,6 +604,7 @@ fn execute(runtime: &Runtime, run: &Run) {
             "stdout_bytes": stdout_bytes,
             "stderr_bytes": stderr_bytes,
             "error": outcome.error,
+            "snapshot": outcome.snapshot,
         },
     }));
     log_finished(run, &outcome, stdout_bytes, stderr_bytes);
@@ -621,6 +632,9 @@ fn log_finished(run: &Run, outcome: &Outcome, stdout_bytes: u64, stderr_bytes: u
     }
     if let Some(error) = &outcome.error {
         fields.push(("error", error.clone()));
+    }
+    if let Some(snapshot) = &outcome.snapshot {
+        fields.push(("snapshot", snapshot.clone()));
     }
     fields.push(("duration_ms", outcome.duration.as_millis().to_string()));
     if !outcome.metrics.connect.is_zero() {

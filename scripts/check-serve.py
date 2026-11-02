@@ -98,7 +98,8 @@ def main():
     server = start()
     try:
         status, info = call(sock, "GET", "/v1/runtime")
-        check("runtime", status == 200 and info["max_cpus"] == 2 and info["running"] == 0, info)
+        check("runtime", status == 200 and info["max_cpus"] == 2 and info["running"] == 0
+              and info["peerfs"] is False, info)
 
         archive = os.path.join(work, "ws.tar")
         with tarfile.open(archive, "w") as t:
@@ -246,11 +247,13 @@ def main():
         # A peerfs workspace is refused unless serve names a space.
         status, _ = call(sock, "POST", "/v1/runs",
                          {**request(20, ["true"]), "peerfs_workspace": "agent"})
-        check("peerfs-no-space", status == 400, status)
+        check("peerfs-no-space", status == 422, status)
 
         # With PEERSPAN_PEERFS naming a peerfs binary: a run on a workspace of the space reads
-        # its branch's files and its writes land in the workspace. It takes no archive and gives
-        # no changes, which the workspace's history holds.
+        # its branch's files and its writes land in the workspace, and its result names the
+        # snapshot taken after it, which holds only what it changed: a change made before the
+        # run is in the snapshot before. It takes no archive and gives no changes, which the
+        # workspace's history holds, and runs on one workspace take turns.
         peerfs = os.environ.get("PEERSPAN_PEERFS")
         if peerfs:
             space = os.path.join(work, "peerfs-space")
@@ -264,6 +267,8 @@ def main():
             pf("init")
             pf("import", src, "-m", "base")
             pf("ws", "create", "agent")
+            subprocess.run([peerfs, "--space", space, "ws", "write", "agent", "early.txt"],
+                           input="before\n", text=True, check=True)
             server.kill()
             server.wait()
             serve_argv += ["--peerfs-space", space, "--peerfs", peerfs]
@@ -276,9 +281,27 @@ def main():
                 out = b"".join(base64.b64decode(e["data"]) for e in events
                                if e["kind"] == "stdout")
                 result = next(e["result"] for e in events if e["kind"] == "exited")
+                snapshots = pf("ws", "snapshots", "agent").splitlines()
                 check("peerfs-run", status == 201 and result["exit_code"] == 0
-                      and out == b"branch\n" and pf("ws", "read", "agent", "b.txt") == "y\n",
-                      (status, result, out))
+                      and out == b"branch\n" and pf("ws", "read", "agent", "b.txt") == "y\n"
+                      and re.fullmatch(r"[0-9a-f]{66}", result["snapshot"] or "")
+                      and snapshots[0].startswith(result["snapshot"] + " ")
+                      and snapshots[0].endswith(": After a peerspan-runtime run: exit 0")
+                      and snapshots[1].endswith(": Before a peerspan-runtime run"),
+                      (status, result, out, snapshots))
+                info = call(sock, "GET", "/v1/runtime")[1]
+                check("peerfs-reported", info["peerfs"] is True, info)
+
+                # A run that changes nothing has no snapshot; one on a held workspace waits.
+                status, _ = call(sock, "POST", "/v1/runs",
+                                 {**request(25, ["sleep", "3"]), "peerfs_workspace": "agent"})
+                held, _ = call(sock, "POST", "/v1/runs",
+                               {**request(26, ["true"]), "peerfs_workspace": "agent"})
+                events = follow(sock, run_id(25))
+                result = next(e["result"] for e in events if e["kind"] == "exited")
+                check("peerfs-unchanged", status == 201 and result["exit_code"] == 0
+                      and result["snapshot"] is None, (status, result))
+                check("peerfs-held", held == 429, held)
                 refused = [call(sock, "POST", "/v1/runs", {**request(n, ["true"], **fields),
                                                            "peerfs_workspace": name})[0]
                            for n, name, fields in [(22, "agent", {"results": "changes"}),
