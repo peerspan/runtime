@@ -138,6 +138,8 @@ pub struct Outcome {
     pub duration: Duration,
     /// Why the run failed outside the command, if it did.
     pub error: Option<String>,
+    /// For a peerfs workspace, the snapshot taken after the command, if it changed anything.
+    pub snapshot: Option<String>,
     /// How long setup took and how much memory the run used.
     pub metrics: Metrics,
 }
@@ -397,6 +399,19 @@ pub fn run(
     }
     mark("vm_exited");
     let progress = progress.into_inner().expect("lock poisoned");
+    if let Workspace::Peerfs(peerfs) = &options.workspace {
+        // Waits for the workspace to be given back.
+        drop(server);
+        if progress.started.is_some() {
+            match snapshot(peerfs, &after_message(&outcome)) {
+                Ok(id) => outcome.snapshot = id,
+                Err(e) => {
+                    outcome.error.get_or_insert_with(|| format!("{e:#}"));
+                }
+            }
+            mark("snapshot");
+        }
+    }
     if shut_down {
         // Every writer has exited, so this reads to the end without blocking.
         let mut text = String::new();
@@ -912,6 +927,8 @@ fn start_peerfs(
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+    // So the snapshot after the command holds only what the run changed.
+    snapshot(workspace, "Before a peerspan-runtime run")?;
     let (log, log_writer) = CappedLog::create(&run_dir.path.join("peerfs.log"), SERVER_LOG_LIMIT)?;
     let mut command = peerfs_command(&workspace.peerfs, &workspace.space);
     join_cgroup(&mut command, cgroup);
@@ -951,6 +968,43 @@ fn start_peerfs(
         name: workspace.name.clone(),
     };
     Ok(WorkspaceServer::Peerfs(server))
+}
+
+/// Snapshots `workspace` with `message`, returning the snapshot, or `None` when nothing changed
+/// since its last. Retried for a moment: a workspace server that was killed rather than exiting
+/// is given back only once the space's server sees its connection close.
+fn snapshot(workspace: &PeerfsWorkspace, message: &str) -> anyhow::Result<Option<String>> {
+    let deadline = Instant::now() + PEERFS_EXIT_WAIT;
+    loop {
+        let output = peerfs_command(&workspace.peerfs, &workspace.space)
+            .args(["ws", "snapshot", &workspace.name, "-m", message])
+            .args(["--agent", "peerspan-runtime"])
+            .output()
+            .with_context(|| format!("starting {}", workspace.peerfs.display()))?;
+        if output.status.success() {
+            let id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            return Ok(Some(id).filter(|id| !id.is_empty()));
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "peerfs could not snapshot workspace {}: {}",
+                workspace.name,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// The message of the snapshot after a run: how the command ended.
+fn after_message(outcome: &Outcome) -> String {
+    let ended = match (outcome.exit_code, outcome.signal) {
+        _ if outcome.timed_out => "timed out".to_owned(),
+        (Some(code), _) => format!("exit {code}"),
+        (None, Some(signal)) => format!("signal {signal}"),
+        (None, None) => "failed".to_owned(),
+    };
+    format!("After a peerspan-runtime run: {ended}")
 }
 
 /// `peerfs` run for the space at `space`.
