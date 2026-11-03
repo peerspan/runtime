@@ -38,6 +38,9 @@ const CHUNK: usize = 16 * 1024;
 const ARTIFACT_LIMIT: u64 = 100 * 1024 * 1024;
 /// Longest wait a client may ask for on the events route.
 const MAX_WAIT: Duration = Duration::from_secs(25);
+/// The most events one events answer may be asked to hold (`limit`); without `limit` it holds
+/// every event after the cursor.
+const MAX_EVENTS_LIMIT: usize = 1000;
 
 #[derive(Debug, Args)]
 pub struct ServeArgs {
@@ -913,9 +916,16 @@ fn events(runtime: &Runtime, id: &str, query: &str) -> (u16, Value) {
     };
     let mut after = 0usize;
     let mut wait = Duration::ZERO;
+    let mut limit = usize::MAX;
     for pair in query.split('&').filter(|pair| !pair.is_empty()) {
         let parsed = match pair.split_once('=') {
             Some(("after", value)) => value.parse().map(|v| after = v).is_ok(),
+            Some(("limit", value)) => value
+                .parse()
+                .ok()
+                .filter(|v| (1..=MAX_EVENTS_LIMIT).contains(v))
+                .map(|v| limit = v)
+                .is_some(),
             Some(("wait", value)) => value
                 .parse::<u64>()
                 .ok()
@@ -943,7 +953,7 @@ fn events(runtime: &Runtime, id: &str, query: &str) -> (u16, Value) {
     }
     (
         200,
-        Value::Array(log.events.get(after..).unwrap_or_default().to_vec()),
+        Value::Array(log.events.iter().skip(after).take(limit).cloned().collect()),
     )
 }
 

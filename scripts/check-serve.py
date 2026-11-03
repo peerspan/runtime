@@ -127,6 +127,10 @@ def main():
         check("events", kinds[0] == "started" and kinds[-2:] == ["exited", "results"]
               and [e["sequence"] for e in events] == list(range(1, len(events) + 1)), kinds)
         check("output", out == b"from the archive\n" and err == b"hi\n", (out, err))
+        status, page = call(sock, "GET", f"/v1/runs/{run_id(1)}/events?after=1&limit=2")
+        refused = [call(sock, "GET", f"/v1/runs/{run_id(1)}/events?limit={n}")[0] for n in (0, 1001)]
+        check("events-limit", status == 200 and page == events[1:3] and refused == [400, 400],
+              (status, page, refused))
         check("result", result["exit_code"] == 0 and result["signal"] is None
               and not result["timed_out"] and result["stdout_bytes"] == 17 and result["error"] is None,
               result)
