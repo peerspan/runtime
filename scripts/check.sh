@@ -399,6 +399,29 @@ left=$(nft list table inet peerspan_runtime | grep -c -e 'chain run-' -e '"peers
 
 # A supervisor killed outright: its run's processes die with it, and the next run removes the
 # cgroup, network filter and run directory it left.
+# A secret is a file only root can read, in the guest's memory: it never reaches the workspace or
+# the console log. A harness directory is mounted read-only and its programs run.
+printf 'sk-check-secret' > "$work/secret"
+mkdir -p "$work/harness"
+printf '#!/bin/sh\necho harness-ran\n' > "$work/harness/tool"
+chmod 755 "$work/harness" "$work/harness/tool"
+rc=0
+"$bin" run --workspace "$work/ws" --console-log "$work/console-secret.log" \
+  --secret api_key="$work/secret" --harness "$work/harness" -- sh -c '
+    stat -c "%a %U" /run/secrets/api_key; cat /run/secrets/api_key; echo
+    /opt/peerspan/harness/tool
+    touch /opt/peerspan/harness/x 2>/dev/null && echo harness-writable; true' \
+  > "$work/out" 2> "$work/err" || rc=$?
+if [ "$rc" -ne 0 ]; then
+  fail "secret-harness: exit $rc"; sed 's/^/    stderr: /' "$work/err" | tail -5
+elif [ "$(cat "$work/out")" != "$(printf '400 root\nsk-check-secret\nharness-ran')" ]; then
+  fail "secret-harness: got $(tr '\n' '|' < "$work/out")"
+elif grep -rqF sk-check-secret "$work/ws" "$work/console-secret.log" "$work/err"; then
+  fail "secret-harness: the secret leaked outside the guest"
+else
+  pass secret-harness
+fi
+
 ls -d /sys/fs/cgroup/peerspan-runtime/run-* > "$work/runs-before" 2>/dev/null || true
 "$bin" run --network internet --workspace "$work/ws" -- sleep 60 > /dev/null 2>&1 &
 supervisor=$!

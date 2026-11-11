@@ -24,6 +24,34 @@ pub const WORKSPACE_TAG: &str = "workspace";
 /// Where the workspace is mounted inside the guest's root filesystem.
 pub const WORKSPACE_PATH: &str = "/workspace";
 
+/// virtio-fs tag of the read-only harness directory, such as an agent tool's binary.
+pub const HARNESS_TAG: &str = "harness";
+
+/// Where the harness directory is mounted, read-only, inside the guest's root filesystem.
+pub const HARNESS_PATH: &str = "/opt/peerspan/harness";
+
+/// The in-memory directory inside the guest where [`Command::secrets`] are written, each as a
+/// file readable only by root. It is outside the workspace, so secrets never reach its history.
+pub const SECRETS_PATH: &str = "/run/secrets";
+
+/// Most secrets one command may carry.
+pub const MAX_SECRETS: usize = 16;
+
+/// Largest value of one secret, in bytes.
+pub const MAX_SECRET_BYTES: usize = 64 * 1024;
+
+/// Whether `name` may name a secret: 1 to 64 ASCII letters, digits, `_`, `-` or `.`, and not
+/// `.` or `..`, so that it is one file name under [`SECRETS_PATH`].
+#[must_use]
+pub fn is_valid_secret_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
 /// The guest's network, when it has one: a fixed address on a /24 behind the host's user-mode
 /// network, with the gateway and DNS server the host serves. Fixed addresses keep DHCP off the
 /// boot path; every VM has its own network, so they never clash.
@@ -59,6 +87,24 @@ const TAG_STDIN_END: u8 = 13;
 /// Largest chunk of archive or changes data a writer puts in one frame.
 pub const DATA_CHUNK: usize = 64 * 1024;
 
+/// A named secret for the guest, such as a model provider's API key. Its value never appears in
+/// `Debug` output, so logging a command cannot leak it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret {
+    /// The file name under [`SECRETS_PATH`]; see [`is_valid_secret_name`].
+    pub name: String,
+    pub value: Vec<u8>,
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Secret")
+            .field("name", &self.name)
+            .field("value", &format_args!("<{} bytes>", self.value.len()))
+            .finish()
+    }
+}
+
 /// A command for the guest to run.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Command {
@@ -68,6 +114,8 @@ pub struct Command {
     pub cwd: String,
     /// The complete environment, as name and value pairs.
     pub env: Vec<(String, String)>,
+    /// Files to write under [`SECRETS_PATH`] before the command starts.
+    pub secrets: Vec<Secret>,
     /// Whether a workspace archive follows, to unpack into the empty workspace first.
     pub archive: bool,
     /// Whether to send the files the command changed relative to the archive.
@@ -80,6 +128,8 @@ pub struct Command {
     /// Whether standard error goes to standard output, as with `2>&1`, so that one stream
     /// keeps the order in which the command wrote to the two.
     pub combined_output: bool,
+    /// Whether a harness directory is attached, to mount read-only at [`HARNESS_PATH`].
+    pub harness: bool,
 }
 
 /// One frame on the guest's stream.
@@ -273,11 +323,17 @@ fn encode_command(command: &Command) -> Vec<u8> {
         put_str(&mut out, name);
         put_str(&mut out, value);
     }
+    put_count(&mut out, command.secrets.len());
+    for secret in &command.secrets {
+        put_str(&mut out, &secret.name);
+        put_bytes(&mut out, &secret.value);
+    }
     out.push(u8::from(command.archive));
     out.push(u8::from(command.collect_changes));
     out.push(u8::from(command.network));
     out.push(u8::from(command.stdin));
     out.push(u8::from(command.combined_output));
+    out.push(u8::from(command.harness));
     out
 }
 
@@ -292,8 +348,33 @@ fn decode_command(payload: &[u8]) -> io::Result<Command> {
     let env = (0..envc)
         .map(|_| Ok((cursor.string()?, cursor.string()?)))
         .collect::<io::Result<Vec<_>>>()?;
-    let [archive, collect_changes, network, stdin, combined_output] = *cursor.rest else {
-        return Err(invalid("command flags are not 5 bytes"));
+    let secretc = cursor.count()?;
+    if secretc > MAX_SECRETS {
+        return Err(invalid("too many secrets"));
+    }
+    let secrets = (0..secretc)
+        .map(|_| {
+            let name = cursor.string()?;
+            if !is_valid_secret_name(&name) {
+                return Err(invalid("invalid secret name"));
+            }
+            let value = cursor.bytes()?;
+            if value.len() > MAX_SECRET_BYTES {
+                return Err(invalid("secret too large"));
+            }
+            Ok(Secret { name, value })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let [
+        archive,
+        collect_changes,
+        network,
+        stdin,
+        combined_output,
+        harness,
+    ] = *cursor.rest
+    else {
+        return Err(invalid("command flags are not 6 bytes"));
     };
     let flag = |b: u8| match b {
         0 => Ok(false),
@@ -304,11 +385,13 @@ fn decode_command(payload: &[u8]) -> io::Result<Command> {
         argv,
         cwd,
         env,
+        secrets,
         archive: flag(archive)?,
         collect_changes: flag(collect_changes)?,
         network: flag(network)?,
         stdin: flag(stdin)?,
         combined_output: flag(combined_output)?,
+        harness: flag(harness)?,
     })
 }
 
@@ -318,8 +401,12 @@ fn put_count(out: &mut Vec<u8>, count: usize) {
 }
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
-    put_count(out, s.len());
-    out.extend_from_slice(s.as_bytes());
+    put_bytes(out, s.as_bytes());
+}
+
+fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    put_count(out, bytes.len());
+    out.extend_from_slice(bytes);
 }
 
 struct Cursor<'buf> {
@@ -345,14 +432,18 @@ impl Cursor<'_> {
         Ok(u64::from_be_bytes(*head))
     }
 
-    fn string(&mut self) -> io::Result<String> {
+    fn bytes(&mut self) -> io::Result<Vec<u8>> {
         let len = self.count()?;
         if len > self.rest.len() {
             return Err(invalid("truncated command"));
         }
         let (bytes, rest) = self.rest.split_at(len);
         self.rest = rest;
-        String::from_utf8(bytes.to_vec()).map_err(|_| invalid("command string is not UTF-8"))
+        Ok(bytes.to_vec())
+    }
+
+    fn string(&mut self) -> io::Result<String> {
+        String::from_utf8(self.bytes()?).map_err(|_| invalid("command string is not UTF-8"))
     }
 }
 
@@ -381,11 +472,22 @@ mod tests {
                     ("PATH".into(), "/bin".into()),
                     ("EMPTY".into(), String::new()),
                 ],
+                secrets: vec![
+                    Secret {
+                        name: "openai_api_key".into(),
+                        value: b"sk-test".to_vec(),
+                    },
+                    Secret {
+                        name: "empty".into(),
+                        value: Vec::new(),
+                    },
+                ],
                 archive: true,
                 collect_changes: true,
                 network: true,
                 stdin: true,
                 combined_output: true,
+                harness: true,
             }),
             Message::Run(Command::default()),
             Message::Stdout(b"out\n".to_vec()),
@@ -450,6 +552,45 @@ mod tests {
 
         let unknown = [99u8, 0, 0, 0, 0];
         let err = Message::read_from(&mut unknown.as_slice()).expect_err("unknown tag");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn secret_values_stay_out_of_debug_output() {
+        let command = Command {
+            secrets: vec![Secret {
+                name: "key".into(),
+                value: b"sk-very-secret".to_vec(),
+            }],
+            ..Command::default()
+        };
+        let shown = format!("{:?}", Message::Run(command));
+        assert!(!shown.contains("sk-very-secret"), "{shown}");
+        assert!(shown.contains("<14 bytes>"), "{shown}");
+    }
+
+    #[test]
+    fn secret_names_are_single_file_names() {
+        for good in ["openai_api_key", "a", "key.v2", "x-y"] {
+            assert!(is_valid_secret_name(good), "{good}");
+        }
+        for bad in ["", ".", "..", "a/b", "../x", "sp ace", "ü", &"k".repeat(65)] {
+            assert!(!is_valid_secret_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_bad_secret_name_is_rejected() {
+        let mut payload = Vec::new();
+        put_count(&mut payload, 1);
+        put_str(&mut payload, "true");
+        put_str(&mut payload, "/");
+        put_count(&mut payload, 0);
+        put_count(&mut payload, 1);
+        put_str(&mut payload, "../escape");
+        put_bytes(&mut payload, b"x");
+        payload.extend_from_slice(&[0; 6]);
+        let err = decode_command(&payload).expect_err("bad name");
         assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
