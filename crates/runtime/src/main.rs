@@ -188,6 +188,15 @@ struct RunArgs {
     /// Environment variables for the command, as NAME=VALUE.
     #[arg(long = "env", value_name = "NAME=VALUE", value_parser = parse_env)]
     env: Vec<(String, String)>,
+    /// A secret for the command, read from FILE and written in the guest to
+    /// /run/secrets/NAME, readable only by root and never in the workspace. Values are taken
+    /// from files so they stay out of the process list and the shell's history.
+    #[arg(long = "secret", value_name = "NAME=FILE", value_parser = parse_secret)]
+    secrets: Vec<(String, PathBuf)>,
+    /// A host directory to mount read-only in the guest at /opt/peerspan/harness, such as an
+    /// agent tool's binary. The VM's own user must be able to read it.
+    #[arg(long)]
+    harness: Option<PathBuf>,
     /// Pass this program's standard input to the command; without it the command's is empty.
     #[arg(long)]
     stdin: bool,
@@ -198,6 +207,46 @@ struct RunArgs {
     /// The command and its arguments.
     #[arg(last = true, required = true)]
     command: Vec<String>,
+}
+
+fn parse_secret(s: &str) -> Result<(String, PathBuf), String> {
+    let (name, file) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected NAME=FILE, got {s:?}"))?;
+    if !peerspan_runtime_protocol::is_valid_secret_name(name) {
+        return Err(format!(
+            "secret name {name:?} must be 1 to 64 letters, digits, '_', '-' or '.'"
+        ));
+    }
+    Ok((name.to_owned(), PathBuf::from(file)))
+}
+
+/// Reads each secret's file, refusing more secrets, or larger ones, than the guest accepts.
+fn read_secrets(
+    secrets: &[(String, PathBuf)],
+) -> anyhow::Result<Vec<peerspan_runtime_protocol::Secret>> {
+    use peerspan_runtime_protocol::{MAX_SECRET_BYTES, MAX_SECRETS, Secret};
+    if secrets.len() > MAX_SECRETS {
+        bail!("at most {MAX_SECRETS} secrets");
+    }
+    let mut names = std::collections::HashSet::new();
+    secrets
+        .iter()
+        .map(|(name, file)| {
+            if !names.insert(name) {
+                bail!("secret {name} given twice");
+            }
+            let value = std::fs::read(file)
+                .with_context(|| format!("reading secret {name} from {}", file.display()))?;
+            if value.len() > MAX_SECRET_BYTES {
+                bail!("secret {name} is over {MAX_SECRET_BYTES} bytes");
+            }
+            Ok(Secret {
+                name: name.clone(),
+                value,
+            })
+        })
+        .collect()
 }
 
 fn parse_env(s: &str) -> Result<(String, String), String> {
@@ -322,6 +371,7 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
         workspace,
         own_workspace: false,
         rootfs,
+        harness: args.harness,
         stdin: if args.stdin {
             Some(File::from(io::stdin().as_fd().try_clone_to_owned()?))
         } else {
@@ -350,11 +400,13 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
             argv: args.command,
             cwd: args.cwd,
             env: image::merge_env(image_env, args.env),
+            secrets: read_secrets(&args.secrets)?,
             archive: false,
             collect_changes,
             network: false,
             stdin: false,
             combined_output: args.combined_output,
+            harness: false,
         },
     };
     let mut stdout = io::stdout().lock();

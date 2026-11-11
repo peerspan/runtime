@@ -4,6 +4,7 @@
 //! Runs one command in one microVM: serves the workspace, starts the launcher, hands the
 //! command and the workspace archive to the guest, and reports what happens as [`Event`]s.
 
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read};
 use std::net::Shutdown;
@@ -70,6 +71,9 @@ pub struct VmSpec {
     pub guest: PathBuf,
     /// A root filesystem to boot instead of the guest image's own, such as a pulled image's.
     pub rootfs: Option<PathBuf>,
+    /// A host directory the guest mounts read-only at the protocol's harness path, such as an
+    /// agent tool's binary. The VM's own user must be able to read it.
+    pub harness: Option<PathBuf>,
     pub libkrun: PathBuf,
     pub virtiofsd: PathBuf,
     /// The passt binary that carries the guest's network traffic.
@@ -324,6 +328,12 @@ pub fn run(
             .arg(&guest.rootfs)
             .arg("--sockets")
             .arg(&sockets)
+            .args(
+                options
+                    .harness
+                    .iter()
+                    .flat_map(|dir| [OsStr::new("--harness"), dir.as_os_str()]),
+            )
             .arg("--jail")
             .arg(&jail)
             .arg("--uid")
@@ -526,6 +536,7 @@ fn converse(
     let mut command = spec.command.clone();
     command.archive = spec.archive.is_some();
     command.network = spec.network > Level::None;
+    command.harness = spec.harness.is_some();
     command.stdin = spec.stdin.is_some();
     Message::Run(command)
         .write_to(stream)

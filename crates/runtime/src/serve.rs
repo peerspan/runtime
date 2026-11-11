@@ -551,6 +551,8 @@ fn execute(runtime: &Runtime, run: &Run) {
                 own_workspace: true,
                 stdin: None,
                 rootfs: runtime.image.as_ref().map(|i| i.rootfs.clone()),
+                // The contract has no harness or secrets yet (runtime.md decision 6).
+                harness: None,
                 archive: request.workspace_archive.clone(),
                 guest: runtime.guest.clone(),
                 libkrun: runtime.libkrun.clone(),
@@ -583,12 +585,14 @@ fn execute(runtime: &Runtime, run: &Run) {
                             .map_or_else(Vec::new, |i| i.env.clone()),
                         request.env.clone(),
                     ),
+                    secrets: Vec::new(),
                     archive: false,
                     collect_changes: request.results == Results::Changes,
                     network: false,
                     // The contract has no standard input and keeps the two streams apart.
                     stdin: false,
                     combined_output: false,
+                    harness: false,
                 },
             };
             if let Some(image) = &runtime.image {

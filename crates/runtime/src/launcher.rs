@@ -8,7 +8,7 @@ use std::convert::Infallible;
 use std::path::PathBuf;
 
 use clap::Args;
-use peerspan_runtime_protocol::{AGENT_PORT, ROOTFS_TAG, WORKSPACE_TAG};
+use peerspan_runtime_protocol::{AGENT_PORT, HARNESS_TAG, ROOTFS_TAG, WORKSPACE_TAG};
 
 use crate::jail::{self, Jail};
 use crate::krun::{Libkrun, VmConfig};
@@ -35,6 +35,9 @@ pub struct LaunchArgs {
     /// Directory holding the workspace and agent sockets.
     #[arg(long)]
     pub sockets: PathBuf,
+    /// Directory to share read-only with the guest at its harness path.
+    #[arg(long)]
+    pub harness: Option<PathBuf>,
     /// Empty directory to build the jail in.
     #[arg(long)]
     pub jail: PathBuf,
@@ -75,6 +78,7 @@ pub fn launch(args: &LaunchArgs) -> anyhow::Result<Infallible> {
         kernel: &args.kernel,
         initrd: &args.initrd,
         sockets: &args.sockets,
+        harness: args.harness.as_deref(),
         uid: args.uid,
         gid: args.gid,
     }
@@ -99,6 +103,10 @@ pub fn launch(args: &LaunchArgs) -> anyhow::Result<Infallible> {
             rootfs_dir: jail::ROOTFS,
             workspace_tag: WORKSPACE_TAG,
             workspace_socket: &workspace_socket,
+            harness: args
+                .harness
+                .is_some()
+                .then_some((HARNESS_TAG, jail::HARNESS)),
             agent_port: AGENT_PORT,
             agent_socket: &agent_socket,
             net_fd: args.net_fd,

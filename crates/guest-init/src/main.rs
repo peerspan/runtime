@@ -21,7 +21,7 @@ use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, PipeReader, Read, Write};
 use std::os::fd::{AsRawFd, IntoRawFd};
-use std::os::unix::fs as unix_fs;
+use std::os::unix::fs::{self as unix_fs, DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{self, ChildStdin, Stdio};
@@ -30,7 +30,8 @@ use std::thread;
 use std::time::Duration;
 
 use peerspan_runtime_protocol::{
-    AGENT_PORT, Command, Message, ROOTFS_TAG, WORKSPACE_PATH, WORKSPACE_TAG,
+    AGENT_PORT, Command, HARNESS_PATH, HARNESS_TAG, Message, ROOTFS_TAG, SECRETS_PATH, Secret,
+    WORKSPACE_PATH, WORKSPACE_TAG, is_valid_secret_name,
 };
 use rustix::fs::{Mode, OFlags};
 use rustix::mount::MountFlags;
@@ -179,6 +180,14 @@ fn run(mut phases: Phases) -> io::Result<()> {
             )));
         }
     };
+    if command.harness
+        && let Err(e) = mount_harness()
+    {
+        return fail(&mut reader, &format!("mounting the harness: {e}"));
+    }
+    if let Err(e) = write_secrets(&command.secrets) {
+        return fail(&mut reader, &format!("writing secrets: {e}"));
+    }
     if command.network {
         if let Err(e) = net::configure() {
             return fail(&mut reader, &format!("setting up the network: {e}"));
@@ -209,6 +218,42 @@ fn run(mut phases: Phases) -> io::Result<()> {
         workspace::send_changes(workspace, &manifest, &mut *stream)?;
     }
     Message::Exited { code, signal }.write_to(&mut *stream)
+}
+
+/// Mounts the harness directory read-only at [`HARNESS_PATH`], in the writable root layer.
+fn mount_harness() -> io::Result<()> {
+    fs::create_dir_all(HARNESS_PATH)?;
+    mount(
+        HARNESS_TAG,
+        HARNESS_PATH,
+        "virtiofs",
+        MountFlags::RDONLY | MountFlags::NOSUID | MountFlags::NODEV,
+    )
+}
+
+/// Writes each secret to its own file under [`SECRETS_PATH`], which is on the in-memory `/run`,
+/// readable only by root. Nothing is written for a command without secrets.
+fn write_secrets(secrets: &[Secret]) -> io::Result<()> {
+    if secrets.is_empty() {
+        return Ok(());
+    }
+    fs::DirBuilder::new().mode(0o700).create(SECRETS_PATH)?;
+    for secret in secrets {
+        // The protocol checks names on decoding; checking again keeps a path out of this join.
+        if !is_valid_secret_name(&secret.name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid secret name",
+            ));
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o400)
+            .open(format!("{SECRETS_PATH}/{}", secret.name))?;
+        file.write_all(&secret.value)?;
+    }
+    Ok(())
 }
 
 /// Reports a run that failed before its command started.

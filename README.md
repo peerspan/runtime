@@ -80,6 +80,8 @@ exits with its code.
 | `--cpus`, `--memory-mib` | VM size (default 2 vCPUs, 1024 MiB) |
 | `--io-mibps`, `--io-iops` | Disk I/O caps (default 256 MiB/s, 10,000 IOPS) |
 | `--cwd`, `--env NAME=VALUE` | Working directory and environment |
+| `--secret NAME=FILE` | Write FILE's contents in the guest to `/run/secrets/NAME`, in memory and readable only by root; repeatable, up to 16 of 64 KiB each. Never in the workspace, its history or the logs |
+| `--harness DIR` | Mount DIR read-only at `/opt/peerspan/harness`, for a tool the image lacks, such as an agent's static binary; the VM's own user must be able to read it |
 
 Exit codes: the command's own, 128 + N if a signal ended it, 124 on timeout, 127 if it never
 ran. Archives may hold only directories, files and symbolic links, with no absolute paths or

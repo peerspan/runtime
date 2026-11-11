@@ -32,6 +32,7 @@ pub const ROOTFS: &str = "/rootfs";
 pub const KERNEL: &str = "/vmlinux";
 pub const INITRD: &str = "/initramfs";
 pub const SOCKETS: &str = "/sockets";
+pub const HARNESS: &str = "/harness";
 const KVM: &str = "/dev/kvm";
 const PROC: &str = "/proc";
 
@@ -45,6 +46,8 @@ pub struct Jail<'cfg> {
     pub initrd: &'cfg Path,
     /// The directory holding the workspace and agent sockets.
     pub sockets: &'cfg Path,
+    /// A directory to share read-only with the guest, if any.
+    pub harness: Option<&'cfg Path>,
     pub uid: u32,
     pub gid: u32,
 }
@@ -96,6 +99,9 @@ impl Jail<'_> {
         bind(self.rootfs, &inside(root, ROOTFS), read_only)?;
         bind(self.kernel, &inside(root, KERNEL), read_only)?;
         bind(self.initrd, &inside(root, INITRD), read_only)?;
+        if let Some(harness) = self.harness {
+            bind(harness, &inside(root, HARNESS), read_only)?;
+        }
         bind(
             self.sockets,
             &inside(root, SOCKETS),

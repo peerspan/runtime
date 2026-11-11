@@ -117,6 +117,8 @@ pub struct VmConfig<'cfg> {
     pub rootfs_dir: &'cfg str,
     pub workspace_tag: &'cfg str,
     pub workspace_socket: &'cfg str,
+    /// A directory shared read-only under its tag, such as an agent tool's binary.
+    pub harness: Option<(&'cfg str, &'cfg str)>,
     pub agent_port: u32,
     pub agent_socket: &'cfg str,
     /// A connected stream socket to passt, handed to libkrun; no network device without one.
@@ -211,6 +213,12 @@ impl Libkrun {
                 &mut err,
             );
             (api.mmio_device_manager_add)(devices, api.handle(workspace, &mut err, "workspace")?);
+
+            if let Some((tag, dir)) = config.harness {
+                let harness =
+                    (api.fs_device_new_read_only)(KrunStr::new(tag), KrunStr::new(dir), &mut err);
+                (api.mmio_device_manager_add)(devices, api.handle(harness, &mut err, "harness")?);
+            }
 
             // No TSI: the guest reaches the host only through the mapped Unix socket.
             let vsock = api.handle(
