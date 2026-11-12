@@ -454,6 +454,21 @@ def main():
                 bad = call(sock, "POST", "/v1/runs", {**request(45, ["true"]),
                                                       "image": "UPPER CASE"})[0]
                 check("run-image-refused", bad == 400, bad)
+                # A pull that stalls (a registry that never answers) is cancellable: the run ends
+                # at once, with signal 9 and no `started`, and frees its slot for the next run.
+                call(sock, "POST", "/v1/runs", {**request(46, ["true"]),
+                                                "image": "10.255.255.1:5000/stalls:1"})
+                time.sleep(2)
+                started = time.time()
+                call(sock, "POST", f"/v1/runs/{run_id(46)}/cancel")
+                events = follow(sock, run_id(46))
+                took = time.time() - started
+                result = next(e["result"] for e in events if e["kind"] == "exited")
+                after, _ = call(sock, "POST", "/v1/runs", {**request(47, ["true"])})
+                follow(sock, run_id(47))
+                check("run-image-pull-cancelled", result["signal"] == 9 and took < 5
+                      and not any(e["kind"] == "started" for e in events) and after == 201,
+                      (result, took, after))
             finally:
                 pf("stop")
     finally:

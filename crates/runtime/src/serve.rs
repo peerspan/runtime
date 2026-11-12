@@ -654,6 +654,32 @@ struct RunInputs {
     image: Option<crate::image::Image>,
 }
 
+/// The run's own image, pulled if the cache lacks it. A pull can take long or stall at the
+/// registry, so it runs on a thread of its own while this one watches for cancellation: a
+/// cancelled run ends now and gives back its slot and workspace, and the pull finishes in the
+/// background, leaving the image cached.
+fn fetch_image(run: &Run, cache: &Path, name: &str) -> anyhow::Result<crate::image::Image> {
+    let reference = crate::image::Reference::parse(name)?;
+    let (send, receive) = std::sync::mpsc::channel();
+    let cache = cache.to_owned();
+    thread::spawn(move || {
+        let _ = send.send(crate::image::get(&cache, &reference, false));
+    });
+    loop {
+        match receive.recv_timeout(Duration::from_millis(100)) {
+            Ok(image) => return image.with_context(|| format!("image {name}")),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if run.cancel.load(Ordering::Relaxed) {
+                    anyhow::bail!("cancelled while pulling image {name}");
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("pulling image {name} stopped without an answer");
+            }
+        }
+    }
+}
+
 /// What the run takes beyond its request, got now so that one that cannot be had fails the run
 /// before it starts: its image, pulled if the cache lacks it; its secrets, read from their
 /// files; and its standard input, as a file in its directory.
@@ -662,10 +688,7 @@ fn run_inputs(run: &Run, cache: &Path) -> anyhow::Result<RunInputs> {
     // Pulled now, so an image that cannot be had fails the run before it starts.
     let image = match &request.image {
         None => None,
-        Some(name) => Some(
-            crate::image::get(cache, &crate::image::Reference::parse(name)?, false)
-                .with_context(|| format!("image {name}"))?,
-        ),
+        Some(name) => Some(fetch_image(run, cache, name)?),
     };
     let secrets: Vec<(String, PathBuf)> = request
         .secrets
