@@ -335,6 +335,40 @@ def main():
                                                    (23, "agent", {"archive": archive}),
                                                    (24, "../agent", {})]]
                 check("peerfs-refused", refused == [400, 400, 400], refused)
+
+                # A fork (runtime.md decision 6c): a new branch at main's head and a workspace
+                # following it, which the run changes and main does not see. Forking onto a
+                # workspace that exists fails the run and leaves that workspace alone, and a
+                # fork needs a workspace name and a branch name.
+                body = {**request(29, ["sh", "-c", "cat a.txt; echo f > f.txt"]),
+                        "peerfs_workspace": "fork.29", "peerfs_fork_from": "main"}
+                status, _ = call(sock, "POST", "/v1/runs", body)
+                events = follow(sock, run_id(29))
+                out = b"".join(base64.b64decode(e["data"]) for e in events
+                               if e["kind"] == "stdout")
+                result = next(e["result"] for e in events if e["kind"] == "exited")
+                branches = pf("branches")
+                check("peerfs-fork", status == 201 and result["exit_code"] == 0
+                      and out == b"branch\n" and pf("ws", "read", "fork.29", "f.txt") == "f\n"
+                      and result["snapshot"] and " fork.29\n" in branches
+                      and "fork.29 fork.29 " in pf("ws", "list"),
+                      (status, result, out, branches))
+                before = pf("ws", "snapshots", "agent")
+                body = {**request(30, ["sh", "-c", "echo z > z.txt"]),
+                        "peerfs_workspace": "agent", "peerfs_fork_from": "main"}
+                status, _ = call(sock, "POST", "/v1/runs", body)
+                events = follow(sock, run_id(30))
+                result = next(e["result"] for e in events if e["kind"] == "exited")
+                check("peerfs-fork-exists", status == 201 and result["exit_code"] is None
+                      and "exists already" in (result.get("error") or "")
+                      and pf("ws", "snapshots", "agent") == before
+                      and " agent\n" not in pf("branches"),
+                      (status, result))
+                refused = [call(sock, "POST", "/v1/runs", {**request(n, ["true"]), **fields})[0]
+                           for n, fields in [(31, {"peerfs_fork_from": "main"}),
+                                             (32, {"peerfs_workspace": "fork.32",
+                                                   "peerfs_fork_from": "a/b"})]]
+                check("peerfs-fork-refused", refused == [400, 400], refused)
             finally:
                 pf("stop")
     finally:

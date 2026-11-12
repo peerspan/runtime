@@ -132,6 +132,10 @@ struct RunRequest {
     /// what the command changes lands in the workspace's history. Not in the contract yet.
     #[serde(default)]
     peerfs_workspace: Option<String>,
+    /// Create `peerfs_workspace` first, as a fork of this branch (runtime.md decision 6c). The
+    /// run fails, touching nothing, if the workspace or its branch exists already.
+    #[serde(default)]
+    peerfs_fork_from: Option<String>,
 }
 
 fn no_network() -> Level {
@@ -454,6 +458,10 @@ fn start(runtime: &Arc<Runtime>, body: &[u8]) -> (u16, Value) {
                 "peerfs_workspace",
                 &request.peerfs_workspace.as_deref().unwrap_or("none"),
             ),
+            (
+                "peerfs_fork_from",
+                &request.peerfs_fork_from.as_deref().unwrap_or("none"),
+            ),
         ],
     );
 
@@ -501,13 +509,16 @@ fn validate(request: &RunRequest) -> Result<(), String> {
             archive.display()
         ));
     }
+    if let Some(from) = &request.peerfs_fork_from {
+        if !is_peerfs_name(from) {
+            return Err("peerfs_fork_from must be a branch's name".into());
+        }
+        if request.peerfs_workspace.is_none() {
+            return Err("peerfs_fork_from needs peerfs_workspace, the fork's name".into());
+        }
+    }
     if let Some(name) = &request.peerfs_workspace {
-        if name.is_empty()
-            || name.len() > 255
-            || name == "."
-            || name == ".."
-            || name.contains(['/', '\0'])
-        {
+        if !is_peerfs_name(name) {
             return Err("peerfs_workspace must be a workspace's name".into());
         }
         if request.workspace_archive.is_some() {
@@ -520,6 +531,15 @@ fn validate(request: &RunRequest) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Whether `name` can name a peerfs branch or workspace: one path component.
+fn is_peerfs_name(name: &str) -> bool {
+    !(name.is_empty()
+        || name.len() > 255
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\0']))
 }
 
 /// Runs one VM and records its events; the run's thread.
@@ -536,6 +556,7 @@ fn execute(runtime: &Runtime, run: &Run) {
                 .clone()
                 .expect("checked when the run was accepted"),
             name: name.clone(),
+            fork_from: request.peerfs_fork_from.clone(),
         });
     let (outcome, results) = match prepare(run, runtime.args.workspace_mib, peerfs.is_none()) {
         Err(e) => (failed(run, &e), None),
