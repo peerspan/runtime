@@ -136,7 +136,28 @@ struct RunRequest {
     /// run fails, touching nothing, if the workspace or its branch exists already.
     #[serde(default)]
     peerfs_fork_from: Option<String>,
+    /// Standard input for the command, base64; empty without it.
+    #[serde(default)]
+    stdin: Option<String>,
+    /// A host directory the guest mounts read-only at the harness path.
+    #[serde(default)]
+    harness: Option<PathBuf>,
+    /// Secret names and the host files holding them, read when the run starts and given to the
+    /// guest at `/run/secrets/NAME`.
+    #[serde(default)]
+    secrets: BTreeMap<String, PathBuf>,
+    /// The agent recorded on the peerfs workspace's snapshots and commit.
+    #[serde(default)]
+    peerfs_agent: Option<String>,
+    /// Commit the peerfs workspace to its branch after the run, with `peerfs_commit_message`.
+    #[serde(default)]
+    peerfs_commit: bool,
+    #[serde(default)]
+    peerfs_commit_message: Option<String>,
 }
+
+/// Largest standard input a run takes, decoded.
+const MAX_STDIN_BYTES: usize = 65_536;
 
 fn no_network() -> Level {
     Level::None
@@ -361,6 +382,7 @@ fn runtime_info(runtime: &Runtime) -> Value {
         "max_concurrent_runs": args.max_concurrent_runs,
         "running": running(runtime),
         "peerfs": args.peerfs_space.is_some(),
+        "max_network": args.max_network.to_string(),
     })
 }
 
@@ -509,6 +531,62 @@ fn validate(request: &RunRequest) -> Result<(), String> {
             archive.display()
         ));
     }
+    if let Some(stdin) = &request.stdin
+        && BASE64
+            .decode(stdin)
+            .map_or(true, |bytes| bytes.len() > MAX_STDIN_BYTES)
+    {
+        return Err(format!(
+            "stdin must be base64 of at most {MAX_STDIN_BYTES} bytes"
+        ));
+    }
+    if let Some(dir) = &request.harness
+        && !dir.is_absolute()
+    {
+        return Err("harness must be an absolute path".into());
+    }
+    if request.secrets.len() > peerspan_runtime_protocol::MAX_SECRETS {
+        return Err(format!(
+            "at most {} secrets",
+            peerspan_runtime_protocol::MAX_SECRETS
+        ));
+    }
+    for (name, path) in &request.secrets {
+        if !peerspan_runtime_protocol::is_valid_secret_name(name) {
+            return Err(format!("secret name {name:?} is invalid"));
+        }
+        if !path.is_absolute() {
+            return Err(format!("secret {name} must be an absolute path"));
+        }
+    }
+    let peerfs_only = [
+        ("peerfs_agent", request.peerfs_agent.is_some()),
+        ("peerfs_commit", request.peerfs_commit),
+        (
+            "peerfs_commit_message",
+            request.peerfs_commit_message.is_some(),
+        ),
+    ];
+    if request.peerfs_workspace.is_none()
+        && let Some((field, _)) = peerfs_only.iter().find(|(_, set)| *set)
+    {
+        return Err(format!("{field} needs peerfs_workspace"));
+    }
+    if let Some(agent) = &request.peerfs_agent
+        && !is_agent_name(agent)
+    {
+        return Err("peerfs_agent must be an addressable agent name".into());
+    }
+    match (&request.peerfs_commit, &request.peerfs_commit_message) {
+        (true, None) => return Err("peerfs_commit needs peerfs_commit_message".into()),
+        (false, Some(_)) => {
+            return Err("peerfs_commit_message needs peerfs_commit true".into());
+        }
+        (_, Some(message)) if message.is_empty() || message.len() > 4096 => {
+            return Err("peerfs_commit_message must be 1 to 4,096 bytes".into());
+        }
+        _ => {}
+    }
     if let Some(from) = &request.peerfs_fork_from {
         if !is_peerfs_name(from) {
             return Err("peerfs_fork_from must be a branch's name".into());
@@ -533,6 +611,19 @@ fn validate(request: &RunRequest) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `name` is an addressable agent name: 1 to 64 characters of lowercase ASCII letters,
+/// digits, `.`, `_` and `-`, starting with a letter or digit.
+fn is_agent_name(name: &str) -> bool {
+    name.len() <= 64
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+}
+
 /// Whether `name` can name a peerfs branch or workspace: one path component.
 fn is_peerfs_name(name: &str) -> bool {
     !(name.is_empty()
@@ -540,6 +631,29 @@ fn is_peerfs_name(name: &str) -> bool {
         || name == "."
         || name == ".."
         || name.contains(['/', '\0']))
+}
+
+/// The run's standard input, as a file in its directory, and its secrets, read from their files
+/// now so that one that cannot be read fails the run before it starts.
+fn run_inputs(run: &Run) -> anyhow::Result<(Option<File>, Vec<peerspan_runtime_protocol::Secret>)> {
+    let request = &run.request;
+    let secrets: Vec<(String, PathBuf)> = request
+        .secrets
+        .iter()
+        .map(|(name, path)| (name.clone(), path.clone()))
+        .collect();
+    let secrets = vm::read_secrets(&secrets)?;
+    let stdin = match &request.stdin {
+        None => None,
+        Some(data) => {
+            let bytes = BASE64.decode(data).context("decoding stdin")?;
+            fs::create_dir_all(&run.dir)?;
+            let path = run.dir.join("stdin");
+            fs::write(&path, bytes).context("writing stdin")?;
+            Some(File::open(&path)?)
+        }
+    };
+    Ok((stdin, secrets))
 }
 
 /// Runs one VM and records its events; the run's thread.
@@ -557,11 +671,22 @@ fn execute(runtime: &Runtime, run: &Run) {
                 .expect("checked when the run was accepted"),
             name: name.clone(),
             fork_from: request.peerfs_fork_from.clone(),
+            agent: request
+                .peerfs_agent
+                .clone()
+                .unwrap_or_else(|| vm::DEFAULT_PEERFS_AGENT.to_owned()),
+            commit_message: request
+                .peerfs_commit
+                .then(|| request.peerfs_commit_message.clone())
+                .flatten(),
         });
-    let (outcome, results) = match prepare(run, runtime.args.workspace_mib, peerfs.is_none()) {
+    let inputs = run_inputs(run);
+    let (outcome, results) = match prepare(run, runtime.args.workspace_mib, peerfs.is_none())
+        .and_then(|prepared| inputs.map(|inputs| (prepared, inputs)))
+    {
         Err(e) => (failed(run, &e), None),
         // The workspace's file system goes at the end of this arm, before the run is finished.
-        Ok((workspace, _disk, mut results)) => {
+        Ok(((workspace, _disk, mut results), (stdin, secrets))) => {
             let workspace = match (peerfs, workspace) {
                 (Some(peerfs), _) => vm::Workspace::Peerfs(peerfs),
                 (None, Some(dir)) => vm::Workspace::Directory(dir),
@@ -570,10 +695,9 @@ fn execute(runtime: &Runtime, run: &Run) {
             let spec = VmSpec {
                 workspace,
                 own_workspace: true,
-                stdin: None,
+                stdin,
                 rootfs: runtime.image.as_ref().map(|i| i.rootfs.clone()),
-                // The contract has no harness or secrets yet (runtime.md decision 6).
-                harness: None,
+                harness: request.harness.clone(),
                 archive: request.workspace_archive.clone(),
                 guest: runtime.guest.clone(),
                 libkrun: runtime.libkrun.clone(),
@@ -606,7 +730,7 @@ fn execute(runtime: &Runtime, run: &Run) {
                             .map_or_else(Vec::new, |i| i.env.clone()),
                         request.env.clone(),
                     ),
-                    secrets: Vec::new(),
+                    secrets,
                     archive: false,
                     collect_changes: request.results == Results::Changes,
                     network: false,
@@ -646,6 +770,7 @@ fn execute(runtime: &Runtime, run: &Run) {
             "stderr_bytes": stderr_bytes,
             "error": outcome.error,
             "snapshot": outcome.snapshot,
+            "commit": outcome.commit,
         },
     }));
     log_finished(run, &outcome, stdout_bytes, stderr_bytes);

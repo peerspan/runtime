@@ -114,6 +114,13 @@ struct RunArgs {
     /// branch or the workspace exists already.
     #[arg(long, requires = "peerfs_workspace")]
     fork_from: Option<String>,
+    /// The agent recorded on the run's snapshots and commit [default: peerspan-runtime].
+    #[arg(long, requires = "peerfs_workspace")]
+    peerfs_agent: Option<String>,
+    /// After the run, commit `--peerfs-workspace` to its branch with this message, unless the
+    /// run's last snapshot failed.
+    #[arg(long, value_name = "MESSAGE", requires = "peerfs_workspace")]
+    commit: Option<String>,
     /// The peerfs space holding `--peerfs-workspace`.
     #[arg(long, env = "PEERFS_SPACE")]
     peerfs_space: Option<PathBuf>,
@@ -224,34 +231,6 @@ fn parse_secret(s: &str) -> Result<(String, PathBuf), String> {
         ));
     }
     Ok((name.to_owned(), PathBuf::from(file)))
-}
-
-/// Reads each secret's file, refusing more secrets, or larger ones, than the guest accepts.
-fn read_secrets(
-    secrets: &[(String, PathBuf)],
-) -> anyhow::Result<Vec<peerspan_runtime_protocol::Secret>> {
-    use peerspan_runtime_protocol::{MAX_SECRET_BYTES, MAX_SECRETS, Secret};
-    if secrets.len() > MAX_SECRETS {
-        bail!("at most {MAX_SECRETS} secrets");
-    }
-    let mut names = std::collections::HashSet::new();
-    secrets
-        .iter()
-        .map(|(name, file)| {
-            if !names.insert(name) {
-                bail!("secret {name} given twice");
-            }
-            let value = std::fs::read(file)
-                .with_context(|| format!("reading secret {name} from {}", file.display()))?;
-            if value.len() > MAX_SECRET_BYTES {
-                bail!("secret {name} is over {MAX_SECRET_BYTES} bytes");
-            }
-            Ok(Secret {
-                name: name.clone(),
-                value,
-            })
-        })
-        .collect()
 }
 
 fn parse_env(s: &str) -> Result<(String, String), String> {
@@ -369,6 +348,10 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
                 .context("--peerfs-workspace needs --peerfs-space")?,
             name,
             fork_from: args.fork_from,
+            agent: args
+                .peerfs_agent
+                .unwrap_or_else(|| vm::DEFAULT_PEERFS_AGENT.to_owned()),
+            commit_message: args.commit,
         }),
         (Some(dir), None) => vm::Workspace::Directory(dir),
         (None, None) => bail!("give --workspace or --peerfs-workspace"),
@@ -406,7 +389,7 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
             argv: args.command,
             cwd: args.cwd,
             env: image::merge_env(image_env, args.env),
-            secrets: read_secrets(&args.secrets)?,
+            secrets: vm::read_secrets(&args.secrets)?,
             archive: false,
             collect_changes,
             network: false,
@@ -431,6 +414,9 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
     if let Some(path) = &args.metrics {
         let json = metrics_json(&outcome.metrics).to_string() + "\n";
         std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
+    }
+    if let Some(commit) = &outcome.commit {
+        eprintln!("peerspan-runtime: committed {commit}");
     }
     if let Some(error) = &outcome.error {
         eprintln!("peerspan-runtime: {error}");

@@ -230,6 +230,16 @@ if [ -n "${PEERSPAN_PEERFS:-}" ]; then
     && ! "$bin" run --peerfs-workspace agent --fork-from main --peerfs-space "$space" -- true \
       > /dev/null 2>&1 \
     && pass peerfs-fork || fail "peerfs-fork: exit $rc, $(tail -3 "$work/out")"
+  # A commit after the run, recorded with the agent given.
+  rc=0
+  "$bin" run --peerfs-workspace forked2 --fork-from main --peerfs-space "$space" \
+    --peerfs-agent codex --commit 'check commit' -- sh -c 'echo c > c.txt' \
+    > "$work/out" 2>&1 || rc=$?
+  commit=$(sed -n 's/^peerspan-runtime: committed //p' "$work/out")
+  [ "$rc" -eq 0 ] && [ -n "$commit" ] \
+    && pf log --branch forked2 | grep -q "$commit" \
+    && pf log --branch forked2 | grep -q 'check commit' \
+    && pass peerfs-commit || fail "peerfs-commit: exit $rc, $(tail -3 "$work/out")"
   pf stop > /dev/null
 fi
 

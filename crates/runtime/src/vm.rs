@@ -119,7 +119,14 @@ pub struct PeerfsWorkspace {
     /// branch's head, and a workspace `name` following it. Refused if either exists already, so
     /// a fork never runs on someone else's work.
     pub fork_from: Option<String>,
+    /// The agent recorded on the run's snapshots and commit.
+    pub agent: String,
+    /// With a message, commit the workspace to its branch once the run has been snapshotted.
+    pub commit_message: Option<String>,
 }
+
+/// The agent recorded on a peerfs workspace's snapshots when the caller names none.
+pub const DEFAULT_PEERFS_AGENT: &str = "peerspan-runtime";
 
 /// Something the run reported.
 #[derive(Debug)]
@@ -148,6 +155,9 @@ pub struct Outcome {
     pub error: Option<String>,
     /// For a peerfs workspace, the snapshot taken after the command, if it changed anything.
     pub snapshot: Option<String>,
+    /// For a peerfs workspace committed after the run, the commit, if there was anything to
+    /// commit.
+    pub commit: Option<String>,
     /// How long setup took and how much memory the run used.
     pub metrics: Metrics,
 }
@@ -424,6 +434,17 @@ pub fn run(
                 }
             }
             mark("snapshot");
+            // A workspace whose last snapshot failed is not committed: the commit would hold
+            // changes nobody snapshotted.
+            if let Some(message) = &peerfs.commit_message
+                && outcome.error.is_none()
+            {
+                match commit(peerfs, message) {
+                    Ok(id) => outcome.commit = id,
+                    Err(e) => outcome.error = Some(format!("{e:#}")),
+                }
+                mark("commit");
+            }
         }
     }
     if shut_down {
@@ -1006,7 +1027,7 @@ fn fork(workspace: &PeerfsWorkspace, from: &str, list: &str) -> anyhow::Result<(
     ] {
         let output = peerfs_command(&workspace.peerfs, &workspace.space)
             .args(args)
-            .args(["--agent", "peerspan-runtime"])
+            .args(["--agent", &workspace.agent])
             .output()
             .with_context(|| format!("starting {}", workspace.peerfs.display()))?;
         if !output.status.success() {
@@ -1019,6 +1040,54 @@ fn fork(workspace: &PeerfsWorkspace, from: &str, list: &str) -> anyhow::Result<(
     Ok(())
 }
 
+/// Commits `workspace` to its branch with `message`, returning the commit, or `None` when
+/// there was nothing to commit.
+fn commit(workspace: &PeerfsWorkspace, message: &str) -> anyhow::Result<Option<String>> {
+    let output = peerfs_command(&workspace.peerfs, &workspace.space)
+        .args(["ws", "commit", &workspace.name, "-m", message])
+        .args(["--agent", &workspace.agent])
+        .output()
+        .with_context(|| format!("starting {}", workspace.peerfs.display()))?;
+    if !output.status.success() {
+        bail!(
+            "peerfs could not commit workspace {}: {}",
+            workspace.name,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    // `nothing to commit` when the workspace has no changes.
+    Ok(Some(id).filter(|id| id.len() == 66 && id.bytes().all(|b| b.is_ascii_hexdigit())))
+}
+
+/// Reads each secret's file, refusing more secrets, or larger ones, than the guest accepts.
+pub fn read_secrets(
+    secrets: &[(String, PathBuf)],
+) -> anyhow::Result<Vec<peerspan_runtime_protocol::Secret>> {
+    use peerspan_runtime_protocol::{MAX_SECRET_BYTES, MAX_SECRETS, Secret};
+    if secrets.len() > MAX_SECRETS {
+        bail!("at most {MAX_SECRETS} secrets");
+    }
+    let mut names = std::collections::HashSet::new();
+    secrets
+        .iter()
+        .map(|(name, file)| {
+            if !names.insert(name) {
+                bail!("secret {name} given twice");
+            }
+            let value = fs::read(file)
+                .with_context(|| format!("reading secret {name} from {}", file.display()))?;
+            if value.len() > MAX_SECRET_BYTES {
+                bail!("secret {name} is over {MAX_SECRET_BYTES} bytes");
+            }
+            Ok(Secret {
+                name: name.clone(),
+                value,
+            })
+        })
+        .collect()
+}
+
 /// Snapshots `workspace` with `message`, returning the snapshot, or `None` when nothing changed
 /// since its last. Retried for a moment: a workspace server that was killed rather than exiting
 /// is given back only once the space's server sees its connection close.
@@ -1027,7 +1096,7 @@ fn snapshot(workspace: &PeerfsWorkspace, message: &str) -> anyhow::Result<Option
     loop {
         let output = peerfs_command(&workspace.peerfs, &workspace.space)
             .args(["ws", "snapshot", &workspace.name, "-m", message])
-            .args(["--agent", "peerspan-runtime"])
+            .args(["--agent", &workspace.agent])
             .output()
             .with_context(|| format!("starting {}", workspace.peerfs.display()))?;
         if output.status.success() {

@@ -70,6 +70,8 @@ exits with its code.
 | `--workspace DIR` | The directory to mount at `/workspace` |
 | `--peerfs-workspace NAME` | Instead, a peerfs workspace, from the space `--peerfs-space` (or `PEERFS_SPACE`); see below |
 | `--fork-from BRANCH` | Create `--peerfs-workspace` first, as a fork of BRANCH; see below |
+| `--peerfs-agent NAME` | The agent recorded on the peerfs workspace's snapshots and commit (default `peerspan-runtime`) |
+| `--commit MESSAGE` | After the run, commit the peerfs workspace to its branch, and print `peerspan-runtime: committed ID` to stderr |
 | `--image REF` | OCI image to boot, such as `node:22` (default: a minimal Alpine); see Images |
 | `--pull` | Pull the image again, to update its tag |
 | `--archive FILE` | Unpack a tar or tar.gz into an empty workspace first |
@@ -129,6 +131,19 @@ task contract's peerfs workspaces specify:
 - `peerfs_fork_from`, a branch, creates `peerfs_workspace` first as a fork of it, as
   `run --fork-from` does. A workspace or branch of that name already there fails the run, with
   the reason in its result's `error`.
+- `peerfs_agent` names the agent recorded on the snapshots and commit. `peerfs_commit` true,
+  with `peerfs_commit_message`, commits the workspace once the run has been snapshotted. The
+  `exited` result gains `commit`: the commit, or null when nothing changed, the run never
+  started, or a snapshot or the commit failed (with `error` set).
+
+For runtime agents (the host's runtime agent contract), a run also takes:
+- `stdin`, base64 of at most 64 KiB, as the command's standard input;
+- `harness`, a host directory mounted read-only at `/opt/peerspan/harness`, as `run --harness`;
+- `secrets`, `{NAME: PATH}`, files read when the run starts and given to the guest as
+  `run --secret` does. A file that cannot be read fails the run before it starts. The contents
+  never appear in the run's files, events or logs.
+
+`GET /v1/runtime` reports `max_network`.
 - The workspace's size is not capped.
 
 `serve` logs to standard error, which the systemd unit sends to the journal, one line per
