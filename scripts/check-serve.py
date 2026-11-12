@@ -369,6 +369,69 @@ def main():
                                              (32, {"peerfs_workspace": "fork.32",
                                                    "peerfs_fork_from": "a/b"})]]
                 check("peerfs-fork-refused", refused == [400, 400], refused)
+
+                # A runtime agent's run (runtime-agent-contract.md): the prompt on stdin, a
+                # secret, a read-only harness, a fork attributed to the agent and committed.
+                # The secret reaches the guest but never the workspace, its history or events.
+                harness = os.path.join(work, "harness")
+                os.makedirs(harness, exist_ok=True)
+                with open(os.path.join(harness, "agent"), "w") as f:
+                    f.write("#!/bin/sh\nread -r prompt\necho \"$prompt\" > answer.txt\n"
+                            "stat -c %a /run/secrets/key\necho \"did: $prompt\"\n")
+                os.chmod(harness, 0o755)
+                os.chmod(os.path.join(harness, "agent"), 0o755)
+                secret = os.path.join(work, "key")
+                open(secret, "w").write("sk-serve-check")
+                body = {**request(33, ["/opt/peerspan/harness/agent"], results="none"),
+                        "stdin": base64.b64encode(b"fix it\n").decode(),
+                        "harness": harness, "secrets": {"key": secret},
+                        "peerfs_workspace": "codex.33", "peerfs_fork_from": "main",
+                        "peerfs_agent": "codex", "peerfs_commit": True,
+                        "peerfs_commit_message": "task 33"}
+                status, _ = call(sock, "POST", "/v1/runs", body)
+                events = follow(sock, run_id(33))
+                out = b"".join(base64.b64decode(e["data"]) for e in events
+                               if e["kind"] == "stdout")
+                result = next(e["result"] for e in events if e["kind"] == "exited")
+                log = pf("log", "--branch", "codex.33")
+                snaps = subprocess.run([peerfs, "--space", space, "ws", "snapshots", "codex.33"],
+                                       capture_output=True, text=True).stdout
+                leaked = "sk-serve-check" in json.dumps(events) + log + snaps
+                check("agent-run", status == 201 and result["exit_code"] == 0
+                      and out == b"400\ndid: fix it\n"
+                      and re.fullmatch(r"[0-9a-f]{66}", result["commit"] or "")
+                      and result["commit"] in log and "task 33" in log
+                      and pf("ws", "read", "codex.33", "answer.txt") == "fix it\n"
+                      and not leaked, (status, result, out, log, leaked))
+                # Nothing changed: no commit. A secret that cannot be read fails the run
+                # before it starts.
+                body = {**request(34, ["true"], results="none"),
+                        "peerfs_workspace": "codex.34", "peerfs_fork_from": "main",
+                        "peerfs_commit": True, "peerfs_commit_message": "task 34"}
+                call(sock, "POST", "/v1/runs", body)
+                result = next(e["result"] for e in follow(sock, run_id(34))
+                              if e["kind"] == "exited")
+                check("agent-no-commit", result["exit_code"] == 0 and result["commit"] is None
+                      and result["error"] is None, result)
+                body = {**request(35, ["true"], results="none"),
+                        "secrets": {"key": os.path.join(work, "missing")}}
+                call(sock, "POST", "/v1/runs", body)
+                events = follow(sock, run_id(35))
+                result = next(e["result"] for e in events if e["kind"] == "exited")
+                check("agent-secret-missing", not any(e["kind"] == "started" for e in events)
+                      and "secret key" in (result["error"] or ""), result)
+                refused = [call(sock, "POST", "/v1/runs", {**request(n, ["true"]), **fields})[0]
+                           for n, fields in [
+                               (36, {"peerfs_commit": True}),
+                               (37, {"peerfs_workspace": "w37", "peerfs_commit": True}),
+                               (38, {"peerfs_workspace": "w38", "peerfs_agent": "Codex"}),
+                               (39, {"stdin": "not base64!"}),
+                               (40, {"stdin": base64.b64encode(b"x" * 65537).decode()}),
+                               (41, {"secrets": {"../key": secret}}),
+                               (42, {"harness": "relative"})]]
+                check("agent-refused", refused == [400] * 7, refused)
+                info = call(sock, "GET", "/v1/runtime")[1]
+                check("max-network", info.get("max_network") == "internet", info)
             finally:
                 pf("stop")
     finally:
