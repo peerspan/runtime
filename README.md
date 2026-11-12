@@ -143,7 +143,12 @@ For runtime agents (the host's runtime agent contract), a run also takes:
   `run --secret` does. A file that cannot be read fails the run before it starts. The contents
   never appear in the run's files, events or logs.
 
-`GET /v1/runtime` reports `max_network`.
+- `image`, an OCI reference booted in place of the runtime's own image (`--image`), pulled into
+  the image cache when the run starts if it is missing. One that cannot be pulled fails the run
+  before it starts; one that does not parse is refused with 400. The run holds the image, so
+  `prune` leaves it alone until the run ends.
+
+`GET /v1/runtime` reports `max_network`, and `images: true`.
 - The workspace's size is not capped.
 
 `serve` logs to standard error, which the systemd unit sends to the journal, one line per

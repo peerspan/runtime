@@ -154,6 +154,10 @@ struct RunRequest {
     peerfs_commit: bool,
     #[serde(default)]
     peerfs_commit_message: Option<String>,
+    /// An OCI image to boot in place of the runtime's own, pulled into the image cache when the
+    /// run starts if it is not there.
+    #[serde(default)]
+    image: Option<String>,
 }
 
 /// Largest standard input a run takes, decoded.
@@ -383,6 +387,7 @@ fn runtime_info(runtime: &Runtime) -> Value {
         "running": running(runtime),
         "peerfs": args.peerfs_space.is_some(),
         "max_network": args.max_network.to_string(),
+        "images": true,
     })
 }
 
@@ -540,6 +545,14 @@ fn validate(request: &RunRequest) -> Result<(), String> {
             "stdin must be base64 of at most {MAX_STDIN_BYTES} bytes"
         ));
     }
+    if let Some(name) = &request.image
+        && (name.is_empty()
+            || name.len() > 1024
+            || !name.bytes().all(|b| b.is_ascii_graphic())
+            || crate::image::Reference::parse(name).is_err())
+    {
+        return Err("image must be an OCI image reference".into());
+    }
     if let Some(dir) = &request.harness
         && !dir.is_absolute()
     {
@@ -633,10 +646,27 @@ fn is_peerfs_name(name: &str) -> bool {
         || name.contains(['/', '\0']))
 }
 
-/// The run's standard input, as a file in its directory, and its secrets, read from their files
-/// now so that one that cannot be read fails the run before it starts.
-fn run_inputs(run: &Run) -> anyhow::Result<(Option<File>, Vec<peerspan_runtime_protocol::Secret>)> {
+/// What a run takes beyond its request: its standard input, its secrets and its image.
+struct RunInputs {
+    stdin: Option<File>,
+    secrets: Vec<peerspan_runtime_protocol::Secret>,
+    /// The run's own image, held (and so kept from `prune`) until the run ends.
+    image: Option<crate::image::Image>,
+}
+
+/// What the run takes beyond its request, got now so that one that cannot be had fails the run
+/// before it starts: its image, pulled if the cache lacks it; its secrets, read from their
+/// files; and its standard input, as a file in its directory.
+fn run_inputs(run: &Run, cache: &Path) -> anyhow::Result<RunInputs> {
     let request = &run.request;
+    // Pulled now, so an image that cannot be had fails the run before it starts.
+    let image = match &request.image {
+        None => None,
+        Some(name) => Some(
+            crate::image::get(cache, &crate::image::Reference::parse(name)?, false)
+                .with_context(|| format!("image {name}"))?,
+        ),
+    };
     let secrets: Vec<(String, PathBuf)> = request
         .secrets
         .iter()
@@ -653,7 +683,11 @@ fn run_inputs(run: &Run) -> anyhow::Result<(Option<File>, Vec<peerspan_runtime_p
             Some(File::open(&path)?)
         }
     };
-    Ok((stdin, secrets))
+    Ok(RunInputs {
+        stdin,
+        secrets,
+        image,
+    })
 }
 
 /// Runs one VM and records its events; the run's thread.
@@ -680,13 +714,19 @@ fn execute(runtime: &Runtime, run: &Run) {
                 .then(|| request.peerfs_commit_message.clone())
                 .flatten(),
         });
-    let inputs = run_inputs(run);
+    let inputs = run_inputs(run, &runtime.args.image_cache);
     let (outcome, results) = match prepare(run, runtime.args.workspace_mib, peerfs.is_none())
         .and_then(|prepared| inputs.map(|inputs| (prepared, inputs)))
     {
         Err(e) => (failed(run, &e), None),
         // The workspace's file system goes at the end of this arm, before the run is finished.
-        Ok(((workspace, _disk, mut results), (stdin, secrets))) => {
+        Ok(((workspace, _disk, mut results), inputs)) => {
+            let RunInputs {
+                stdin,
+                secrets,
+                image: own_image,
+            } = inputs;
+            let image = own_image.as_ref().or(runtime.image.as_ref());
             let workspace = match (peerfs, workspace) {
                 (Some(peerfs), _) => vm::Workspace::Peerfs(peerfs),
                 (None, Some(dir)) => vm::Workspace::Directory(dir),
@@ -696,7 +736,7 @@ fn execute(runtime: &Runtime, run: &Run) {
                 workspace,
                 own_workspace: true,
                 stdin,
-                rootfs: runtime.image.as_ref().map(|i| i.rootfs.clone()),
+                rootfs: image.map(|i| i.rootfs.clone()),
                 harness: request.harness.clone(),
                 archive: request.workspace_archive.clone(),
                 guest: runtime.guest.clone(),
@@ -724,10 +764,7 @@ fn execute(runtime: &Runtime, run: &Run) {
                     argv: request.argv.clone(),
                     cwd: request.cwd.clone(),
                     env: crate::image::merge_env(
-                        runtime
-                            .image
-                            .as_ref()
-                            .map_or_else(Vec::new, |i| i.env.clone()),
+                        image.map_or_else(Vec::new, |i| i.env.clone()),
                         request.env.clone(),
                     ),
                     secrets,
@@ -740,7 +777,7 @@ fn execute(runtime: &Runtime, run: &Run) {
                     harness: false,
                 },
             };
-            if let Some(image) = &runtime.image {
+            if let Some(image) = image {
                 image.mark_used();
             }
             let outcome = vm::run(&spec, &run.cancel, &mut |event| results.record(run, &event))
