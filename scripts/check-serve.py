@@ -432,6 +432,28 @@ def main():
                 check("agent-refused", refused == [400] * 7, refused)
                 info = call(sock, "GET", "/v1/runtime")[1]
                 check("max-network", info.get("max_network") == "internet", info)
+                check("images-reported", info.get("images") is True, info)
+
+                # A run's own image (runtime-agent-contract.md, RUN-12): pulled if missing and
+                # booted in place of the runtime's; one that cannot be pulled fails the run
+                # before it starts; a reference that does not parse is refused.
+                call(sock, "POST", "/v1/runs", {**request(43, ["cat", "/etc/alpine-release"]),
+                                                "image": "alpine:3.20"})
+                events = follow(sock, run_id(43))
+                out = b"".join(base64.b64decode(e["data"]) for e in events
+                               if e["kind"] == "stdout")
+                result = next(e["result"] for e in events if e["kind"] == "exited")
+                check("run-image", result["exit_code"] == 0 and out.startswith(b"3.20"),
+                      (result, out))
+                call(sock, "POST", "/v1/runs", {**request(44, ["true"]),
+                                                "image": "registry.invalid/none/such:1"})
+                events = follow(sock, run_id(44))
+                result = next(e["result"] for e in events if e["kind"] == "exited")
+                check("run-image-unpullable", not any(e["kind"] == "started" for e in events)
+                      and "registry.invalid" in (result["error"] or ""), result)
+                bad = call(sock, "POST", "/v1/runs", {**request(45, ["true"]),
+                                                      "image": "UPPER CASE"})[0]
+                check("run-image-refused", bad == 400, bad)
             finally:
                 pf("stop")
     finally:
