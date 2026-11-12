@@ -65,6 +65,7 @@ impl Jail<'_> {
     ///
     /// Fails if any step fails; the process must then exit rather than boot unconfined.
     pub fn enter(&self) -> anyhow::Result<()> {
+        ensure_single_threaded()?;
         let kvm_gid = fs::metadata(KVM).context("/dev/kvm")?.gid();
 
         // SAFETY: none of these flags unshares anything other code in the process relies on
@@ -134,6 +135,24 @@ impl Jail<'_> {
     }
 }
 
+/// Refuses to go on in a process with other threads. It reads the host's /proc, so it runs
+/// before the jail is built: once the jailed child has called `pivot_root`, the parent, which
+/// shares its mount namespace, sees the jail's /proc, where it has no entry of its own.
+fn ensure_single_threaded() -> anyhow::Result<()> {
+    let threads = fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Threads:"))
+                .and_then(|n| n.trim().parse::<u32>().ok())
+        });
+    if threads != Some(1) {
+        bail!("cannot enter the jail with other threads running ({threads:?})");
+    }
+    Ok(())
+}
+
 /// Forks; the child, the first process of the new PID namespace, returns. The parent drops to
 /// `uid` and `gid` with no groups, waits for the child, and exits with its status.
 fn fork_into_namespace(uid: u32, gid: u32) -> anyhow::Result<()> {
@@ -172,19 +191,9 @@ fn fork_into_namespace(uid: u32, gid: u32) -> anyhow::Result<()> {
 /// it again.
 ///
 /// The system calls change only the calling thread's credentials, unlike the C library's,
-/// which change every thread's; so this refuses to run in a process with other threads.
+/// which change every thread's; so the process must have no other threads, which
+/// [`Jail::enter`] checks before it forks. Both processes after the fork have one thread.
 fn drop_privileges(uid: u32, gid: u32, groups: &[u32]) -> anyhow::Result<()> {
-    let threads = fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| {
-            status
-                .lines()
-                .find_map(|line| line.strip_prefix("Threads:"))
-                .and_then(|n| n.trim().parse::<u32>().ok())
-        });
-    if threads != Some(1) {
-        bail!("cannot drop privileges with other threads running ({threads:?})");
-    }
     let parent = getppid();
     let groups: Vec<Gid> = groups.iter().map(|&g| Gid::from_raw(g)).collect();
     set_thread_groups(&groups).context("setgroups")?;
