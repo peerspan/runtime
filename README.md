@@ -69,6 +69,7 @@ exits with its code.
 | --- | --- |
 | `--workspace DIR` | The directory to mount at `/workspace` |
 | `--peerfs-workspace NAME` | Instead, a peerfs workspace, from the space `--peerfs-space` (or `PEERFS_SPACE`); see below |
+| `--fork-from BRANCH` | Create `--peerfs-workspace` first, as a fork of BRANCH; see below |
 | `--image REF` | OCI image to boot, such as `node:22` (default: a minimal Alpine); see Images |
 | `--pull` | Pull the image again, to update its tag |
 | `--archive FILE` | Unpack a tar or tar.gz into an empty workspace first |
@@ -97,6 +98,12 @@ guest (see Confinement). The runtime snapshots the workspace before the command 
 so `peerfs ws snapshots` lists what each run changed. A workspace serves one run at a time. `--archive` and `--results-dir`
 take a workspace directory only: the workspace's history holds what the command changed.
 
+With `--fork-from BRANCH`, the run first makes a branch named after `--peerfs-workspace` at
+BRANCH's head (`peerfs fork`), then the workspace following it (`peerfs ws create`), so each
+run, such as one agent task, works on a fork of its own and BRANCH is left alone. The run fails
+before the VM starts if the workspace or the branch exists already, so a fork never lands on
+other work. Committing the fork and merging it are left to the caller.
+
 ## `serve`
 
 `serve --socket PATH` is the local API the Peerspan host daemon drives: start a run, follow its
@@ -119,6 +126,9 @@ task contract's peerfs workspaces specify:
 - The run takes `results` `none` or `output`, and its `exited` result gains `snapshot`: the
   snapshot after the command, or null when it changed nothing.
 - Runs on one workspace take turns: while one holds it, another is refused with 429.
+- `peerfs_fork_from`, a branch, creates `peerfs_workspace` first as a fork of it, as
+  `run --fork-from` does. A workspace or branch of that name already there fails the run, with
+  the reason in its result's `error`.
 - The workspace's size is not capped.
 
 `serve` logs to standard error, which the systemd unit sends to the journal, one line per

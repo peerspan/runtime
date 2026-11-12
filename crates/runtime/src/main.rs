@@ -109,6 +109,11 @@ struct RunArgs {
     /// workspace's history. Needs a peerfs that has `ws vhost-user`.
     #[arg(long, conflicts_with_all = ["workspace", "archive", "results_dir"], requires = "peerfs_space")]
     peerfs_workspace: Option<String>,
+    /// Create `--peerfs-workspace` first, as a fork of this branch: a new branch of the
+    /// workspace's name at this branch's head, and the workspace following it. Refused if the
+    /// branch or the workspace exists already.
+    #[arg(long, requires = "peerfs_workspace")]
+    fork_from: Option<String>,
     /// The peerfs space holding `--peerfs-workspace`.
     #[arg(long, env = "PEERFS_SPACE")]
     peerfs_space: Option<PathBuf>,
@@ -363,6 +368,7 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
                 .peerfs_space
                 .context("--peerfs-workspace needs --peerfs-space")?,
             name,
+            fork_from: args.fork_from,
         }),
         (Some(dir), None) => vm::Workspace::Directory(dir),
         (None, None) => bail!("give --workspace or --peerfs-workspace"),

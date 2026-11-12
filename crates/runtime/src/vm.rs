@@ -115,6 +115,10 @@ pub struct PeerfsWorkspace {
     pub space: PathBuf,
     /// The workspace's name.
     pub name: String,
+    /// A branch to fork a new workspace from: the run creates a branch named `name` at this
+    /// branch's head, and a workspace `name` following it. Refused if either exists already, so
+    /// a fork never runs on someone else's work.
+    pub fork_from: Option<String>,
 }
 
 /// Something the run reported.
@@ -938,6 +942,9 @@ fn start_peerfs(
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+    if let Some(from) = &workspace.fork_from {
+        fork(workspace, from, &String::from_utf8_lossy(&output.stdout))?;
+    }
     // So the snapshot after the command holds only what the run changed.
     snapshot(workspace, "Before a peerspan-runtime run")?;
     let (log, log_writer) = CappedLog::create(&run_dir.path.join("peerfs.log"), SERVER_LOG_LIMIT)?;
@@ -979,6 +986,37 @@ fn start_peerfs(
         name: workspace.name.clone(),
     };
     Ok(WorkspaceServer::Peerfs(server))
+}
+
+/// Creates `workspace` as a fork of the branch `from`: a branch of the workspace's name at
+/// `from`'s head, then a workspace following it. `list` is `peerfs ws list`'s output, one
+/// workspace per line, name first; a workspace of that name already there is refused before the
+/// branch is made.
+fn fork(workspace: &PeerfsWorkspace, from: &str, list: &str) -> anyhow::Result<()> {
+    let name = &workspace.name;
+    if list
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some(name))
+    {
+        bail!("peerfs workspace {name} exists already, so it cannot be forked from {from}");
+    }
+    for args in [
+        &["fork", name, "--from", from][..],
+        &["ws", "create", name, "--branch", name],
+    ] {
+        let output = peerfs_command(&workspace.peerfs, &workspace.space)
+            .args(args)
+            .args(["--agent", "peerspan-runtime"])
+            .output()
+            .with_context(|| format!("starting {}", workspace.peerfs.display()))?;
+        if !output.status.success() {
+            bail!(
+                "peerfs could not fork workspace {name} from {from}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Snapshots `workspace` with `message`, returning the snapshot, or `None` when nothing changed

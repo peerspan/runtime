@@ -220,6 +220,16 @@ if [ -n "${PEERSPAN_PEERFS:-}" ]; then
     && [ "$(pf ws read agent runs)" = "$(printf 'run1\nrun2')" ] \
     && [ "$(pf ws read agent d/e/g)" = x ] \
     && pass peerfs || fail "peerfs: exit $rc, $(tail -3 "$work/out")"
+  # A fork: a new branch and workspace at main's head, which the run changes and main does not.
+  rc=0
+  "$bin" run --peerfs-workspace forked --fork-from main --peerfs-space "$space" -- \
+    sh -c 'cat a.txt; echo f > f.txt' > "$work/out" 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] && [ "$(cat "$work/out")" = branch ] \
+    && [ "$(pf ws read forked f.txt)" = f ] \
+    && pf branches | grep -q ' forked$' \
+    && ! "$bin" run --peerfs-workspace agent --fork-from main --peerfs-space "$space" -- true \
+      > /dev/null 2>&1 \
+    && pass peerfs-fork || fail "peerfs-fork: exit $rc, $(tail -3 "$work/out")"
   pf stop > /dev/null
 fi
 
