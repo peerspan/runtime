@@ -87,6 +87,7 @@ struct Api {
     vhost_user_device_new:
         unsafe extern "C" fn(u32, KrunStr, KrunStr, u16, *const u16, usize, *mut Handle) -> Handle,
     vsock_device_new: unsafe extern "C" fn(u64, u32, *mut Handle) -> Handle,
+    balloon_device_new: unsafe extern "C" fn(*mut Handle) -> Handle,
     vsock_device_add_unix_port: unsafe extern "C" fn(Handle, u32, KrunStr, bool),
     /// Absent from a libkrun built without networking (`make NET=1`).
     net_device_new_unixstream_fd:
@@ -234,6 +235,11 @@ impl Libkrun {
             );
             (api.mmio_device_manager_add)(devices, vsock);
 
+            // Free page reporting: memory the guest frees goes back to the host, so a run costs
+            // what it uses rather than the most it ever used.
+            let balloon = api.handle((api.balloon_device_new)(&mut err), &mut err, "balloon")?;
+            (api.mmio_device_manager_add)(devices, balloon);
+
             if let Some(fd) = config.net_fd {
                 let Some(new_net) = api.net_device_new_unixstream_fd else {
                     bail!("this libkrun was built without networking (make NET=1)");
@@ -309,6 +315,7 @@ impl Api {
             fs_device_new_read_only: sym!("krun_fs_device_new_read_only"),
             vhost_user_device_new: sym!("krun_vhost_user_device_new"),
             vsock_device_new: sym!("krun_vsock_device_new"),
+            balloon_device_new: sym!("krun_balloon_device_new"),
             vsock_device_add_unix_port: sym!("krun_vsock_device_add_unix_port"),
             // SAFETY: as for sym! above.
             net_device_new_unixstream_fd: unsafe {
