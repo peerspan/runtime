@@ -26,9 +26,8 @@ curl -fsSL https://raw.githubusercontent.com/peerspan/runtime/main/scripts/insta
 sudo peerspan-runtime run --image node:22 --workspace ~/src/project -- npm test
 ```
 
-A release bundles the runtime with libkrun, passt and the guest image. The host needs
-`virtiofsd`, `nft` and `mkfs.ext4` (on Debian and Ubuntu:
-`apt-get install virtiofsd nftables e2fsprogs`). `peerspan-runtime doctor` checks everything a
+A release bundles the runtime with libkrun, passt, virtiofsd and the guest image. The host
+needs `nft` and `mkfs.ext4` (on Debian and Ubuntu: `apt-get install nftables e2fsprogs`). `peerspan-runtime doctor` checks everything a
 run needs and says what to fix.
 
 - **Layout:** each version goes in `/usr/local/lib/peerspan-runtime/VERSION`, with `current`
@@ -43,19 +42,22 @@ run needs and says what to fix.
 ## Build from source
 
 Needs a kernel build toolchain (`flex`, `bison`, `bc`, `libelf-dev`), `clang` and
-`libclang-dev` for libkrun, and the `x86_64-unknown-linux-musl` Rust target.
+`libclang-dev` for libkrun, `libseccomp-dev` and `libcap-ng-dev` for virtiofsd, and the
+`x86_64-unknown-linux-musl` Rust target.
 
 ```sh
 scripts/build-guest.sh target/release/guest   # guest kernel, init and root filesystem
 scripts/build-libkrun.sh target/release       # pinned libkrun, beside the binary
 scripts/build-passt.sh target/release         # pinned passt, beside the binary
+scripts/build-virtiofsd.sh target/release     # pinned virtiofsd, beside the binary
 cargo build --release -p peerspan-runtime
 sudo target/release/peerspan-runtime doctor
 sudo scripts/check.sh                         # end-to-end checks
 ```
 
-The runtime looks for libkrun, passt and the guest image beside its own binary.
-`--libkrun`, `--passt` and `--guest`, or `PEERSPAN_LIBKRUN`, `PEERSPAN_PASST` and
+The runtime looks for libkrun, passt, virtiofsd and the guest image beside its own binary,
+and for virtiofsd next at `/usr/libexec/virtiofsd`. `--libkrun`, `--passt`, `--virtiofsd` and
+`--guest`, or `PEERSPAN_LIBKRUN`, `PEERSPAN_PASST`, `PEERSPAN_VIRTIOFSD` and
 `PEERSPAN_RUNTIME_GUEST`, name others. `scripts/build-release.sh OUT_DIR` builds a release
 tarball. Its binaries need the glibc of the host that built them, so build releases on the
 oldest distribution to support.

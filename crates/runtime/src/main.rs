@@ -163,13 +163,10 @@ struct RunArgs {
     /// dynamic loader's].
     #[arg(long, env = "PEERSPAN_LIBKRUN")]
     libkrun: Option<PathBuf>,
-    /// virtiofsd binary that serves the workspace.
-    #[arg(
-        long,
-        env = "PEERSPAN_VIRTIOFSD",
-        default_value = "/usr/libexec/virtiofsd"
-    )]
-    virtiofsd: PathBuf,
+    /// virtiofsd binary that serves the workspace [default: virtiofsd beside this binary, from
+    /// scripts/build-virtiofsd.sh, or /usr/libexec/virtiofsd].
+    #[arg(long, env = "PEERSPAN_VIRTIOFSD")]
+    virtiofsd: Option<PathBuf>,
     /// What the guest may reach.
     #[arg(long, value_enum, default_value_t = net::Level::Internet)]
     network: net::Level,
@@ -372,7 +369,7 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
             None => crate::bundle::guest()?,
         },
         libkrun: args.libkrun.unwrap_or_else(crate::bundle::libkrun),
-        virtiofsd: args.virtiofsd,
+        virtiofsd: args.virtiofsd.unwrap_or_else(crate::bundle::virtiofsd),
         passt: args.passt.unwrap_or_else(crate::bundle::passt),
         network: args.network,
         cpus: args.cpus,
