@@ -93,7 +93,11 @@ impl Trimmer {
     pub fn next(&mut self, s: &Sample) -> Action {
         if s.busy_cores > QUIET_CORES || s.stall > STALL_LIMIT {
             self.quiet = Duration::ZERO;
-            self.trimming = false;
+            // A trim that activity interrupted resumes after the next quiet minute; only one
+            // that reached the floor, or that the kernel could not finish, waits for growth.
+            if std::mem::take(&mut self.trimming) {
+                self.trimmed_to = None;
+            }
             self.fine_ticks = 0;
             return Action::Wait { fine: false };
         }
@@ -416,6 +420,24 @@ mod tests {
             assert!(matches!(t.next(&quiet(2 * GIB)), Action::Wait { .. }));
         }
         assert!(matches!(t.next(&quiet(2 * GIB)), Action::Reclaim(_)));
+    }
+
+    #[test]
+    fn an_interrupted_trim_resumes_after_the_next_quiet_minute() {
+        let mut t = Trimmer::default();
+        for _ in 1..ticks_to_quiet() {
+            t.next(&quiet(8 * GIB));
+        }
+        let Action::Reclaim(bytes) = t.next(&quiet(8 * GIB)) else {
+            panic!("no reclaim")
+        };
+        let left = 8 * GIB - bytes;
+        t.reclaimed(true, left);
+        t.next(&busy(left));
+        for _ in 1..ticks_to_quiet() {
+            assert!(matches!(t.next(&quiet(left)), Action::Wait { .. }));
+        }
+        assert!(matches!(t.next(&quiet(left)), Action::Reclaim(_)));
     }
 
     #[test]
