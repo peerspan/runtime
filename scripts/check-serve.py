@@ -413,6 +413,37 @@ def main():
                               if e["kind"] == "exited")
                 check("agent-no-commit", result["exit_code"] == 0 and result["commit"] is None
                       and result["error"] is None, result)
+                # peerfs_discard (runtime-agent-contract.md, RUN-16): once committed, the
+                # workspace goes with its build output and the branch stays; with nothing to
+                # commit, it goes too; after a failed commit it would stay.
+                body = {**request(48, ["sh", "-c", "echo work > /workspace/out.txt; mkdir -p "
+                                       "/workspace/target; head -c 1048576 /dev/zero "
+                                       "> /workspace/target/big"], results="none"),
+                        "peerfs_workspace": "codex.48", "peerfs_fork_from": "main",
+                        "peerfs_commit": True, "peerfs_commit_message": "task 48",
+                        "peerfs_discard": True}
+                call(sock, "POST", "/v1/runs", body)
+                result = next(e["result"] for e in follow(sock, run_id(48))
+                              if e["kind"] == "exited")
+                kept = os.path.join(work, "export-48")
+                pf("export", kept, "--branch", "codex.48")
+                workspaces = pf("ws", "list")
+                check("agent-discard", result["exit_code"] == 0 and result["error"] is None
+                      and re.fullmatch(r"[0-9a-f]{66}", result["commit"] or "")
+                      and "codex.48" not in workspaces and " codex.48\n" in pf("branches")
+                      and open(os.path.join(kept, "out.txt")).read() == "work\n"
+                      and not os.path.exists(os.path.join(kept, "target")),
+                      (result, workspaces))
+                body = {**request(49, ["true"], results="none"),
+                        "peerfs_workspace": "codex.49", "peerfs_fork_from": "main",
+                        "peerfs_commit": True, "peerfs_commit_message": "task 49",
+                        "peerfs_discard": True}
+                call(sock, "POST", "/v1/runs", body)
+                result = next(e["result"] for e in follow(sock, run_id(49))
+                              if e["kind"] == "exited")
+                check("agent-discard-unchanged", result["commit"] is None
+                      and result["error"] is None and "codex.49" not in pf("ws", "list"),
+                      result)
                 body = {**request(35, ["true"], results="none"),
                         "secrets": {"key": os.path.join(work, "missing")}}
                 call(sock, "POST", "/v1/runs", body)
@@ -428,8 +459,9 @@ def main():
                                (39, {"stdin": "not base64!"}),
                                (40, {"stdin": base64.b64encode(b"x" * 65537).decode()}),
                                (41, {"secrets": {"../key": secret}}),
-                               (42, {"harness": "relative"})]]
-                check("agent-refused", refused == [400] * 7, refused)
+                               (42, {"harness": "relative"}),
+                               (50, {"peerfs_workspace": "w50", "peerfs_discard": True})]]
+                check("agent-refused", refused == [400] * 8, refused)
                 info = call(sock, "GET", "/v1/runtime")[1]
                 check("max-network", info.get("max_network") == "internet", info)
                 check("images-reported", info.get("images") is True, info)

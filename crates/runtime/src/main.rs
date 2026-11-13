@@ -349,6 +349,7 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
                 .peerfs_agent
                 .unwrap_or_else(|| vm::DEFAULT_PEERFS_AGENT.to_owned()),
             commit_message: args.commit,
+            discard: false,
         }),
         (Some(dir), None) => vm::Workspace::Directory(dir),
         (None, None) => bail!("give --workspace or --peerfs-workspace"),

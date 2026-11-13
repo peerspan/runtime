@@ -151,6 +151,10 @@ struct RunRequest {
     peerfs_commit: bool,
     #[serde(default)]
     peerfs_commit_message: Option<String>,
+    /// Discard the peerfs workspace once its commit is made, or when there was nothing to
+    /// commit, keeping its branch.
+    #[serde(default)]
+    peerfs_discard: bool,
     /// An OCI image to boot in place of the runtime's own, pulled into the image cache when the
     /// run starts if it is not there.
     #[serde(default)]
@@ -597,6 +601,9 @@ fn validate(request: &RunRequest) -> Result<(), String> {
         }
         _ => {}
     }
+    if request.peerfs_discard && !request.peerfs_commit {
+        return Err("peerfs_discard needs peerfs_commit true".into());
+    }
     if let Some(from) = &request.peerfs_fork_from {
         if !is_peerfs_name(from) {
             return Err("peerfs_fork_from must be a branch's name".into());
@@ -733,6 +740,7 @@ fn execute(runtime: &Runtime, run: &Run) {
                 .peerfs_commit
                 .then(|| request.peerfs_commit_message.clone())
                 .flatten(),
+            discard: request.peerfs_discard,
         });
     let inputs = run_inputs(run, &runtime.args.image_cache);
     let (outcome, results) = match prepare(run, runtime.args.workspace_mib, peerfs.is_none())
