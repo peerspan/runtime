@@ -19,13 +19,10 @@ pub struct DoctorArgs {
     /// libkrun shared library [default: beside this binary, or the dynamic loader's].
     #[arg(long, env = "PEERSPAN_LIBKRUN")]
     libkrun: Option<PathBuf>,
-    /// virtiofsd binary.
-    #[arg(
-        long,
-        env = "PEERSPAN_VIRTIOFSD",
-        default_value = "/usr/libexec/virtiofsd"
-    )]
-    virtiofsd: PathBuf,
+    /// virtiofsd binary [default: virtiofsd beside this binary, from
+    /// scripts/build-virtiofsd.sh, or /usr/libexec/virtiofsd].
+    #[arg(long, env = "PEERSPAN_VIRTIOFSD")]
+    virtiofsd: Option<PathBuf>,
     /// passt binary [default: beside this binary].
     #[arg(long, env = "PEERSPAN_PASST")]
     passt: Option<PathBuf>,
@@ -44,7 +41,7 @@ pub fn doctor(args: &DoctorArgs) -> bool {
         ("user namespaces", user_namespaces()),
         ("nftables", nftables()),
         ("disk images", disk_images()),
-        ("virtiofsd", virtiofsd(&args.virtiofsd)),
+        ("virtiofsd", virtiofsd(args.virtiofsd.clone())),
         ("libkrun", libkrun(args.libkrun.clone())),
         ("passt", passt(args.passt.clone())),
         ("guest image", guest(args.guest.clone())),
@@ -159,10 +156,12 @@ fn disk_images() -> Found {
     Ok("mkfs.ext4 and loop devices".into())
 }
 
-fn virtiofsd(path: &Path) -> Found {
-    let version = run(Command::new(path).arg("--version")).map_err(|e| {
+fn virtiofsd(path: Option<PathBuf>) -> Found {
+    let path = path.unwrap_or_else(bundle::virtiofsd);
+    let version = run(Command::new(&path).arg("--version")).map_err(|e| {
         format!(
-            "{}: {e}; install virtiofsd 1.10 or later, or pass --virtiofsd",
+            "{}: {e}; install a release, which has virtiofsd beside the binary, or pass \
+             --virtiofsd",
             path.display()
         )
     })?;

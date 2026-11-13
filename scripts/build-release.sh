@@ -3,7 +3,7 @@
 # Copyright The Peerspan Authors
 #
 # Builds a release: OUT_DIR/peerspan-runtime-VERSION-linux-x86_64.tar.gz and its .sha256,
-# holding the runtime with libkrun, passt and the guest image beside it, as it finds them.
+# holding the runtime with libkrun, passt, virtiofsd and the guest image beside it.
 # The binaries need the glibc of the host that builds them, so build releases on the oldest
 # distribution to support; the script prints the glibc version the result needs.
 #
@@ -22,6 +22,7 @@ cargo build --quiet --release --manifest-path "$repo/Cargo.toml" -p peerspan-run
 cp "$repo/target/release/peerspan-runtime" "$stage/"
 "$repo/scripts/build-libkrun.sh" "$stage"
 "$repo/scripts/build-passt.sh" "$stage"
+"$repo/scripts/build-virtiofsd.sh" "$stage"
 "$repo/scripts/build-guest.sh" "$stage/guest"
 cp "$repo/dist/peerspan-runtime.service" "$stage/"
 echo "$version" > "$stage/VERSION"
@@ -39,6 +40,7 @@ This release bundles the following, unmodified unless noted.
 | --- | --- | --- | --- |
 | libkrun (\`libkrun.so.2\`) | peerspan/libkrun \`$(cat "$stage/libkrun.version")\`, a thin fork | Apache-2.0 | https://github.com/peerspan/libkrun |
 | passt (\`passt\`, \`passt.avx2\`) | $(cat "$stage/passt.version") | GPL-2.0-or-later | https://passt.top/passt, at that release |
+| virtiofsd (\`virtiofsd\`) | $(cat "$stage/virtiofsd.version") | Apache-2.0 AND BSD-3-Clause | https://gitlab.com/virtio-fs/virtiofsd, as published on crates.io |
 | Linux (\`guest/vmlinux\`) | $kernel, configured by \`guest/kernel.config\` | GPL-2.0 | https://kernel.org, at that release |
 | Alpine Linux minirootfs (\`guest/rootfs\`) | $alpine | Various, chiefly GPL-2.0 (BusyBox) and MIT (musl) | https://alpinelinux.org, at that release |
 
@@ -46,7 +48,7 @@ The runtime's own Rust dependencies are under MIT, Apache-2.0 and similarly perm
 licenses, among them CDLA-Permissive-2.0 for webpki-roots.
 NOTES
 
-glibc=$(for f in "$stage/peerspan-runtime" "$stage/libkrun.so.2"; do
+glibc=$(for f in "$stage/peerspan-runtime" "$stage/libkrun.so.2" "$stage/virtiofsd"; do
   objdump -T "$f" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' ; done | sort -t. -k2 -n -u | tail -1)
 
 # Owned by root whoever builds it: root runs these files.

@@ -83,5 +83,5 @@ fi
 echo
 "$prefix/bin/peerspan-runtime" doctor || {
   echo
-  echo "On Debian and Ubuntu, the usual missing pieces are: apt-get install virtiofsd nftables e2fsprogs"
+  echo "On Debian and Ubuntu, the usual missing pieces are: apt-get install nftables e2fsprogs"
 }

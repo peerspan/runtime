@@ -62,13 +62,10 @@ pub struct ServeArgs {
     /// dynamic loader's].
     #[arg(long, env = "PEERSPAN_LIBKRUN")]
     libkrun: Option<PathBuf>,
-    /// virtiofsd binary that serves workspaces.
-    #[arg(
-        long,
-        env = "PEERSPAN_VIRTIOFSD",
-        default_value = "/usr/libexec/virtiofsd"
-    )]
-    virtiofsd: PathBuf,
+    /// virtiofsd binary that serves workspaces [default: virtiofsd beside this binary, from
+    /// scripts/build-virtiofsd.sh, or /usr/libexec/virtiofsd].
+    #[arg(long, env = "PEERSPAN_VIRTIOFSD")]
+    virtiofsd: Option<PathBuf>,
     /// passt binary that carries guests' network traffic [default: passt beside this binary,
     /// from scripts/build-passt.sh].
     #[arg(long, env = "PEERSPAN_PASST")]
@@ -764,7 +761,11 @@ fn execute(runtime: &Runtime, run: &Run) {
                 archive: request.workspace_archive.clone(),
                 guest: runtime.guest.clone(),
                 libkrun: runtime.libkrun.clone(),
-                virtiofsd: runtime.args.virtiofsd.clone(),
+                virtiofsd: runtime
+                    .args
+                    .virtiofsd
+                    .clone()
+                    .unwrap_or_else(crate::bundle::virtiofsd),
                 passt: runtime
                     .args
                     .passt

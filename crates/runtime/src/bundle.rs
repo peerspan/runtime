@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright The Peerspan Authors
 
-//! Files the runtime ships with, beside its own binary: passt, libkrun and the guest image, as
+//! Files the runtime ships with, beside its own binary: passt, virtiofsd, libkrun and the guest
+//! image, as
 //! an installed release lays them out. Flags and environment variables name others.
 
 use std::env;
@@ -22,6 +23,12 @@ fn beside(name: &str) -> Option<PathBuf> {
 /// whose arguments `net::passt_args` is written against. Otherwise the one on `PATH`.
 pub fn passt() -> PathBuf {
     beside("passt").unwrap_or_else(|| PathBuf::from("passt"))
+}
+
+/// The virtiofsd the runtime ships with, built by `scripts/build-virtiofsd.sh`. Otherwise the one
+/// Debian and Ubuntu packages install.
+pub fn virtiofsd() -> PathBuf {
+    beside("virtiofsd").unwrap_or_else(|| PathBuf::from("/usr/libexec/virtiofsd"))
 }
 
 /// The libkrun the runtime ships with, or the dynamic loader's.
