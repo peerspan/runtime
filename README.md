@@ -245,6 +245,10 @@ workspace server and passt.
 | Server logs | 1 MiB each |
 | Output and changes (`serve`) | 100 MiB each; larger changes are left out |
 
+Each VM has a virtio balloon with free page reporting: memory the guest frees goes back to the
+host within seconds, so a run's memory falls again after a peak. Memory the guest keeps for its
+page cache is not freed, so a run that writes or reads many files still holds up to its size.
+
 Stopping a run kills its whole cgroup. If a supervisor dies, the next run on the host removes
 its leftovers: processes, cgroup, network rules and run directory. `serve` also unmounts
 leftover workspace images when it starts.
