@@ -137,6 +137,10 @@ task contract's peerfs workspaces specify:
   with `peerfs_commit_message`, commits the workspace once the run has been snapshotted. The
   `exited` result gains `commit`: the commit, or null when nothing changed, the run never
   started, or a snapshot or the commit failed (with `error` set).
+- `peerfs_discard` true, with `peerfs_commit`, then discards the workspace and keeps its
+  branch, once the commit is made or there was nothing to commit, and only with no `error`.
+  What only the workspace held goes with it, such as build output, so a finished run costs
+  no disk beyond its commit. A discard that fails is logged and changes nothing else.
 
 For runtime agents (the host's runtime agent contract), a run also takes:
 - `stdin`, base64 of at most 64 KiB, as the command's standard input;
