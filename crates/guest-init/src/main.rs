@@ -52,6 +52,7 @@ const CONNECT_RETRY: Duration = Duration::from_millis(50);
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 mod net;
+mod trim;
 mod workspace;
 
 /// How long init waits for the console before running without one.
@@ -146,6 +147,13 @@ fn run(mut phases: Phases) -> io::Result<()> {
         "sysfs",
         MountFlags::empty(),
     )?;
+    // For the page cache trim; a run without it keeps its cache.
+    let _ = mount(
+        "cgroup2",
+        &format!("{NEW_ROOT}/sys/fs/cgroup"),
+        "cgroup2",
+        MountFlags::empty(),
+    );
     mount(
         "devtmpfs",
         &format!("{NEW_ROOT}/dev"),
@@ -167,6 +175,7 @@ fn run(mut phases: Phases) -> io::Result<()> {
     unix_fs::chroot(NEW_ROOT)?;
     std::env::set_current_dir("/")?;
     net::loopback_up()?;
+    trim::spawn();
     phases.mark("mounted");
 
     let stream = connect_host(AGENT_PORT)?;
