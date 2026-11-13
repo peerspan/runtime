@@ -123,6 +123,8 @@ pub struct PeerfsWorkspace {
     pub agent: String,
     /// With a message, commit the workspace to its branch once the run has been snapshotted.
     pub commit_message: Option<String>,
+    /// Discard the workspace once it is committed, or had nothing to commit, keeping its branch.
+    pub discard: bool,
 }
 
 /// The agent recorded on a peerfs workspace's snapshots when the caller names none.
@@ -444,6 +446,17 @@ pub fn run(
                     Err(e) => outcome.error = Some(format!("{e:#}")),
                 }
                 mark("commit");
+                // Only after a commit: a failed one leaves the work in the workspace for the
+                // owner. The work is committed, so a discard that fails costs disk, not results.
+                if peerfs.discard && outcome.error.is_none() {
+                    if let Err(e) = discard(peerfs) {
+                        crate::log::warn(
+                            "could not discard the committed peerfs workspace",
+                            &[("workspace", &peerfs.name), ("error", &format!("{e:#}"))],
+                        );
+                    }
+                    mark("discard");
+                }
             }
         }
     }
@@ -1058,6 +1071,23 @@ fn commit(workspace: &PeerfsWorkspace, message: &str) -> anyhow::Result<Option<S
     let id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     // `nothing to commit` when the workspace has no changes.
     Ok(Some(id).filter(|id| id.len() == 66 && id.bytes().all(|b| b.is_ascii_hexdigit())))
+}
+
+/// Discards `workspace`: what it held beyond its branch, such as build output, goes, and the
+/// branch stays.
+fn discard(workspace: &PeerfsWorkspace) -> anyhow::Result<()> {
+    let output = peerfs_command(&workspace.peerfs, &workspace.space)
+        .args(["ws", "discard", &workspace.name])
+        .output()
+        .with_context(|| format!("starting {}", workspace.peerfs.display()))?;
+    if !output.status.success() {
+        bail!(
+            "peerfs could not discard workspace {}: {}",
+            workspace.name,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Reads each secret's file, refusing more secrets, or larger ones, than the guest accepts.
