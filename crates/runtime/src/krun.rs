@@ -65,11 +65,14 @@ struct VtableHandle {
     metadata: u32,
     vtable_ptr: *const c_void,
     user_data: *const c_void,
-    vtable_size: u16,
 }
 
 #[repr(C)]
 struct PushStrVtable {
+    /// Method slots after `drop`: `push`.
+    num_slots: u16,
+    reserved1: u16,
+    reserved2: u32,
     drop: Option<unsafe extern "C" fn(*mut c_void)>,
     push: unsafe extern "C" fn(*mut c_void, KrunStr) -> bool,
 }
@@ -390,6 +393,9 @@ impl Api {
         }
         let mut message = String::new();
         let vtable = PushStrVtable {
+            num_slots: 1,
+            reserved1: 0,
+            reserved2: 0,
             drop: None,
             push: push_str,
         };
@@ -398,7 +404,6 @@ impl Api {
             metadata: 0,
             vtable_ptr: ptr::from_ref(&vtable).cast(),
             user_data: ptr::from_mut(&mut message).cast(),
-            vtable_size: u16::try_from(size_of::<PushStrVtable>()).expect("small vtable"),
         };
         // SAFETY: *err is a live error handle; the writer and the String it appends to outlive
         // the call, and the handle is destroyed exactly once and then cleared.
