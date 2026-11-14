@@ -122,6 +122,9 @@ pub struct VmConfig<'cfg> {
     pub harness: Option<(&'cfg str, &'cfg str)>,
     pub agent_port: u32,
     pub agent_socket: &'cfg str,
+    /// A linked run's vsock port, its Unix socket, and whether the VMM listens on the socket
+    /// (the link's `listen` side) or the guest connects out through it (`connect`).
+    pub link: Option<(u32, &'cfg str, bool)>,
     /// A connected stream socket to passt, handed to libkrun; no network device without one.
     pub net_fd: Option<RawFd>,
 }
@@ -233,6 +236,9 @@ impl Libkrun {
                 KrunStr::new(config.agent_socket),
                 false,
             );
+            if let Some((port, socket, listen)) = config.link {
+                (api.vsock_device_add_unix_port)(vsock, port, KrunStr::new(socket), listen);
+            }
             (api.mmio_device_manager_add)(devices, vsock);
 
             // Free page reporting: memory the guest frees goes back to the host, so a run costs

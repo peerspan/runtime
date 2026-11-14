@@ -139,9 +139,18 @@ const CLONE_NAMESPACES: u64 = (libc::CLONE_NEWNS
     | libc::CLONE_NEWPID
     | libc::CLONE_NEWNET) as u64;
 
+/// Calls the VMM of a link's `listen` run makes besides, to listen on its link socket and accept
+/// the host's connections; sockets stay Unix sockets only.
+const LISTEN: &[libc::c_long] = &[
+    libc::SYS_bind,
+    libc::SYS_listen,
+    libc::SYS_accept,
+    libc::SYS_accept4,
+];
+
 /// Builds the filters in the order they are applied: the refusal of clone3, then the
-/// allow-list, which does not allow installing more filters.
-fn programs() -> anyhow::Result<[BpfProgram; 2]> {
+/// allow-list, which does not allow installing more filters. `listen` adds [`LISTEN`].
+fn programs(listen: bool) -> anyhow::Result<[BpfProgram; 2]> {
     let arch = TargetArch::try_from(std::env::consts::ARCH)
         .map_err(|e| anyhow::anyhow!("seccomp target {}: {e}", std::env::consts::ARCH))?;
     let arg = |index, op, value| SeccompCondition::new(index, SeccompCmpArgLen::Qword, op, value);
@@ -152,8 +161,12 @@ fn programs() -> anyhow::Result<[BpfProgram; 2]> {
             libc::AF_UNIX as u64,
         )?])?])
     };
-    let mut rules: BTreeMap<i64, Vec<SeccompRule>> =
-        ALLOWED.iter().map(|&call| (call, Vec::new())).collect();
+    let extra: &[libc::c_long] = if listen { LISTEN } else { &[] };
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = ALLOWED
+        .iter()
+        .chain(extra)
+        .map(|&call| (call, Vec::new()))
+        .collect();
     // The kernel takes the command as 32 bits, so only those are compared.
     let ioctls = IOCTLS
         .iter()
@@ -213,8 +226,8 @@ fn programs() -> anyhow::Result<[BpfProgram; 2]> {
 /// # Errors
 ///
 /// Fails if the filters cannot be built or installed; the caller must not boot the VM then.
-pub fn install() -> anyhow::Result<()> {
-    apply(&programs()?)
+pub fn install(listen: bool) -> anyhow::Result<()> {
+    apply(&programs(listen)?)
 }
 
 fn apply(programs: &[BpfProgram]) -> anyhow::Result<()> {
@@ -232,7 +245,7 @@ mod tests {
     /// exit code, or the signal that killed it as a negative number. The filters are built
     /// before forking, so the child only applies them and makes raw system calls.
     fn filtered(body: fn() -> i32) -> i32 {
-        let programs = programs().expect("build the filters");
+        let programs = programs(false).expect("build the filters");
         // SAFETY: the child makes only system calls and exits without returning.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");

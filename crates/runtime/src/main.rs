@@ -12,6 +12,7 @@ mod image;
 mod jail;
 mod krun;
 mod launcher;
+mod link;
 mod log;
 mod net;
 mod phases;
@@ -394,7 +395,9 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
             stdin: false,
             combined_output: args.combined_output,
             harness: false,
+            link: None,
         },
+        link: None,
     };
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();

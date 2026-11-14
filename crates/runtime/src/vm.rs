@@ -13,8 +13,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -31,7 +31,8 @@ use crate::net::{self, Level, RunFilter};
 use crate::phases;
 use crate::userns::UserNamespace;
 
-use crate::launcher::{AGENT_SOCKET, WORKSPACE_SOCKET};
+use crate::launcher::{AGENT_SOCKET, LINK_SOCKET, LinkSide, WORKSPACE_SOCKET};
+use crate::link::{EndOnDrop, Link, Relay};
 
 /// How long a workspace server that may have failed has to exit, when the guest did not connect.
 const SERVER_EXIT_GRACE: Duration = Duration::from_millis(500);
@@ -93,6 +94,9 @@ pub struct VmSpec {
     pub kernel_args: Option<String>,
     /// The command; its `archive` flag is set from `archive` above.
     pub command: protocol::Command,
+    /// The run's side of a link and the link it shares with its partner; the command's `link`
+    /// names the same side.
+    pub link: Option<(LinkSide, Arc<Link>)>,
 }
 
 /// Where the guest's workspace comes from.
@@ -317,6 +321,23 @@ pub fn run(
         .with_context(|| format!("binding {}", agent_socket.display()))?;
     chown(&agent_socket, id)?;
 
+    // A `connect` run's guest connects out to the relay; a `listen` run's VMM makes its own
+    // socket, which the relay connects to once the guest is up. Either ends the link when the
+    // run does.
+    let link_socket = sockets.join(LINK_SOCKET);
+    let mut relay = None;
+    let mut link_end = None;
+    match &options.link {
+        None => {}
+        Some((LinkSide::Connect, link)) => {
+            let link_listener = UnixListener::bind(&link_socket)
+                .with_context(|| format!("binding {}", link_socket.display()))?;
+            chown(&link_socket, id)?;
+            relay = Some(Relay::start(Arc::clone(link), link_listener)?);
+        }
+        Some((LinkSide::Listen, link)) => link_end = Some(EndOnDrop(Arc::clone(link))),
+    }
+
     let (console, console_writer) = CappedLog::create(&console_path, CONSOLE_LIMIT)
         .with_context(|| format!("creating {}", console_path.display()))?;
     let (mut phase_reader, phase_writer) = io::pipe()?;
@@ -371,6 +392,15 @@ pub fn run(
                     .iter()
                     .flat_map(|_| ["--net-fd".to_owned(), NET_FD.to_string()]),
             )
+            .args(options.link.iter().flat_map(|(side, _)| {
+                [
+                    "--link",
+                    match side {
+                        LinkSide::Listen => "listen",
+                        LinkSide::Connect => "connect",
+                    },
+                ]
+            }))
             .stdin(Stdio::null())
             .stdout(console_writer.try_clone()?)
             .stderr(console_writer)
@@ -410,8 +440,13 @@ pub fn run(
     };
     let connect = launched.elapsed();
     mark("connected");
+    if let Some(EndOnDrop(link)) = &link_end {
+        link.listening(link_socket.clone());
+    }
     let progress = Mutex::new(Progress::default());
     let mut outcome = serve_guest(spec, stream, &cgroup, &progress, cancel, on_event);
+    drop(relay);
+    drop(link_end);
     if cgroup.oom_killed() && outcome.exit_code.is_none() && !outcome.timed_out {
         outcome.error = Some("the VM exceeded its memory limit and was killed".into());
     }

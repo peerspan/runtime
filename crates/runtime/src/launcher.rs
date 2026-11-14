@@ -8,7 +8,7 @@ use std::convert::Infallible;
 use std::path::PathBuf;
 
 use clap::Args;
-use peerspan_runtime_protocol::{AGENT_PORT, HARNESS_TAG, ROOTFS_TAG, WORKSPACE_TAG};
+use peerspan_runtime_protocol::{AGENT_PORT, HARNESS_TAG, LINK_PORT, ROOTFS_TAG, WORKSPACE_TAG};
 
 use crate::jail::{self, Jail};
 use crate::krun::{Libkrun, VmConfig};
@@ -21,6 +21,14 @@ pub const KERNEL_CMDLINE: &str = "console=hvc0 rdinit=/init panic=-1 reboot=k qu
 /// Socket names inside the sockets directory.
 pub const WORKSPACE_SOCKET: &str = "workspace.sock";
 pub const AGENT_SOCKET: &str = "agent.sock";
+pub const LINK_SOCKET: &str = "link.sock";
+
+/// Which side of a link a run's VM is, for the launcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum LinkSide {
+    Listen,
+    Connect,
+}
 
 #[derive(Debug, Args)]
 pub struct LaunchArgs {
@@ -58,6 +66,9 @@ pub struct LaunchArgs {
     /// Connected stream socket to the guest's network backend (passt); no network without it.
     #[arg(long)]
     pub net_fd: Option<i32>,
+    /// The run's side of a link, carried on the link socket in the sockets directory.
+    #[arg(long, value_enum)]
+    pub link: Option<LinkSide>,
 }
 
 /// Confines this process and boots the VM described by `args`.
@@ -84,7 +95,7 @@ pub fn launch(args: &LaunchArgs) -> anyhow::Result<Infallible> {
     }
     .enter()?;
     phases.mark("jailed");
-    seccomp::install()?;
+    seccomp::install(args.link == Some(LinkSide::Listen))?;
     phases.mark("seccomp");
     let cmdline = match &args.kernel_args {
         Some(extra) => format!("{KERNEL_CMDLINE} {extra}"),
@@ -92,6 +103,7 @@ pub fn launch(args: &LaunchArgs) -> anyhow::Result<Infallible> {
     };
     let workspace_socket = format!("{}/{WORKSPACE_SOCKET}", jail::SOCKETS);
     let agent_socket = format!("{}/{AGENT_SOCKET}", jail::SOCKETS);
+    let link_socket = format!("{}/{LINK_SOCKET}", jail::SOCKETS);
     libkrun.boot(
         &VmConfig {
             cpus: args.cpus,
@@ -109,6 +121,9 @@ pub fn launch(args: &LaunchArgs) -> anyhow::Result<Infallible> {
                 .then_some((HARNESS_TAG, jail::HARNESS)),
             agent_port: AGENT_PORT,
             agent_socket: &agent_socket,
+            link: args
+                .link
+                .map(|side| (LINK_PORT, link_socket.as_str(), side == LinkSide::Listen)),
             net_fd: args.net_fd,
         },
         &mut || phases.mark("vm_built"),

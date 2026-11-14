@@ -51,6 +51,7 @@ const CONNECT_ATTEMPTS: u32 = 100;
 const CONNECT_RETRY: Duration = Duration::from_millis(50);
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+mod link;
 mod net;
 mod trim;
 mod workspace;
@@ -196,6 +197,11 @@ fn run(mut phases: Phases) -> io::Result<()> {
     }
     if let Err(e) = write_secrets(&command.secrets) {
         return fail(&mut reader, &format!("writing secrets: {e}"));
+    }
+    if let Some(link) = command.link
+        && let Err(e) = link::start(link)
+    {
+        return fail(&mut reader, &format!("setting up the link: {e}"));
     }
     if command.network {
         if let Err(e) = net::configure() {
@@ -362,7 +368,7 @@ fn connect_host(port: u32) -> io::Result<File> {
     ))
 }
 
-fn connect_vsock(cid: u32, port: u32) -> io::Result<File> {
+pub(crate) fn connect_vsock(cid: u32, port: u32) -> io::Result<File> {
     let fd = rustix::net::socket_with(
         AddressFamily::VSOCK,
         SocketType::STREAM,

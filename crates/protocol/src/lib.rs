@@ -15,6 +15,11 @@ use std::io::{self, ErrorKind, Read, Write};
 /// The vsock port the guest connects to; the launcher maps it to the supervisor's socket.
 pub const AGENT_PORT: u32 = 1024;
 
+/// The vsock port that carries a linked run's connections ([`Link`]). The `connect` guest
+/// connects out on it, once per connection, to the supervisor's link socket; in the `listen`
+/// guest, init listens on it and the launcher maps the supervisor's connections to it.
+pub const LINK_PORT: u32 = 1025;
+
 /// virtio-fs tag of the read-only root filesystem.
 pub const ROOTFS_TAG: &str = "rootfs";
 
@@ -130,6 +135,26 @@ pub struct Command {
     pub combined_output: bool,
     /// Whether a harness directory is attached, to mount read-only at [`HARNESS_PATH`].
     pub harness: bool,
+    /// The run's side of a link to another run, if any.
+    pub link: Option<Link>,
+}
+
+/// One side of a link between two runs: a TCP port on loopback in each guest, joined through
+/// the host. The `connect` guest's connections to `127.0.0.1:port` reach `127.0.0.1:port` in
+/// the `listen` guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Link {
+    pub role: LinkRole,
+    pub port: u16,
+}
+
+/// Which side of a link a run is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkRole {
+    /// Serves the link: connections arrive at its loopback port.
+    Listen,
+    /// Opens the link's connections, from its loopback port.
+    Connect,
 }
 
 /// One frame on the guest's stream.
@@ -334,6 +359,19 @@ fn encode_command(command: &Command) -> Vec<u8> {
     out.push(u8::from(command.stdin));
     out.push(u8::from(command.combined_output));
     out.push(u8::from(command.harness));
+    let (role, port) = match command.link {
+        None => (0, 0),
+        Some(Link {
+            role: LinkRole::Listen,
+            port,
+        }) => (1, port),
+        Some(Link {
+            role: LinkRole::Connect,
+            port,
+        }) => (2, port),
+    };
+    out.push(role);
+    out.extend_from_slice(&port.to_be_bytes());
     out
 }
 
@@ -372,9 +410,25 @@ fn decode_command(payload: &[u8]) -> io::Result<Command> {
         stdin,
         combined_output,
         harness,
+        role,
+        port_high,
+        port_low,
     ] = *cursor.rest
     else {
-        return Err(invalid("command flags are not 6 bytes"));
+        return Err(invalid("command flags and link are not 9 bytes"));
+    };
+    let port = u16::from_be_bytes([port_high, port_low]);
+    let link = match (role, port) {
+        (0, 0) => None,
+        (1, 1..) => Some(Link {
+            role: LinkRole::Listen,
+            port,
+        }),
+        (2, 1..) => Some(Link {
+            role: LinkRole::Connect,
+            port,
+        }),
+        _ => return Err(invalid("invalid link")),
     };
     let flag = |b: u8| match b {
         0 => Ok(false),
@@ -392,6 +446,7 @@ fn decode_command(payload: &[u8]) -> io::Result<Command> {
         stdin: flag(stdin)?,
         combined_output: flag(combined_output)?,
         harness: flag(harness)?,
+        link,
     })
 }
 
@@ -488,6 +543,17 @@ mod tests {
                 stdin: true,
                 combined_output: true,
                 harness: true,
+                link: Some(Link {
+                    role: LinkRole::Listen,
+                    port: 25_565,
+                }),
+            }),
+            Message::Run(Command {
+                link: Some(Link {
+                    role: LinkRole::Connect,
+                    port: 1,
+                }),
+                ..Command::default()
             }),
             Message::Run(Command::default()),
             Message::Stdout(b"out\n".to_vec()),
