@@ -149,12 +149,14 @@ impl Link {
             let before = self.sent[direction].fetch_add(n as u64, Ordering::Relaxed);
             let allowed = usize::try_from(self.max_bytes.saturating_sub(before)).unwrap_or(n);
             let write = n.min(allowed);
-            if write > 0 && to.write_all(&buf[..write]).is_err() {
-                break;
-            }
+            let written = write == 0 || to.write_all(&buf[..write]).is_ok();
+            // The bound ends the link whether or not this last write got through.
             if before + n as u64 >= self.max_bytes {
                 self.end();
                 return;
+            }
+            if !written {
+                break;
             }
         }
         let _ = to.shutdown(Shutdown::Write);
@@ -287,5 +289,17 @@ mod tests {
         let mut after = UnixStream::connect(&connect).expect("connect");
         assert_eq!(after.read(&mut buf).expect("read"), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_bound_ends_the_link_even_when_its_last_write_fails() {
+        let link = Link::new(1, 1);
+        let (from, mut feed) = UnixStream::pair().expect("pair");
+        let (to, closed_peer) = UnixStream::pair().expect("pair");
+        drop(closed_peer);
+        feed.write_all(b"x").expect("write");
+        drop(feed);
+        link.copy(0, from, to);
+        assert!(link.state().closed);
     }
 }
