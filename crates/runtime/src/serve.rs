@@ -26,6 +26,8 @@ use sha2::{Digest, Sha256};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::disk::WorkspaceDisk;
+use crate::launcher::LinkSide;
+use crate::link::Link;
 use crate::net::Level;
 use crate::vm::{self, Event, Outcome, VmSpec};
 
@@ -159,6 +161,50 @@ struct RunRequest {
     /// run starts if it is not there.
     #[serde(default)]
     image: Option<String>,
+    /// This run's side of a link to one other run (the runtime task contract's Linked runs).
+    #[serde(default)]
+    link: Option<LinkRequest>,
+}
+
+/// A run's `link`: the two runs of a pair carry the same `id` and fields, one of each role.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinkRequest {
+    id: String,
+    role: LinkRoleName,
+    port: u16,
+    max_connections: usize,
+    max_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum LinkRoleName {
+    Listen,
+    Connect,
+}
+
+/// Most connections a link carries at once, and most bytes each way over its life.
+const MAX_LINK_CONNECTIONS: usize = 64;
+const MAX_LINK_BYTES: u64 = 1 << 30;
+
+/// A link that has at least one of its runs.
+struct LinkEntry {
+    port: u16,
+    max_connections: usize,
+    max_bytes: u64,
+    listen: Option<String>,
+    connect: Option<String>,
+    link: Arc<Link>,
+}
+
+impl LinkEntry {
+    fn slot(&mut self, role: LinkRoleName) -> &mut Option<String> {
+        match role {
+            LinkRoleName::Listen => &mut self.listen,
+            LinkRoleName::Connect => &mut self.connect,
+        }
+    }
 }
 
 /// Largest standard input a run takes, decoded.
@@ -194,10 +240,15 @@ struct Runtime {
     /// The peerfs workspaces runs hold, from acceptance until the run has given the workspace
     /// back and snapshotted it, even if it is deleted meanwhile. Locked after `runs`.
     held: Mutex<HashSet<String>>,
+    /// Links by `id`, from their first run's acceptance until both runs are deleted. Locked
+    /// after `runs`.
+    links: Mutex<HashMap<String, LinkEntry>>,
 }
 
 struct Run {
     request: RunRequest,
+    /// The link this run is a side of, shared with its partner.
+    link: Option<Arc<Link>>,
     created_at: String,
     dir: PathBuf,
     cancel: AtomicBool,
@@ -304,6 +355,7 @@ pub fn serve(args: ServeArgs) -> anyhow::Result<()> {
         image,
         runs: Mutex::new(HashMap::new()),
         held: Mutex::new(HashSet::new()),
+        links: Mutex::new(HashMap::new()),
     });
     for request in server.incoming_requests() {
         let runtime = Arc::clone(&runtime);
@@ -389,6 +441,7 @@ fn runtime_info(runtime: &Runtime) -> Value {
         "peerfs": args.peerfs_space.is_some(),
         "max_network": args.max_network.to_string(),
         "images": true,
+        "links": true,
     })
 }
 
@@ -444,6 +497,22 @@ fn start(runtime: &Arc<Runtime>, body: &[u8]) -> (u16, Value) {
     if busy >= args.max_concurrent_runs {
         return error(429, "busy", "every run slot is in use");
     }
+    if let Some(link) = &request.link
+        && let Some(entry) = runtime
+            .links
+            .lock()
+            .expect("links lock poisoned")
+            .get_mut(&link.id)
+    {
+        if (entry.port, entry.max_connections, entry.max_bytes)
+            != (link.port, link.max_connections, link.max_bytes)
+        {
+            return error(400, "invalid", "link fields differ from its partner's");
+        }
+        if entry.slot(link.role).is_some() {
+            return error(400, "invalid", "the link already has a run of that role");
+        }
+    }
     // Runs on one peerfs workspace take turns.
     if let Some(name) = &request.peerfs_workspace
         && !runtime
@@ -454,7 +523,22 @@ fn start(runtime: &Arc<Runtime>, body: &[u8]) -> (u16, Value) {
     {
         return error(429, "busy", "another run holds the peerfs workspace");
     }
+    // Checked above, under the same lock on the runs, so this cannot fail.
+    let link = request.link.as_ref().map(|link| {
+        let mut links = runtime.links.lock().expect("links lock poisoned");
+        let entry = links.entry(link.id.clone()).or_insert_with(|| LinkEntry {
+            port: link.port,
+            max_connections: link.max_connections,
+            max_bytes: link.max_bytes,
+            listen: None,
+            connect: None,
+            link: Link::new(link.max_connections, link.max_bytes),
+        });
+        *entry.slot(link.role) = Some(request.run_id.clone());
+        Arc::clone(&entry.link)
+    });
     let run = Arc::new(Run {
+        link,
         dir: args.state.join("runs").join(&request.run_id),
         created_at: crate::log::rfc3339(SystemTime::now()),
         request,
@@ -558,6 +642,28 @@ fn validate(request: &RunRequest) -> Result<(), String> {
         && !dir.is_absolute()
     {
         return Err("harness must be an absolute path".into());
+    }
+    if let Some(link) = &request.link {
+        let id_ok = link.id.strip_prefix("lnk_").is_some_and(|hex| {
+            hex.len() == 32
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        });
+        if !id_ok {
+            return Err("link id must be lnk_ and 32 lowercase hex digits".into());
+        }
+        if link.port == 0 {
+            return Err("link port must be 1 to 65,535".into());
+        }
+        if !(1..=MAX_LINK_CONNECTIONS).contains(&link.max_connections) {
+            return Err(format!(
+                "link max_connections must be 1 to {MAX_LINK_CONNECTIONS}"
+            ));
+        }
+        if !(1..=MAX_LINK_BYTES).contains(&link.max_bytes) {
+            return Err(format!("link max_bytes must be 1 to {MAX_LINK_BYTES}"));
+        }
     }
     if request.secrets.len() > peerspan_runtime_protocol::MAX_SECRETS {
         return Err(format!(
@@ -807,7 +913,30 @@ fn execute(runtime: &Runtime, run: &Run) {
                     stdin: false,
                     combined_output: false,
                     harness: false,
+                    link: request
+                        .link
+                        .as_ref()
+                        .map(|link| peerspan_runtime_protocol::Link {
+                            role: match link.role {
+                                LinkRoleName::Listen => peerspan_runtime_protocol::LinkRole::Listen,
+                                LinkRoleName::Connect => {
+                                    peerspan_runtime_protocol::LinkRole::Connect
+                                }
+                            },
+                            port: link.port,
+                        }),
                 },
+                link: request
+                    .link
+                    .as_ref()
+                    .zip(run.link.as_ref())
+                    .map(|(request, link)| {
+                        let side = match request.role {
+                            LinkRoleName::Listen => LinkSide::Listen,
+                            LinkRoleName::Connect => LinkSide::Connect,
+                        };
+                        (side, Arc::clone(link))
+                    }),
             };
             if let Some(image) = image {
                 image.mark_used();
@@ -1182,6 +1311,15 @@ fn delete(runtime: &Runtime, id: &str) -> (u16, Value) {
     };
     run.deleted.store(true, Ordering::Relaxed);
     run.cancel.store(true, Ordering::Relaxed);
+    if let Some(link) = &run.request.link {
+        let mut links = runtime.links.lock().expect("links lock poisoned");
+        if let Some(entry) = links.get_mut(&link.id) {
+            *entry.slot(link.role) = None;
+            if entry.listen.is_none() && entry.connect.is_none() {
+                links.remove(&link.id);
+            }
+        }
+    }
     crate::log::info("run deleted", &[("run", &id)]);
     if run.log.lock().expect("run log lock poisoned").finished {
         let _ = fs::remove_dir_all(&run.dir);

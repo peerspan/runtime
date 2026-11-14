@@ -154,7 +154,19 @@ For runtime agents (the host's runtime agent contract), a run also takes:
   before it starts; one that does not parse is refused with 400. The run holds the image, so
   `prune` leaves it alone until the run ends.
 
-`GET /v1/runtime` reports `max_network`, and `images: true`.
+- `link`, `{id, role, port, max_connections, max_bytes}`, joins two runs: one `listen` and one
+  `connect` run with the same `id` (`lnk_` and 32 lowercase hex digits) and fields. A TCP
+  connection the `connect` guest opens to `127.0.0.1:port` reaches `127.0.0.1:port` in the
+  `listen` guest, and nothing else crosses: each guest's init carries its loopback port over a
+  vsock port mapped to a Unix socket in the run's sockets directory, and the runtime splices the
+  two on the host. At most `max_connections` (1 to 64) are open at once, and `max_bytes` (up to
+  1 GiB) bound each direction over the link's life; reaching it, or either run's exit, closes
+  every connection. A connection is closed at once while the `listen` guest is not up or not
+  listening on the port, so clients retry. A run whose `id` already has a run of its role, or
+  whose fields differ from its partner's, is refused with 400. The `listen` run's VMM may also
+  bind, listen on and accept Unix sockets, which its seccomp filter otherwise refuses.
+
+`GET /v1/runtime` reports `max_network`, `images: true` and `links: true`.
 - The workspace's size is not capped.
 
 `serve` logs to standard error, which the systemd unit sends to the journal, one line per
