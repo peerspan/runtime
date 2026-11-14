@@ -9,7 +9,7 @@
 # usage: build-libkrun.sh OUT_DIR
 set -eu
 
-LIBKRUN_COMMIT=7af4025f52e1a43c32c391b6124a6d3a37fe63db
+LIBKRUN_COMMIT=3ab5d38b47ee3eda20ae469286d676c10e73ec3b
 
 out=$1
 cache="${XDG_CACHE_HOME:-$HOME/.cache}/peerspan-runtime"
