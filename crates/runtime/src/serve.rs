@@ -188,18 +188,30 @@ enum LinkRoleName {
 const MAX_LINK_CONNECTIONS: usize = 64;
 const MAX_LINK_BYTES: u64 = 1 << 30;
 
-/// A link that has at least one of its runs.
+/// A link that has at least one of its runs. Its `id` stays taken until both runs have been
+/// deleted, so a run of a role whose run was deleted is still a second run of that role.
 struct LinkEntry {
     port: u16,
     max_connections: usize,
     max_bytes: u64,
-    listen: Option<String>,
-    connect: Option<String>,
+    listen: LinkSlot,
+    connect: LinkSlot,
     link: Arc<Link>,
 }
 
+/// One role's place in a link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkSlot {
+    /// No run of this role has come.
+    Open,
+    /// A run of this role is there.
+    Taken,
+    /// The run of this role has been deleted; the role stays taken.
+    Deleted,
+}
+
 impl LinkEntry {
-    fn slot(&mut self, role: LinkRoleName) -> &mut Option<String> {
+    fn slot(&mut self, role: LinkRoleName) -> &mut LinkSlot {
         match role {
             LinkRoleName::Listen => &mut self.listen,
             LinkRoleName::Connect => &mut self.connect,
@@ -509,7 +521,7 @@ fn start(runtime: &Arc<Runtime>, body: &[u8]) -> (u16, Value) {
         {
             return error(400, "invalid", "link fields differ from its partner's");
         }
-        if entry.slot(link.role).is_some() {
+        if *entry.slot(link.role) != LinkSlot::Open {
             return error(400, "invalid", "the link already has a run of that role");
         }
     }
@@ -530,11 +542,11 @@ fn start(runtime: &Arc<Runtime>, body: &[u8]) -> (u16, Value) {
             port: link.port,
             max_connections: link.max_connections,
             max_bytes: link.max_bytes,
-            listen: None,
-            connect: None,
+            listen: LinkSlot::Open,
+            connect: LinkSlot::Open,
             link: Link::new(link.max_connections, link.max_bytes),
         });
-        *entry.slot(link.role) = Some(request.run_id.clone());
+        *entry.slot(link.role) = LinkSlot::Taken;
         Arc::clone(&entry.link)
     });
     let run = Arc::new(Run {
@@ -1314,8 +1326,8 @@ fn delete(runtime: &Runtime, id: &str) -> (u16, Value) {
     if let Some(link) = &run.request.link {
         let mut links = runtime.links.lock().expect("links lock poisoned");
         if let Some(entry) = links.get_mut(&link.id) {
-            *entry.slot(link.role) = None;
-            if entry.listen.is_none() && entry.connect.is_none() {
+            *entry.slot(link.role) = LinkSlot::Deleted;
+            if entry.listen == LinkSlot::Deleted && entry.connect == LinkSlot::Deleted {
                 links.remove(&link.id);
             }
         }
