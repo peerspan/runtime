@@ -20,6 +20,11 @@ pub const AGENT_PORT: u32 = 1024;
 /// guest, init listens on it and the launcher maps the supervisor's connections to it.
 pub const LINK_PORT: u32 = 1025;
 
+/// The byte the `listen` guest's init sends first on each link stream, once the command's
+/// listener has accepted the connection it opened for it. The host carries nothing, and counts
+/// nothing, before it: a stream that closes without it was refused.
+pub const LINK_ACCEPTED: u8 = 1;
+
 /// virtio-fs tag of the read-only root filesystem.
 pub const ROOTFS_TAG: &str = "rootfs";
 

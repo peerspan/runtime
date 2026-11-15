@@ -11,6 +11,10 @@
 //! the second, one pair per connection, and copies bytes both ways under the link's bounds:
 //! connections open at once, and bytes each way over the link's life. Reaching the byte bound,
 //! or either run's end, closes every connection and refuses new ones.
+//!
+//! The `listen` guest's init sends [`LINK_ACCEPTED`] on a stream once the command has accepted
+//! the connection it opened for it. Until then nothing is carried or counted, so bytes a client
+//! sends on a connection the `listen` guest refuses never count against the byte bound.
 
 use std::collections::HashMap;
 use std::io::{self, ErrorKind, Read, Write};
@@ -21,6 +25,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+use peerspan_runtime_protocol::LINK_ACCEPTED;
 
 /// How often the relay looks for a stop while no connection arrives.
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
@@ -124,9 +130,13 @@ impl Link {
         thread::spawn(move || link.carry(id, from_connect, to_listen));
     }
 
-    /// Copies both ways until both directions have ended.
-    fn carry(&self, id: u64, from_connect: UnixStream, to_listen: UnixStream) {
-        let (Ok(connect_in), Ok(listen_out)) = (from_connect.try_clone(), to_listen.try_clone())
+    /// Waits for the `listen` guest to accept the connection, then copies both ways until both
+    /// directions have ended.
+    fn carry(&self, id: u64, from_connect: UnixStream, mut to_listen: UnixStream) {
+        let mut accepted = [0];
+        let ok = matches!(to_listen.read(&mut accepted), Ok(1)) && accepted[0] == LINK_ACCEPTED;
+        let (true, Ok(connect_in), Ok(listen_out)) =
+            (ok, from_connect.try_clone(), to_listen.try_clone())
         else {
             self.state().open.remove(&id);
             return;
@@ -220,7 +230,8 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
-    /// A listen side that echoes, behind a real socket, as the listen VMM's socket would be.
+    /// A listen side that accepts and echoes, behind a real socket, as the listen VMM's socket
+    /// would be.
     fn echo_server(dir: &std::path::Path) -> PathBuf {
         let path = dir.join("listen.sock");
         let listener = UnixListener::bind(&path).expect("bind listen socket");
@@ -229,6 +240,7 @@ mod tests {
                 thread::spawn(move || {
                     let mut reader = stream.try_clone().expect("clone");
                     let mut writer = stream;
+                    writer.write_all(&[LINK_ACCEPTED]).expect("accept");
                     let _ = io::copy(&mut reader, &mut writer);
                 });
             }
@@ -288,6 +300,36 @@ mod tests {
         assert!(b"abcde".starts_with(&rest), "got {rest:?}");
         let mut after = UnixStream::connect(&connect).expect("connect");
         assert_eq!(after.read(&mut buf).expect("read"), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A connection the listen guest refuses, closing it without the accepted byte, carries
+    /// nothing and counts nothing against the byte bound.
+    #[test]
+    fn a_refused_connection_counts_no_bytes() {
+        let dir = temp_dir();
+        let link = Link::new(1, 10);
+        let (connect, _relay) = connect_side(&dir, &link);
+        let refusing = dir.join("refusing.sock");
+        let listener = UnixListener::bind(&refusing).expect("bind listen socket");
+        link.listening(refusing);
+        let mut client = UnixStream::connect(&connect).expect("connect");
+        client.write_all(b"0123456789abc").expect("write");
+        // The listen side reads what was sent and closes without accepting.
+        let (mut refused, _) = listener.accept().expect("accept");
+        let mut buf = [0; 16];
+        refused
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("timeout");
+        assert!(
+            refused.read(&mut buf).is_err(),
+            "nothing is carried before acceptance"
+        );
+        drop(refused);
+        // Closed, at once: with what it sent unread, the client may see a reset.
+        assert!(matches!(client.read(&mut buf), Ok(0) | Err(_)));
+        assert_eq!(link.sent[0].load(Ordering::Relaxed), 0);
+        assert!(!link.state().closed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
