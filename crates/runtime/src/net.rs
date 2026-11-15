@@ -106,6 +106,9 @@ impl RunFilter {
             );
         };
         let names = Names::of(cgroup)?;
+        if names.table != DEFAULT_TABLE {
+            remove_legacy_reject(path_str(root)?);
+        }
         let script = format!(
             "{base}{chain}add element {table} runs {{ \"{cgroup}\" : jump {name} }}\n",
             base = base_rules(&names.table, path_str(root)?, depth),
@@ -197,6 +200,46 @@ impl Drop for RunFilter {
             );
         }
     }
+}
+
+/// Versions that kept every root in the default table left that table rejecting all traffic
+/// from the last root that installed a filter, which would now reject this root's runs before
+/// their own table accepts them. Removes that rule for `root`, a root other than the default.
+/// A failure is logged and the run goes on: the leftover rule only ever rejects.
+fn remove_legacy_reject(root: &str) {
+    let listing = Command::new("nft")
+        .args(["-a", "list", "chain"])
+        .args(DEFAULT_TABLE.split(' '))
+        .arg("output")
+        .stderr(Stdio::null())
+        .output();
+    // No default table or chain, nothing left in it.
+    let Ok(listing) = listing else { return };
+    if !listing.status.success() {
+        return;
+    }
+    let script = legacy_reject_deletions(&String::from_utf8_lossy(&listing.stdout), root);
+    if script.is_empty() {
+        return;
+    }
+    if let Err(e) = nft(&script) {
+        crate::log::warn(
+            "could not remove an earlier version's network rule",
+            &[("root", &root), ("error", &format!("{e:#}"))],
+        );
+    }
+}
+
+/// The deletions of the rules in `listing`, the default table's output chain listed with
+/// handles, that reject the traffic of the cgroup root `root`.
+fn legacy_reject_deletions(listing: &str, root: &str) -> String {
+    let rejected = format!(" \"{root}\" reject ");
+    listing
+        .lines()
+        .filter(|line| line.contains(&rejected))
+        .filter_map(|line| line.rsplit_once("# handle ")?.1.trim().parse::<u64>().ok())
+        .map(|handle| format!("delete rule {DEFAULT_TABLE} output handle {handle}\n"))
+        .collect()
 }
 
 /// What `nft` lists for `table`, or `None` if there is no such table.
@@ -394,5 +437,12 @@ mod tests {
         assert!(
             base_rules(&other, "other/root", 3).contains(&format!("flush chain {other} output"))
         );
+        let listing = "\t\tsocket cgroupv2 level 2 vmap @runs # handle 4\n\
+            \t\tsocket cgroupv2 level 1 \"other\" reject with icmpx admin-prohibited # handle 7\n";
+        assert_eq!(
+            legacy_reject_deletions(listing, "other"),
+            "delete rule inet peerspan_runtime output handle 7\n"
+        );
+        assert_eq!(legacy_reject_deletions(listing, "peerspan-runtime"), "");
     }
 }
