@@ -223,7 +223,9 @@ updates a tag to what it names now. `images` lists what is cached, with sizes an
 
 Each guest's traffic goes through its own [passt](https://passt.top) process and leaves as
 ordinary host sockets. An nftables table (`inet peerspan_runtime`) filters it by the run's
-cgroup and fails closed.
+cgroup and fails closed. A runtime started with another `--cgroup-root` gets a table of its own
+(`inet peerspan_runtime_` and a hash of the root), so two runtimes on one host keep separate
+rules.
 
 ## Confinement
 

@@ -9,7 +9,8 @@
 //! namespace, so it could reach anything the host can. passt runs in the run's cgroup, and an
 //! nftables table limits where sockets in that cgroup may connect: every run's traffic goes to
 //! a chain of its own, and traffic from the runtime's cgroups with no chain is rejected, so the
-//! filter fails closed.
+//! filter fails closed. Each cgroup root has a table of its own, so two runtimes on one host
+//! with different roots never rewrite each other's rules.
 
 use std::fmt;
 use std::fs;
@@ -20,9 +21,10 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, bail};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
-/// The nftables table the runtime owns, shared by every run on the host.
-const TABLE: &str = "inet peerspan_runtime";
+/// The nftables table of a runtime under the default cgroup root, shared by all its runs.
+const DEFAULT_TABLE: &str = "inet peerspan_runtime";
 /// Where cgroup v2 is mounted; nftables matches cgroups by their path below it.
 const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
 /// Rejected traffic fails fast in the guest instead of hanging until a timeout.
@@ -77,9 +79,11 @@ impl fmt::Display for Level {
 #[derive(Debug)]
 pub struct RunFilter(Names);
 
-/// Where a run is in the filter: its chain, and its cgroup's key in the map of runs.
+/// Where a run is in the filter: its root's table, its chain, and its cgroup's key in the map
+/// of runs.
 #[derive(Debug)]
 struct Names {
+    table: String,
     chain: String,
     cgroup: String,
 }
@@ -103,9 +107,10 @@ impl RunFilter {
         };
         let names = Names::of(cgroup)?;
         let script = format!(
-            "{base}{chain}add element {TABLE} runs {{ \"{cgroup}\" : jump {name} }}\n",
-            base = base_rules(path_str(root)?, depth),
-            chain = run_chain(&names.chain, level, &resolvers()),
+            "{base}{chain}add element {table} runs {{ \"{cgroup}\" : jump {name} }}\n",
+            base = base_rules(&names.table, path_str(root)?, depth),
+            chain = run_chain(&names.table, &names.chain, level, &resolvers()),
+            table = names.table,
             cgroup = names.cgroup,
             name = names.chain,
         );
@@ -124,18 +129,23 @@ impl Names {
             .file_name()
             .and_then(|n| n.to_str())
             .context("cgroup name is not UTF-8")?;
+        let root = relative.parent().context("a run's cgroup has no parent")?;
         Ok(Names {
+            table: table_of(path_str(root)?),
             chain: name.to_owned(),
             cgroup: path_str(relative)?.to_owned(),
         })
     }
 
     fn delete_element(&self) -> String {
-        format!("delete element {TABLE} runs {{ \"{}\" }}\n", self.cgroup)
+        format!(
+            "delete element {} runs {{ \"{}\" }}\n",
+            self.table, self.cgroup
+        )
     }
 
     fn delete_chain(&self) -> String {
-        format!("delete chain {TABLE} {}\n", self.chain)
+        format!("delete chain {} {}\n", self.table, self.chain)
     }
 }
 
@@ -149,20 +159,21 @@ pub fn remove_stale(cgroups: &[&Path]) -> anyhow::Result<()> {
     if cgroups.is_empty() {
         return Ok(());
     }
-    let listing = Command::new("nft")
-        .args(["list", "table"])
-        .args(TABLE.split(' '))
-        .stderr(Stdio::null())
-        .output()
-        .context("running nft")?;
-    // No table, nothing left in it.
-    if !listing.status.success() {
-        return Ok(());
-    }
-    let listing = String::from_utf8_lossy(&listing.stdout);
     let mut script = String::new();
+    // One listing per table; the cgroups of one runtime share a root, and so a table.
+    let mut listings: Vec<(String, Option<String>)> = vec![];
     for cgroup in cgroups {
         let names = Names::of(cgroup)?;
+        let listing = match listings.iter().find(|(table, _)| *table == names.table) {
+            Some((_, listing)) => listing.clone(),
+            None => {
+                let listing = list_table(&names.table)?;
+                listings.push((names.table.clone(), listing.clone()));
+                listing
+            }
+        };
+        // No table, nothing left in it.
+        let Some(listing) = listing else { continue };
         if listing.contains(&format!("\"{}\" : jump", names.cgroup)) {
             script.push_str(&names.delete_element());
         }
@@ -188,25 +199,52 @@ impl Drop for RunFilter {
     }
 }
 
+/// What `nft` lists for `table`, or `None` if there is no such table.
+fn list_table(table: &str) -> anyhow::Result<Option<String>> {
+    let listing = Command::new("nft")
+        .args(["list", "table"])
+        .args(table.split(' '))
+        .stderr(Stdio::null())
+        .output()
+        .context("running nft")?;
+    Ok(listing
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&listing.stdout).into_owned()))
+}
+
+/// The table of the runtime whose cgroup root is `root`, a path relative to the cgroup mount.
+/// The default root keeps the name earlier versions used; any other root gets a name of its
+/// own, from a hash of the path, since a path is not an nftables identifier.
+fn table_of(root: &str) -> String {
+    let default = Path::new(crate::cgroup::DEFAULT_ROOT).strip_prefix(CGROUP_MOUNT);
+    if default.is_ok_and(|default| default == Path::new(root)) {
+        return DEFAULT_TABLE.to_owned();
+    }
+    let digest = Sha256::digest(root.as_bytes());
+    let suffix: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{DEFAULT_TABLE}_{suffix}")
+}
+
 /// The table, the map from run cgroups to their chains, and the output hook. Rewritten on
-/// every install, in the same transaction, so it always matches the current cgroup root.
-fn base_rules(root: &str, depth: usize) -> String {
+/// every install, in the same transaction, so it always matches the table's cgroup root.
+fn base_rules(table: &str, root: &str, depth: usize) -> String {
     let parent_depth = depth - 1;
     format!(
-        "table {TABLE} {{
+        "table {table} {{
   map runs {{ typeof socket cgroupv2 level {depth} : verdict; }}
   chain output {{ type filter hook output priority 0; policy accept; }}
 }}
-flush chain {TABLE} output
-add rule {TABLE} output socket cgroupv2 level {depth} vmap @runs
-add rule {TABLE} output socket cgroupv2 level {parent_depth} \"{root}\" {REJECT}
+flush chain {table} output
+add rule {table} output socket cgroupv2 level {depth} vmap @runs
+add rule {table} output socket cgroupv2 level {parent_depth} \"{root}\" {REJECT}
 "
     )
 }
 
 /// One run's chain: DNS to the host's resolvers, then the host's own addresses and the ranges
 /// `level` excludes are rejected, and the rest accepted.
-fn run_chain(name: &str, level: Level, resolvers: &[IpAddr]) -> String {
+fn run_chain(table: &str, name: &str, level: Level, resolvers: &[IpAddr]) -> String {
     let mut rules = vec![];
     for resolver in resolvers {
         let family = if resolver.is_ipv4() { "ip" } else { "ip6" };
@@ -222,9 +260,9 @@ fn run_chain(name: &str, level: Level, resolvers: &[IpAddr]) -> String {
         rules.push(format!("ip6 daddr {PRIVATE_V6} {REJECT}"));
     }
     rules.push("accept".to_owned());
-    let mut script = format!("add chain {TABLE} {name}\n");
+    let mut script = format!("add chain {table} {name}\n");
     for rule in rules {
-        script.push_str(&format!("add rule {TABLE} {name} {rule}\n"));
+        script.push_str(&format!("add rule {table} {name} {rule}\n"));
     }
     script
 }
@@ -320,8 +358,8 @@ mod tests {
 
     #[test]
     fn internet_rejects_private_ranges_and_lan_does_not() {
-        let internet = run_chain("run-1", Level::Internet, &[]);
-        let lan = run_chain("run-1", Level::InternetLan, &[]);
+        let internet = run_chain(DEFAULT_TABLE, "run-1", Level::Internet, &[]);
+        let lan = run_chain(DEFAULT_TABLE, "run-1", Level::InternetLan, &[]);
         assert!(internet.contains(PRIVATE_V4));
         assert!(internet.contains(PRIVATE_V6));
         assert!(!lan.contains(PRIVATE_V4));
@@ -335,15 +373,26 @@ mod tests {
 
     #[test]
     fn dns_to_resolvers_is_accepted_before_local_addresses_are_rejected() {
-        let chain = run_chain("run-1", Level::Internet, &["127.0.0.53".parse().unwrap()]);
+        let chain = run_chain(
+            DEFAULT_TABLE,
+            "run-1",
+            Level::Internet,
+            &["127.0.0.53".parse().unwrap()],
+        );
         let dns = chain.find("127.0.0.53").unwrap();
         assert!(dns < chain.find("fib daddr type local").unwrap());
     }
 
     #[test]
     fn base_rules_reject_the_runtime_root_one_level_up() {
-        let rules = base_rules("peerspan-runtime", 2);
+        let rules = base_rules(&table_of("peerspan-runtime"), "peerspan-runtime", 2);
+        assert!(rules.contains("table inet peerspan_runtime {"));
         assert!(rules.contains("level 2 vmap @runs"));
         assert!(rules.contains("level 1 \"peerspan-runtime\" reject"));
+        let other = table_of("other/root");
+        assert_ne!(other, table_of("peerspan-runtime"));
+        assert!(
+            base_rules(&other, "other/root", 3).contains(&format!("flush chain {other} output"))
+        );
     }
 }
