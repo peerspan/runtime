@@ -89,7 +89,9 @@ exits with its code.
 | `--harness DIR` | Mount DIR read-only at `/opt/peerspan/harness`, for a tool the image lacks, such as an agent's static binary; the VM's own user must be able to read it |
 
 Exit codes: the command's own, 128 + N if a signal ended it, 124 on timeout, 127 if it never
-ran. Archives may hold only directories, files and symbolic links, with no absolute paths or
+ran. When the guest's kernel killed processes for lack of memory, `run` says so on standard
+error, `peerspan-runtime: the guest killed N processes for lack of memory (M MiB)`, whatever
+the exit code: a build whose compiler was killed often just exits 1 or 101. Archives may hold only directories, files and symbolic links, with no absolute paths or
 `..`.
 
 With `--peerfs-workspace`, a peerfs process of the run's own serves the workspace to the VM as a
@@ -167,6 +169,11 @@ For runtime agents (the host's runtime agent contract), a run also takes:
   bind, listen on and accept Unix sockets, which its seccomp filter otherwise refuses.
 
 `GET /v1/runtime` reports `max_network`, `images: true` and `links: true`.
+
+A run's `exited` result also has `oom_kills`: how many processes the guest's kernel killed for
+lack of memory (its `/proc/vmstat` `oom_kill`), 0 when none. The command may still have exited
+with a status, which is then often the failure those kills caused. A VM that exceeded its own
+memory limit on the host has `error` set instead, as before.
 - The workspace's size is not capped.
 
 `serve` logs to standard error, which the systemd unit sends to the journal, one line per

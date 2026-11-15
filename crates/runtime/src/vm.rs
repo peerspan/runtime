@@ -164,6 +164,9 @@ pub struct Outcome {
     /// For a peerfs workspace committed after the run, the commit, if there was anything to
     /// commit.
     pub commit: Option<String>,
+    /// How many processes in the guest its kernel killed for lack of memory. The command
+    /// may still have exited, with whatever status its parent gave after losing them.
+    pub oom_kills: u64,
     /// How long setup took and how much memory the run used.
     pub metrics: Metrics,
 }
@@ -194,6 +197,8 @@ struct Progress {
     stamps: Vec<(String, u64)>,
     /// The guest's own phases, in microseconds of its boot clock.
     guest_phases: Vec<(String, u64)>,
+    /// How many processes the guest's kernel killed for lack of memory.
+    memory_kills: u64,
 }
 
 /// Why the watchdog stopped a run.
@@ -571,6 +576,7 @@ fn serve_guest(
             .started
             .map(|at| at.elapsed());
         outcome.duration = ran_for.unwrap_or_default();
+        outcome.oom_kills = progress.lock().expect("lock poisoned").memory_kills;
         match (*stopped.lock().expect("lock poisoned"), result) {
             (Some(Stop::Cancelled), _) => outcome.signal = Some(libc::SIGKILL),
             (Some(Stop::TimedOut), _) => outcome.timed_out = true,
@@ -631,6 +637,9 @@ fn converse(
             }
             Some(Message::Phases(phases)) => {
                 progress.lock().expect("lock poisoned").guest_phases = phases;
+            }
+            Some(Message::MemoryKills(count)) => {
+                progress.lock().expect("lock poisoned").memory_kills = count;
             }
             Some(Message::Stdout(bytes)) => on_event(Event::Stdout(&bytes))?,
             Some(Message::Stderr(bytes)) => on_event(Event::Stderr(&bytes))?,
@@ -1177,6 +1186,16 @@ fn snapshot(workspace: &PeerfsWorkspace, message: &str) -> anyhow::Result<Option
         }
         thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// Says that the guest's kernel killed `count` processes for lack of memory in a VM of
+/// `memory_mib`.
+pub fn memory_kills_message(count: u64, memory_mib: u32) -> String {
+    let processes = if count == 1 { "process" } else { "processes" };
+    format!(
+        "the guest killed {count} {processes} for lack of memory ({memory_mib} MiB); \
+         give the run more memory or run fewer jobs at once"
+    )
 }
 
 /// The message of the snapshot after a run: how the command ended.

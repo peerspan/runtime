@@ -222,17 +222,40 @@ fn run(mut phases: Phases) -> io::Result<()> {
 
     let writer = Arc::new(Mutex::new(stream));
     let Some((code, signal)) = execute(&command, reader, &writer, phases) else {
+        let mut stream = writer.lock().expect("stream lock poisoned");
+        report_memory_kills(&mut stream)?;
         return Message::Exited {
             code: None,
             signal: None,
         }
-        .write_to(&mut *writer.lock().expect("stream lock poisoned"));
+        .write_to(&mut *stream);
     };
     let mut stream = writer.lock().expect("stream lock poisoned");
     if command.collect_changes {
         workspace::send_changes(workspace, &manifest, &mut *stream)?;
     }
+    report_memory_kills(&mut stream)?;
     Message::Exited { code, signal }.write_to(&mut *stream)
+}
+
+/// Tells the host how many processes the kernel killed for lack of memory, when any were. The
+/// guest boots fresh for each run, so the kernel's count is the run's.
+fn report_memory_kills(stream: &mut File) -> io::Result<()> {
+    match memory_kills() {
+        Some(count) if count > 0 => Message::MemoryKills(count).write_to(stream),
+        _ => Ok(()),
+    }
+}
+
+/// `oom_kill` from `/proc/vmstat`, if the kernel reports it.
+fn memory_kills() -> Option<u64> {
+    fs::read_to_string("/proc/vmstat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("oom_kill "))?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Mounts the harness directory read-only at [`HARNESS_PATH`], in the writable root layer.

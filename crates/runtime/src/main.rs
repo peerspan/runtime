@@ -419,6 +419,12 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
     if let Some(commit) = &outcome.commit {
         eprintln!("peerspan-runtime: committed {commit}");
     }
+    if outcome.oom_kills > 0 {
+        eprintln!(
+            "peerspan-runtime: {}",
+            vm::memory_kills_message(outcome.oom_kills, args.memory_mib)
+        );
+    }
     if let Some(error) = &outcome.error {
         eprintln!("peerspan-runtime: {error}");
         return Ok(EXIT_NOT_RUN);
