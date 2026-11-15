@@ -7,8 +7,8 @@
 //! - `connect`: init listens on `127.0.0.1:port` and, for each connection the command opens,
 //!   opens one vsock stream to the host's [`LINK_PORT`] and copies bytes both ways.
 //! - `listen`: init listens on vsock [`LINK_PORT`] and, for each stream the host opens, opens
-//!   one TCP connection to `127.0.0.1:port` and copies bytes both ways. A connection the
-//!   command is not listening for is closed at once.
+//!   one TCP connection to `127.0.0.1:port`, tells the host with [`LINK_ACCEPTED`], and copies
+//!   bytes both ways. A connection the command is not listening for is closed at once.
 //!
 //! Bounds on connections and bytes are the host's; init only carries what arrives.
 
@@ -18,7 +18,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::thread;
 
-use peerspan_runtime_protocol::{LINK_PORT, Link, LinkRole};
+use peerspan_runtime_protocol::{LINK_ACCEPTED, LINK_PORT, Link, LinkRole};
 use rustix::net::{AddressFamily, SocketFlags, SocketType};
 
 /// Starts carrying the link, before the command starts, so the port is ready for it.
@@ -44,10 +44,13 @@ pub fn start(link: Link) -> io::Result<()> {
             let listener = vsock_listener(LINK_PORT)?;
             let port = link.port;
             thread::spawn(move || {
-                while let Ok(vsock) = accept(&listener) {
+                while let Ok(mut vsock) = accept(&listener) {
                     thread::spawn(move || {
-                        // Not listening yet, or no longer: the host sees the stream close.
-                        if let Ok(tcp) = TcpStream::connect(("127.0.0.1", port)) {
+                        // Not listening yet, or no longer: the host sees the stream close
+                        // without the accepted byte.
+                        if let Ok(tcp) = TcpStream::connect(("127.0.0.1", port))
+                            && vsock.write_all(&[LINK_ACCEPTED]).is_ok()
+                        {
                             splice(tcp, vsock);
                         }
                     });
