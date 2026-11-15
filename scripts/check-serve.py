@@ -312,6 +312,138 @@ def check_links(sock):
     check("link-id-free-after-lone-run-deleted", lone == 201 and again == 201, (lone, again))
 
 
+PACKAGE_ENV = "echo \"$CARGO_HOME|$npm_config_cache|$PIP_CACHE_DIR|$GOMODCACHE|$GOCACHE\""
+
+
+def check_caches(sock, pf):
+    """Build caches (the build cache contract's two run fields), on the space whose main holds
+    a.txt. Needs a peerfs with caches."""
+    info = call(sock, "GET", "/v1/runtime")[1]
+    check("cache-reported", info.get("peerfs_caches") is True, info)
+
+    def cache_run(n, script, **fields):
+        body = {**request(n, ["sh", "-c", script]), "peerfs_fork_from": "main", **fields}
+        status, _ = call(sock, "POST", "/v1/runs", body)
+        events = follow(sock, run_id(n))
+        call(sock, "DELETE", f"/v1/runs/{run_id(n)}")
+        return status, exited(events), stream(events).decode()
+
+    def caches():
+        return {c["name"]: c for c in json.loads(pf("cache", "ls", "--json"))}
+
+    def gone(name):
+        """The refresh's workspace and any branch of its name are gone."""
+        return (name not in [line.split()[0] for line in pf("ws", "list").splitlines()]
+                and name not in [line.split()[1] for line in pf("branches").splitlines()])
+
+    main_head = next(line.split()[0] for line in pf("branches").splitlines()
+                     if line.split()[1] == "main")
+
+    # A run without either field has no package caches in its environment, and its result says
+    # it saved no cache.
+    status, result, out = cache_run(106, PACKAGE_ENV, peerfs_workspace="plain.106")
+    check("cache-saved-false", status == 201 and result["exit_code"] == 0
+          and result["cache_saved"] is False and out == "||||\n", (status, result, out))
+
+    # A refresh with both fields, of a cache that does not exist yet: it builds from cold, its
+    # derived files become the cache's current version, built from main's head, and its
+    # workspace and branch are gone. The package caches are in its environment.
+    script = ("cat target/out.o 2> /dev/null || echo cold; mkdir -p target; "
+              "echo built > target/out.o; stat -c %Y target/out.o; " + PACKAGE_ENV)
+    status, result, out = cache_run(100, script, peerfs_workspace="bc-1.refresh.100",
+                                    peerfs_cache="bc-1", peerfs_cache_save="bc-1")
+    lines = out.splitlines()
+    saved = caches().get("bc-1")
+    check("refresh-saves", status == 201 and result["exit_code"] == 0
+          and result["error"] is None and result["cache_saved"] is True
+          and lines[0] == "cold" and saved and saved["commit"] == main_head
+          and gone("bc-1.refresh.100"), (status, result, out, saved))
+    built_at = lines[1] if len(lines) > 1 else None
+    check("cache-package-env", lines[2:] == [
+        "/workspace/.peerspan/cache/cargo|/workspace/.peerspan/cache/npm|"
+        "/workspace/.peerspan/cache/pip|/workspace/.peerspan/cache/go/mod|"
+        "/workspace/.peerspan/cache/go/build"], lines)
+
+    # A task holding the cache sees its file, dated as when it was saved, and its `env`
+    # overrides a package cache.
+    time.sleep(2)
+    status, result, out = cache_run(
+        101, "cat target/out.o; stat -c %Y target/out.o; " + PACKAGE_ENV,
+        peerfs_workspace="task.101", peerfs_cache="bc-1", peerfs_commit=True,
+        peerfs_commit_message="task 101", peerfs_discard=True,
+        env={"GOCACHE": "/tmp/go", "CARGO_HOME": "/tmp/cargo"})
+    lines = out.splitlines()
+    check("cache-task-holds", status == 201 and result["exit_code"] == 0
+          and result["error"] is None and result["cache_saved"] is False
+          and lines[:2] == ["built", built_at], (status, result, out, built_at))
+    check("cache-package-env-overridden", lines[2:] == [
+        "/tmp/cargo|/workspace/.peerspan/cache/npm|/workspace/.peerspan/cache/pip|"
+        "/workspace/.peerspan/cache/go/mod|/tmp/go"], lines)
+
+    # A refresh that fails saves nothing and leaves the cache as it was, but its workspace
+    # and branch go.
+    before = caches()
+    status, result, out = cache_run(102, "echo other > target/out.o; exit 1",
+                                    peerfs_workspace="bc-1.refresh.102",
+                                    peerfs_cache="bc-1", peerfs_cache_save="bc-1")
+    check("refresh-failed", status == 201 and result["exit_code"] == 1
+          and result["error"] is None and result["cache_saved"] is False
+          and caches() == before and gone("bc-1.refresh.102"), (status, result, caches()))
+
+    # So does one that changes source, even exiting 0; its error names the first changed
+    # source path in byte order.
+    status, result, out = cache_run(
+        103, "echo new > z.txt; echo changed > a.txt; echo other > target/out.o",
+        peerfs_workspace="bc-1.refresh.103", peerfs_cache="bc-1", peerfs_cache_save="bc-1")
+    check("refresh-source-changed", status == 201 and result["exit_code"] == 0
+          and result["error"] == "the build changed source files: a.txt"
+          and result["cache_saved"] is False and caches() == before
+          and gone("bc-1.refresh.103"), (status, result, caches()))
+
+    # After both, a task still sees the version the first refresh saved.
+    status, result, out = cache_run(107, "cat target/out.o; stat -c %Y target/out.o",
+                                    peerfs_workspace="task.107", peerfs_cache="bc-1")
+    check("cache-kept", result["exit_code"] == 0 and out.splitlines() == ["built", built_at],
+          (result, out))
+
+    # A refresh that holds the current version builds on it, and saves the next.
+    status, result, out = cache_run(105, "cat target/out.o; echo again > target/more.o",
+                                    peerfs_workspace="bc-1.refresh.105",
+                                    peerfs_cache="bc-1", peerfs_cache_save="bc-1")
+    after = caches().get("bc-1")
+    check("refresh-incremental", result["exit_code"] == 0 and result["cache_saved"] is True
+          and out == "built\n" and after and after["saved_at"] != before["bc-1"]["saved_at"]
+          and gone("bc-1.refresh.105"), (result, out, after))
+
+    # A cache that does not exist is no error: the fork holds none.
+    status, result, out = cache_run(104, "ls target 2>&1; true",
+                                    peerfs_workspace="task.104", peerfs_cache="bc-none")
+    check("cache-missing", status == 201 and result["exit_code"] == 0
+          and result["error"] is None and "no cache" in pf("ws", "status", "task.104"),
+          (status, result, out))
+
+    refused = []
+    for n, fields in [
+            (110, {"peerfs_workspace": "w110", "peerfs_cache": "bc-1"}),
+            (111, {"peerfs_workspace": "w111", "peerfs_cache_save": "bc-1"}),
+            (112, {"peerfs_workspace": "w112", "peerfs_fork_from": "main",
+                   "peerfs_cache_save": "bc-1", "peerfs_commit": True,
+                   "peerfs_commit_message": "m"}),
+            (113, {"peerfs_workspace": "w113", "peerfs_fork_from": "main",
+                   "peerfs_cache": "Bc-1"}),
+            (114, {"peerfs_workspace": "w114", "peerfs_fork_from": "main",
+                   "peerfs_cache_save": "-bc"}),
+            (115, {"peerfs_workspace": "w115", "peerfs_fork_from": "main",
+                   "peerfs_cache": "b" * 129})]:
+        status, body = call(sock, "POST", "/v1/runs", {**request(n, ["true"]), **fields})
+        refused.append((status, body.get("error", "")))
+    fields = ["peerfs_cache", "peerfs_cache_save", "peerfs_cache_save", "peerfs_cache",
+              "peerfs_cache_save", "peerfs_cache"]
+    check("cache-refused", [s for s, _ in refused] == [400] * 6
+          and all(error.startswith(field) for (_, error), field in zip(refused, fields)),
+          refused)
+
+
 def main():
     work = tempfile.mkdtemp()
     # Each run's workspace server runs as the run's own user, which must reach the state dir.
@@ -510,6 +642,13 @@ def main():
         status, _ = call(sock, "POST", "/v1/runs",
                          {**request(20, ["true"]), "peerfs_workspace": "agent"})
         check("peerfs-no-space", status == 422, status)
+        # Without a space, no peerfs keeps caches: a run naming one is refused.
+        info = call(sock, "GET", "/v1/runtime")[1]
+        status, body = call(sock, "POST", "/v1/runs", {
+            **request(20, ["true"]), "peerfs_workspace": "w", "peerfs_fork_from": "main",
+            "peerfs_cache": "bc-1"})
+        check("cache-no-caches", info.get("peerfs_caches") is False and status == 400
+              and "peerfs_cache needs" in body.get("error", ""), (info, status, body))
 
         # With PEERSPAN_PEERFS naming a peerfs binary: a run on a workspace of the space reads
         # its branch's files and its writes land in the workspace, and its result names the
@@ -759,6 +898,8 @@ def main():
                 check("run-image-pull-cancelled", result["signal"] == 9 and took < 5
                       and not any(e["kind"] == "started" for e in events) and after == 201,
                       (result, took, after))
+
+                check_caches(sock, pf)
             finally:
                 pf("stop")
     finally:
