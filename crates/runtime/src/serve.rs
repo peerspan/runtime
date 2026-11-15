@@ -157,6 +157,15 @@ struct RunRequest {
     /// commit, keeping its branch.
     #[serde(default)]
     peerfs_discard: bool,
+    /// A build cache whose current version the fork holds, with `peerfs_fork_from` (the build
+    /// cache contract). A cache that does not exist is no error.
+    #[serde(default)]
+    peerfs_cache: Option<String>,
+    /// A build cache this run refreshes, with `peerfs_fork_from` and `peerfs_commit` false:
+    /// once the command has exited 0 without changing source, the workspace's derived files
+    /// become the cache's new current version.
+    #[serde(default)]
+    peerfs_cache_save: Option<String>,
     /// An OCI image to boot in place of the runtime's own, pulled into the image cache when the
     /// run starts if it is not there.
     #[serde(default)]
@@ -255,6 +264,50 @@ struct Runtime {
     /// Links by `id`, from their first run's acceptance until both runs are deleted. Locked
     /// after `runs`.
     links: Mutex<HashMap<String, LinkEntry>>,
+    /// Whether the space's peerfs keeps build caches, once peerfs has told.
+    peerfs_caches: std::sync::OnceLock<bool>,
+}
+
+impl Runtime {
+    /// Whether runs may name build caches: the runtime has a peerfs space and its peerfs keeps
+    /// caches. Asked of peerfs the first time, and again while it cannot tell, such as while
+    /// the space cannot be reached.
+    fn peerfs_caches(&self) -> bool {
+        let Some(space) = &self.args.peerfs_space else {
+            return false;
+        };
+        if let Some(known) = self.peerfs_caches.get() {
+            return *known;
+        }
+        match vm::peerfs_has_caches(&self.args.peerfs, space) {
+            Some(known) => *self.peerfs_caches.get_or_init(|| known),
+            None => false,
+        }
+    }
+}
+
+/// The package caches a run with a build cache has in its environment, under its own `env`:
+/// inside the workspace, in a derived path, so they are kept with the build cache.
+const PACKAGE_CACHES: [(&str, &str); 5] = [
+    ("CARGO_HOME", "/workspace/.peerspan/cache/cargo"),
+    ("npm_config_cache", "/workspace/.peerspan/cache/npm"),
+    ("PIP_CACHE_DIR", "/workspace/.peerspan/cache/pip"),
+    ("GOMODCACHE", "/workspace/.peerspan/cache/go/mod"),
+    ("GOCACHE", "/workspace/.peerspan/cache/go/build"),
+];
+
+/// The command's environment: the image's, then for a run with a build cache the package
+/// caches, then the run's own `env`, each overriding the one before.
+fn command_env(image: Vec<(String, String)>, request: &RunRequest) -> Vec<(String, String)> {
+    let caches = if request.peerfs_cache.is_some() || request.peerfs_cache_save.is_some() {
+        PACKAGE_CACHES
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    crate::image::merge_env(crate::image::merge_env(image, caches), request.env.clone())
 }
 
 struct Run {
@@ -368,6 +421,7 @@ pub fn serve(args: ServeArgs) -> anyhow::Result<()> {
         runs: Mutex::new(HashMap::new()),
         held: Mutex::new(HashSet::new()),
         links: Mutex::new(HashMap::new()),
+        peerfs_caches: std::sync::OnceLock::new(),
     });
     for request in server.incoming_requests() {
         let runtime = Arc::clone(&runtime);
@@ -454,6 +508,7 @@ fn runtime_info(runtime: &Runtime) -> Value {
         "max_network": args.max_network.to_string(),
         "images": true,
         "links": true,
+        "peerfs_caches": runtime.peerfs_caches(),
     })
 }
 
@@ -471,6 +526,21 @@ fn start(runtime: &Arc<Runtime>, body: &[u8]) -> (u16, Value) {
     };
     if let Err(reason) = validate(&request) {
         return error(400, "invalid", &reason);
+    }
+    let cache_field = [
+        ("peerfs_cache", request.peerfs_cache.is_some()),
+        ("peerfs_cache_save", request.peerfs_cache_save.is_some()),
+    ]
+    .into_iter()
+    .find_map(|(field, set)| set.then_some(field));
+    if let Some(field) = cache_field
+        && !runtime.peerfs_caches()
+    {
+        return error(
+            400,
+            "invalid",
+            &format!("{field} needs a runtime whose peerfs keeps build caches"),
+        );
     }
     let args = &runtime.args;
     let resources = request.resources;
@@ -730,6 +800,25 @@ fn validate(request: &RunRequest) -> Result<(), String> {
             return Err("peerfs_fork_from needs peerfs_workspace, the fork's name".into());
         }
     }
+    for (field, cache) in [
+        ("peerfs_cache", &request.peerfs_cache),
+        ("peerfs_cache_save", &request.peerfs_cache_save),
+    ] {
+        let Some(cache) = cache else { continue };
+        if !is_cache_name(cache) {
+            return Err(format!(
+                "{field} must be a cache's name: 1 to 128 lowercase letters, digits, ., _ and -, \
+                 starting with a letter or digit"
+            ));
+        }
+        if request.peerfs_fork_from.is_none() {
+            return Err(format!("{field} needs peerfs_fork_from"));
+        }
+    }
+    // A refresh saves the workspace's derived files and discards it; it commits nothing.
+    if request.peerfs_cache_save.is_some() && request.peerfs_commit {
+        return Err("peerfs_cache_save needs peerfs_commit false".into());
+    }
     if let Some(name) = &request.peerfs_workspace {
         if !is_peerfs_name(name) {
             return Err("peerfs_workspace must be a workspace's name".into());
@@ -749,7 +838,19 @@ fn validate(request: &RunRequest) -> Result<(), String> {
 /// Whether `name` is an addressable agent name: 1 to 64 characters of lowercase ASCII letters,
 /// digits, `.`, `_` and `-`, starting with a letter or digit.
 fn is_agent_name(name: &str) -> bool {
-    name.len() <= 64
+    is_lowercase_name(name, 64)
+}
+
+/// Whether `name` is a peerfs build cache's name: 1 to 128 characters of lowercase ASCII
+/// letters, digits, `.`, `_` and `-`, starting with a letter or digit.
+fn is_cache_name(name: &str) -> bool {
+    is_lowercase_name(name, 128)
+}
+
+/// Whether `name` is 1 to `max` characters of lowercase ASCII letters, digits, `.`, `_` and
+/// `-`, starting with a letter or digit.
+fn is_lowercase_name(name: &str, max: usize) -> bool {
+    name.len() <= max
         && name
             .bytes()
             .next()
@@ -859,6 +960,9 @@ fn execute(runtime: &Runtime, run: &Run) {
                 .then(|| request.peerfs_commit_message.clone())
                 .flatten(),
             discard: request.peerfs_discard,
+            cache: request.peerfs_cache.clone(),
+            cache_save: request.peerfs_cache_save.clone(),
+            created: AtomicBool::new(false),
         });
     let inputs = run_inputs(run, &runtime.args.image_cache);
     let (outcome, results) = match prepare(run, runtime.args.workspace_mib, peerfs.is_none())
@@ -913,10 +1017,7 @@ fn execute(runtime: &Runtime, run: &Run) {
                 command: peerspan_runtime_protocol::Command {
                     argv: request.argv.clone(),
                     cwd: request.cwd.clone(),
-                    env: crate::image::merge_env(
-                        image.map_or_else(Vec::new, |i| i.env.clone()),
-                        request.env.clone(),
-                    ),
+                    env: command_env(image.map_or_else(Vec::new, |i| i.env.clone()), request),
                     secrets,
                     archive: false,
                     collect_changes: request.results == Results::Changes,
@@ -953,8 +1054,12 @@ fn execute(runtime: &Runtime, run: &Run) {
             if let Some(image) = image {
                 image.mark_used();
             }
-            let outcome = vm::run(&spec, &run.cancel, &mut |event| results.record(run, &event))
+            let mut outcome = vm::run(&spec, &run.cancel, &mut |event| results.record(run, &event))
                 .unwrap_or_else(|e| failed(run, &e));
+            // Whether the VM ran or failed to: a refresh ends the same way, saving or not.
+            if let vm::Workspace::Peerfs(peerfs) = &spec.workspace {
+                vm::finish_refresh(peerfs, &mut outcome);
+            }
             (outcome, Some(results))
         }
     };
@@ -982,6 +1087,7 @@ fn execute(runtime: &Runtime, run: &Run) {
             "oom_kills": outcome.oom_kills,
             "snapshot": outcome.snapshot,
             "commit": outcome.commit,
+            "cache_saved": outcome.cache_saved,
         },
     }));
     log_finished(run, &outcome, stdout_bytes, stderr_bytes);
@@ -1015,6 +1121,9 @@ fn log_finished(run: &Run, outcome: &Outcome, stdout_bytes: u64, stderr_bytes: u
     }
     if let Some(snapshot) = &outcome.snapshot {
         fields.push(("snapshot", snapshot.clone()));
+    }
+    if outcome.cache_saved {
+        fields.push(("cache_saved", "true".into()));
     }
     fields.push(("duration_ms", outcome.duration.as_millis().to_string()));
     if !outcome.metrics.connect.is_zero() {
@@ -1360,4 +1469,130 @@ fn not_found() -> (u16, Value) {
 
 fn error(status: u16, code: &str, message: &str) -> (u16, Value) {
     (status, json!({"code": code, "error": message}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A valid run on a fork of `main`, with `fields` added to it.
+    fn fork_run(fields: Value) -> RunRequest {
+        let mut body = json!({
+            "run_id": format!("run_{}", "0".repeat(64)),
+            "argv": ["true"],
+            "cwd": "/workspace",
+            "env": {},
+            "resources": {"cpus": 1, "memory_mib": 512, "timeout_seconds": 60},
+            "workspace_archive": null,
+            "results": "none",
+            "peerfs_workspace": "fork.1",
+            "peerfs_fork_from": "main",
+        });
+        for (name, value) in fields.as_object().expect("fields are an object") {
+            if value.is_null() {
+                body.as_object_mut().expect("an object").remove(name);
+            } else {
+                body[name] = value.clone();
+            }
+        }
+        serde_json::from_value(body).expect("a well-formed request")
+    }
+
+    #[test]
+    fn cache_fields_default_to_null() {
+        let request = fork_run(json!({}));
+        assert_eq!(request.peerfs_cache, None);
+        assert_eq!(request.peerfs_cache_save, None);
+        assert_eq!(validate(&request), Ok(()));
+    }
+
+    #[test]
+    fn cache_fields_are_accepted_on_a_fork() {
+        for fields in [
+            json!({"peerfs_cache": "bc-0123"}),
+            json!({"peerfs_cache_save": "bc-0123"}),
+            json!({"peerfs_cache": "bc-0123", "peerfs_cache_save": "bc-0123"}),
+            // A task: holds the cache, commits and discards.
+            json!({"peerfs_cache": "a", "peerfs_commit": true,
+                   "peerfs_commit_message": "task", "peerfs_discard": true}),
+            json!({"peerfs_cache": "0._-z", "peerfs_cache_save": "x".repeat(128)}),
+        ] {
+            assert_eq!(validate(&fork_run(fields.clone())), Ok(()), "{fields}");
+        }
+    }
+
+    #[test]
+    fn cache_fields_need_a_fork() {
+        for field in ["peerfs_cache", "peerfs_cache_save"] {
+            let request = fork_run(json!({ field: "bc-1", "peerfs_fork_from": null }));
+            assert_eq!(
+                validate(&request),
+                Err(format!("{field} needs peerfs_fork_from"))
+            );
+        }
+    }
+
+    #[test]
+    fn a_refresh_commits_nothing() {
+        let request = fork_run(json!({"peerfs_cache_save": "bc-1", "peerfs_commit": true,
+                                      "peerfs_commit_message": "task"}));
+        assert_eq!(
+            validate(&request),
+            Err("peerfs_cache_save needs peerfs_commit false".into())
+        );
+        // peerfs_discard still needs a commit: a refresh discards by itself.
+        let request = fork_run(json!({"peerfs_cache_save": "bc-1", "peerfs_discard": true}));
+        assert_eq!(
+            validate(&request),
+            Err("peerfs_discard needs peerfs_commit true".into())
+        );
+    }
+
+    #[test]
+    fn cache_names_are_checked() {
+        for field in ["peerfs_cache", "peerfs_cache_save"] {
+            for name in [
+                String::new(),
+                "-bc".into(),
+                ".bc".into(),
+                "_bc".into(),
+                "Bc".into(),
+                "bc/1".into(),
+                "bc 1".into(),
+                "bé".into(),
+                "x".repeat(129),
+            ] {
+                let error = validate(&fork_run(json!({ field: name })))
+                    .expect_err(&format!("{field} {name:?}"));
+                assert!(
+                    error.starts_with(&format!("{field} must be a cache's name")),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn package_caches_sit_under_the_runs_env() {
+        let image = vec![
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+            ("CARGO_HOME".to_owned(), "/usr/local/cargo".to_owned()),
+        ];
+        let request = fork_run(json!({"peerfs_cache": "bc-1",
+                                      "env": {"GOCACHE": "/tmp/go", "A": "b"}}));
+        let env: BTreeMap<_, _> = command_env(image.clone(), &request).into_iter().collect();
+        assert_eq!(env["PATH"], "/usr/bin");
+        assert_eq!(env["CARGO_HOME"], "/workspace/.peerspan/cache/cargo");
+        assert_eq!(env["npm_config_cache"], "/workspace/.peerspan/cache/npm");
+        assert_eq!(env["PIP_CACHE_DIR"], "/workspace/.peerspan/cache/pip");
+        assert_eq!(env["GOMODCACHE"], "/workspace/.peerspan/cache/go/mod");
+        assert_eq!(env["GOCACHE"], "/tmp/go");
+        assert_eq!(env["A"], "b");
+        // Without a cache field, the image's stay.
+        let env: BTreeMap<_, _> = command_env(image, &fork_run(json!({})))
+            .into_iter()
+            .collect();
+        assert_eq!(env["CARGO_HOME"], "/usr/local/cargo");
+        assert!(!env.contains_key("GOCACHE"));
+    }
 }
