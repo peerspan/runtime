@@ -1331,7 +1331,9 @@ fn delete(runtime: &Runtime, id: &str) -> (u16, Value) {
         let mut links = runtime.links.lock().expect("links lock poisoned");
         if let Some(entry) = links.get_mut(&link.id) {
             *entry.slot(link.role) = LinkSlot::Deleted;
-            if entry.listen == LinkSlot::Deleted && entry.connect == LinkSlot::Deleted {
+            // With no run left, the id is free again; a partner still there keeps the deleted
+            // role taken.
+            if entry.listen != LinkSlot::Taken && entry.connect != LinkSlot::Taken {
                 links.remove(&link.id);
             }
         }

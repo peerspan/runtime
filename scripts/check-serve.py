@@ -303,6 +303,14 @@ def check_links(sock):
           (first, partner, second, repeats, third, changed))
     check("link-id-taken-until-both-deleted", after_one == 400, after_one)
 
+    # A link that only ever had one run is free again once that run is deleted.
+    lone = call(sock, "POST", "/v1/runs", linked(84, "listen", "sleep 60", 20))[0]
+    finish(sock, 84)
+    again = call(sock, "POST", "/v1/runs", linked(85, "listen", "true", 20))[0]
+    if again == 201:
+        finish(sock, 85)
+    check("link-id-free-after-lone-run-deleted", lone == 201 and again == 201, (lone, again))
+
 
 def main():
     work = tempfile.mkdtemp()
