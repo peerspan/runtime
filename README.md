@@ -143,6 +143,32 @@ task contract's peerfs workspaces specify:
   branch, once the commit is made or there was nothing to commit, and only with no `error`.
   What only the workspace held goes with it, such as build output, so a finished run costs
   no disk beyond its commit. A discard that fails is logged and changes nothing else.
+- Build caches (the build cache contract), with a peerfs that keeps them: `GET /v1/runtime`
+  reports `peerfs_caches: true` when the space's peerfs answers `peerfs cache ls`, and false
+  without a space or with an older peerfs. Both fields below take a cache's name (1 to 128
+  lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit), need
+  `peerfs_fork_from`, and are refused with 400 when `peerfs_caches` is false.
+  - `peerfs_cache` creates the fork holding the cache's current version (`peerfs ws create
+    --cache`), read-only under its derived paths. A cache that does not exist is no error.
+  - `peerfs_cache_save`, with `peerfs_commit` false, makes the run a refresh. Once the command
+    has ended, if it exited 0, the result has no `error` and `peerfs ws status` lists no
+    changed source path, the runtime saves the workspace's derived files as the cache's new
+    current version (`peerfs cache save`, which discards the workspace). Otherwise it saves
+    nothing, leaving the cache as it was, and discards the workspace; a run that changed source
+    has `error` `the build changed source files: PATH`, the first such path in byte order, and
+    a save that fails sets `error` too. The refresh's workspace follows `peerfs_fork_from`
+    itself, so no branch is made for it and none is left once it ends; a workspace or branch
+    of its name already there still fails the run. The two fields may be set together, so a
+    refresh builds on the current version and saves the next.
+  - The `exited` result gains `cache_saved`: true when the run saved a version, false
+    otherwise, including for runs without `peerfs_cache_save`.
+  - A run with either field has the package caches in the command's environment, under the
+    run's `env`, which overrides them: `CARGO_HOME=/workspace/.peerspan/cache/cargo`,
+    `npm_config_cache=/workspace/.peerspan/cache/npm`,
+    `PIP_CACHE_DIR=/workspace/.peerspan/cache/pip`,
+    `GOMODCACHE=/workspace/.peerspan/cache/go/mod` and
+    `GOCACHE=/workspace/.peerspan/cache/go/build`. peerfs treats `.peerspan/cache/` as
+    derived, so they stay out of commits and are saved with the cache.
 
 For runtime agents (the host's runtime agent contract), a run also takes:
 - `stdin`, base64 of at most 64 KiB, as the command's standard input;
@@ -168,7 +194,7 @@ For runtime agents (the host's runtime agent contract), a run also takes:
   whose fields differ from its partner's, is refused with 400. The `listen` run's VMM may also
   bind, listen on and accept Unix sockets, which its seccomp filter otherwise refuses.
 
-`GET /v1/runtime` reports `max_network`, `images: true` and `links: true`.
+`GET /v1/runtime` reports `max_network`, `images: true`, `links: true` and `peerfs_caches`.
 
 A run's `exited` result also has `oom_kills`: how many processes the guest's kernel killed for
 lack of memory (its `/proc/vmstat` `oom_kill`), 0 when none. The command may still have exited
