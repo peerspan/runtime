@@ -967,6 +967,7 @@ fn execute(runtime: &Runtime, run: &Run) {
             "stdout_bytes": stdout_bytes,
             "stderr_bytes": stderr_bytes,
             "error": outcome.error,
+            "oom_kills": outcome.oom_kills,
             "snapshot": outcome.snapshot,
             "commit": outcome.commit,
         },
@@ -996,6 +997,9 @@ fn log_finished(run: &Run, outcome: &Outcome, stdout_bytes: u64, stderr_bytes: u
     }
     if let Some(error) = &outcome.error {
         fields.push(("error", error.clone()));
+    }
+    if outcome.oom_kills > 0 {
+        fields.push(("oom_kills", outcome.oom_kills.to_string()));
     }
     if let Some(snapshot) = &outcome.snapshot {
         fields.push(("snapshot", snapshot.clone()));

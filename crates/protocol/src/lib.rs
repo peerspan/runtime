@@ -6,8 +6,9 @@
 //! The guest opens one vsock stream to the host. The host sends one [`Message::Run`], followed,
 //! when [`Command::archive`] is set, by the workspace archive as [`Message::ArchiveData`] frames
 //! and [`Message::ArchiveEnd`]. The guest answers with [`Message::Started`] or
-//! [`Message::Failed`], output chunks, the changes when [`Command::collect_changes`] is set, and
-//! finally [`Message::Exited`]. Each message is a frame: a one-byte tag, a big-endian `u32`
+//! [`Message::Failed`], output chunks, the changes when [`Command::collect_changes`] is set,
+//! [`Message::MemoryKills`] when the guest's kernel killed processes for memory, and finally
+//! [`Message::Exited`]. Each message is a frame: a one-byte tag, a big-endian `u32`
 //! payload length, then the payload.
 
 use std::io::{self, ErrorKind, Read, Write};
@@ -88,6 +89,7 @@ const TAG_DELETED: u8 = 10;
 const TAG_PHASES: u8 = 11;
 const TAG_STDIN: u8 = 12;
 const TAG_STDIN_END: u8 = 13;
+const TAG_MEMORY_KILLS: u8 = 14;
 
 /// Largest chunk of archive or changes data a writer puts in one frame.
 pub const DATA_CHUNK: usize = 64 * 1024;
@@ -190,6 +192,10 @@ pub enum Message {
     /// Guest to host, just before [`Message::Started`]: when init reached each step, as
     /// microseconds of the guest's boot clock, which starts with the kernel.
     Phases(Vec<(String, u64)>),
+    /// Guest to host, just before [`Message::Exited`] and only when it is not zero: how many
+    /// processes the guest's kernel killed for lack of memory during the run (`oom_kill` in
+    /// `/proc/vmstat`).
+    MemoryKills(u64),
 }
 
 impl Message {
@@ -214,6 +220,7 @@ impl Message {
             Message::Phases(phases) => (TAG_PHASES, encode_phases(phases)),
             Message::Stdin(bytes) => (TAG_STDIN, bytes.clone()),
             Message::StdinEnd => (TAG_STDIN_END, Vec::new()),
+            Message::MemoryKills(count) => (TAG_MEMORY_KILLS, count.to_be_bytes().to_vec()),
         };
         if payload.len() > MAX_PAYLOAD {
             return Err(io::Error::new(
@@ -269,6 +276,12 @@ impl Message {
             TAG_PHASES => Message::Phases(decode_phases(&payload)?),
             TAG_STDIN => Message::Stdin(payload),
             TAG_STDIN_END => empty(&payload, Message::StdinEnd)?,
+            TAG_MEMORY_KILLS => Message::MemoryKills(u64::from_be_bytes(
+                payload
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| invalid("memory kills payload is not 8 bytes"))?,
+            )),
             other => return Err(invalid(format!("unknown message tag {other}"))),
         };
         Ok(Some(message))
@@ -583,9 +596,22 @@ mod tests {
             Message::Phases(Vec::new()),
             Message::Stdin(b"in".to_vec()),
             Message::StdinEnd,
+            Message::MemoryKills(1),
+            Message::MemoryKills(u64::MAX),
         ];
         for message in &messages {
             assert_eq!(&round_trip(message), message);
+        }
+    }
+
+    #[test]
+    fn memory_kills_payload_is_eight_bytes() {
+        for len in [0usize, 7, 9] {
+            let mut frame = vec![TAG_MEMORY_KILLS];
+            frame.extend_from_slice(&u32::try_from(len).expect("small").to_be_bytes());
+            frame.extend(std::iter::repeat_n(0u8, len));
+            let err = Message::read_from(&mut frame.as_slice()).expect_err("malformed");
+            assert_eq!(err.kind(), ErrorKind::InvalidData);
         }
     }
 
