@@ -3,7 +3,9 @@
 # Copyright The Peerspan Authors
 """Drives `peerspan-runtime serve` over its socket as the host daemon will.
 
-Needs root and the environment scripts/check.sh needs; run by it.
+Needs root and the environment scripts/check.sh needs; run by it. PEERSPAN_CGROUP_ROOT and
+PEERSPAN_IMAGE_CACHE name a cgroup root and an image cache of its own, to keep it apart from a
+serve installed on the same host.
 """
 import base64
 import glob
@@ -72,6 +74,236 @@ def follow(sock, rid):
     return events
 
 
+def stream(events, kind="stdout"):
+    return b"".join(base64.b64decode(e["data"]) for e in events if e["kind"] == kind)
+
+
+def exited(events):
+    return next(e["result"] for e in events if e["kind"] == "exited")
+
+
+def link_id(n):
+    return "lnk_" + hashlib.sha256(f"link_{n}".encode()).hexdigest()[:32]
+
+
+def linked(n, role, script, link, port=7000, max_connections=4, max_bytes=1 << 20,
+           timeout_seconds=60):
+    """A run of `script` that is the `role` side of link `link` (the contract's Linked runs)."""
+    return {**request(n, ["sh", "-c", script], timeout_seconds=timeout_seconds),
+            "link": {"id": link_id(link), "role": role, "port": port,
+                     "max_connections": max_connections, "max_bytes": max_bytes}}
+
+
+def wait_for_output(sock, rid, text, seconds=30):
+    """Polls a running run's stdout until it holds `text`."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        status, events = call(sock, "GET", f"/v1/runs/{rid}/events?wait=1")
+        if status == 200 and text in stream(events):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def finish(sock, *ns):
+    """Cancels runs, waits for each to end, deletes it, and returns its events."""
+    got = []
+    for n in ns:
+        call(sock, "POST", f"/v1/runs/{run_id(n)}/cancel", {})
+        got.append(follow(sock, run_id(n)))
+        call(sock, "DELETE", f"/v1/runs/{run_id(n)}")
+    return got
+
+
+# Guest shell for linked runs, on the image's busybox. HANDLER writes /tmp/h, the program
+# `nc -e` runs for each connection the listen side accepts. RETRY runs a command until it
+# writes something, since a connection made before the listener is up is closed at once.
+HANDLER = "printf '#!/bin/sh\\n%s\\n' {} > /tmp/h; chmod +x /tmp/h; "
+RETRY = ("retry() { for i in $(seq 150); do \"$@\" > /tmp/r; [ -s /tmp/r ] && return 0; "
+         "sleep 0.2; done; return 1; }; ")
+# HOLD opens a connection that stays open until it has read hello into the file it is given;
+# $pid is its nc. Its stdin is the second argument, or else a FIFO no one writes to or closes,
+# and busybox nc then never ends the connection itself. It holds none of the run's output,
+# which the run would otherwise wait on.
+HOLD = ("mkfifo /tmp/in; exec 3<> /tmp/in; hold() { for i in $(seq 150); do "
+        "nc 127.0.0.1 7000 < \"${2:-/tmp/in}\" > \"$1\" 2> /dev/null & pid=$!; sleep 0.2; "
+        "grep -q hello \"$1\" && return 0; kill $pid; done; return 1; }; ")
+
+
+def check_links(sock):
+    """Linked runs (runtime task contract, Linked runs; PBX-26, PBX-27). Needs two run slots."""
+    info = call(sock, "GET", "/v1/runtime")[1]
+    check("links-reported", info.get("links") is True, info)
+
+    # A pair carries one ordered byte stream each way between the guests' loopback ports. The
+    # connect run is started first: its connections are closed until the listen guest is up
+    # and listening, and the client retries. 1 MB goes to the listen side and comes back.
+    connect = linked(60, "connect", RETRY + "head -c 1000000 /dev/urandom > /tmp/d; "
+                     "retry sh -c 'nc -w 5 127.0.0.1 7000 < /tmp/d' || exit 3; "
+                     "cmp -s /tmp/d /tmp/r && echo same; wc -c < /tmp/r", 1)
+    listen = linked(61, "listen", HANDLER.format("'head -c 1000000 > /tmp/in; cat /tmp/in'")
+                    + "nc -l -p 7000 -e /tmp/h; echo served", 1)
+    statuses = [call(sock, "POST", "/v1/runs", connect)[0]]
+    time.sleep(2)
+    statuses.append(call(sock, "POST", "/v1/runs", listen)[0])
+    connect_events, listen_events = follow(sock, run_id(60)), follow(sock, run_id(61))
+    check("link-pair", statuses == [201, 201] and exited(connect_events)["exit_code"] == 0
+          and stream(connect_events) == b"same\n1000000\n"
+          and exited(listen_events)["exit_code"] == 0 and stream(listen_events) == b"served\n",
+          (statuses, exited(connect_events), stream(connect_events),
+           exited(listen_events), stream(listen_events)))
+    finish(sock, 60, 61)
+
+    # At most max_connections are open at once: with one held open, the next is closed at once
+    # with nothing carried, and once the first has closed a new one is carried again.
+    listen = linked(62, "listen", HANDLER.format("'echo hello; cat > /dev/null'")
+                    + "nc -lk -p 7000 -e /tmp/h", 2, max_connections=1)
+    connect = linked(63, "connect", RETRY + HOLD + (
+        "hold /tmp/first || exit 3; "
+        "start=$(date +%s); second=$(nc -w 5 127.0.0.1 7000 < /dev/null); "
+        "took=$(( $(date +%s) - start )); kill $pid; wait $pid; "
+        "retry sh -c 'nc -w 1 127.0.0.1 7000 < /dev/null'; "
+        "echo \"first:$(cat /tmp/first) second:[$second] took:$took third:$(cat /tmp/r)\""),
+        2, max_connections=1)
+    call(sock, "POST", "/v1/runs", listen)
+    call(sock, "POST", "/v1/runs", connect)
+    connect_events = follow(sock, run_id(63))
+    out = stream(connect_events).decode()
+    took = re.search(r"took:(\d+)", out)
+    check("link-connections", exited(connect_events)["exit_code"] == 0
+          and out.startswith("first:hello second:[] took:") and out.endswith(" third:hello\n")
+          and took and int(took.group(1)) <= 1, (exited(connect_events), out))
+    finish(sock, 62, 63)
+
+    # max_bytes bounds each direction over the link's life: the byte past it is not delivered,
+    # and reaching it closes the link's connections and refuses new ones. The listen side is
+    # listening before the connect run starts, so no byte goes to a refused connection.
+    listen = linked(64, "listen", HANDLER.format("'cat >> /tmp/got; wc -c < /tmp/got >&2'")
+                    + "nc -lk -p 7000 -e /tmp/h & sleep 1; echo listening; wait", 3,
+                    max_bytes=1000)
+    connect = linked(65, "connect", (
+        "head -c 5000 /dev/zero | nc -w 5 127.0.0.1 7000; first=$?; sleep 1; "
+        "start=$(date +%s); echo more | nc -w 5 127.0.0.1 7000; "
+        "echo \"first:$first took:$(( $(date +%s) - start ))\""), 3, max_bytes=1000)
+    call(sock, "POST", "/v1/runs", listen)
+    up = wait_for_output(sock, run_id(64), b"listening")
+    call(sock, "POST", "/v1/runs", connect)
+    connect_events = follow(sock, run_id(65))
+    time.sleep(1)
+    listen_events, = finish(sock, 64)
+    finish(sock, 65)
+    counts = [int(n) for n in stream(listen_events, "stderr").split()]
+    out = stream(connect_events).decode()
+    took = re.search(r"took:(\d+)", out)
+    check("link-bytes", up and exited(connect_events)["exit_code"] == 0
+          and len(counts) == 1 and 0 < counts[0] <= 1000 and took and int(took.group(1)) <= 1,
+          (up, exited(connect_events), out, counts))
+
+    # A connection the listen guest refuses carries nothing, so what a retrying client sends
+    # on it does not count against max_bytes: here the client sends 300 bytes on each try,
+    # many times the bound in all, while the listen guest is up but not yet listening.
+    listen = linked(80, "listen", HANDLER.format("'head -c 300 > /tmp/got; wc -c < /tmp/got'")
+                    + "echo up; sleep 5; nc -lk -p 7000 -e /tmp/h", 12, max_bytes=1000)
+    connect = linked(81, "connect", RETRY + (
+        "retry sh -c 'head -c 300 /dev/zero | nc -w 2 127.0.0.1 7000' || exit 3; cat /tmp/r"),
+        12, max_bytes=1000)
+    call(sock, "POST", "/v1/runs", listen)
+    up = wait_for_output(sock, run_id(80), b"up")
+    call(sock, "POST", "/v1/runs", connect)
+    connect_events = follow(sock, run_id(81))
+    finish(sock, 80, 81)
+    check("link-refused-bytes", up and exited(connect_events)["exit_code"] == 0
+          and stream(connect_events) == b"300\n",
+          (up, exited(connect_events), stream(connect_events)))
+
+    # Either run's exit ends the link and closes its connections; the other run goes on. Here
+    # the listen run exits while a connection is open, its server neither reading nor closing:
+    # the connect side's client, which has sent its end of stream, sees the connection close,
+    # and a new connection is refused.
+    listen = linked(66, "listen", HANDLER.format("'echo hello; touch /tmp/accepted; sleep 60'")
+                    + "nc -l -p 7000 -e /tmp/h > /dev/null 2>&1 & "
+                    "while [ ! -e /tmp/accepted ]; do sleep 0.1; done; sleep 1; echo bye", 4)
+    connect = linked(67, "connect", HOLD + (
+        "hold /tmp/c /dev/null || exit 3; "
+        "start=$(date +%s); wait $pid; took=$(( $(date +%s) - start )); "
+        "after=$(nc -w 5 127.0.0.1 7000 < /dev/null); "
+        "echo \"held:$(cat /tmp/c) closed-after:$took after:[$after]\""), 4)
+    call(sock, "POST", "/v1/runs", listen)
+    call(sock, "POST", "/v1/runs", connect)
+    listen_events, connect_events = follow(sock, run_id(66)), follow(sock, run_id(67))
+    out = stream(connect_events).decode()
+    took = re.search(r"closed-after:(\d+)", out)
+    check("link-listen-ends", exited(listen_events)["exit_code"] == 0
+          and exited(connect_events)["exit_code"] == 0 and out.startswith("held:hello ")
+          and out.endswith(" after:[]\n") and took and int(took.group(1)) <= 5,
+          (exited(listen_events), exited(connect_events), out))
+    finish(sock, 66, 67)
+
+    # And the connect run exits while a connection is open: the listen side's connection
+    # closes, and the listen run goes on to its own end.
+    listen = linked(68, "listen", HANDLER.format("'echo hello; cat > /dev/null'")
+                    + "nc -l -p 7000 -e /tmp/h; echo closed; sleep 1; echo still-running", 5)
+    connect = linked(69, "connect", HOLD + (
+        "hold /tmp/c || exit 3; cat /tmp/c"), 5)
+    call(sock, "POST", "/v1/runs", listen)
+    call(sock, "POST", "/v1/runs", connect)
+    started = time.time()
+    connect_events, listen_events = follow(sock, run_id(69)), follow(sock, run_id(68))
+    took = time.time() - started
+    check("link-connect-ends", exited(connect_events)["exit_code"] == 0
+          and stream(connect_events) == b"hello\n" and exited(listen_events)["exit_code"] == 0
+          and stream(listen_events) == b"closed\nstill-running\n" and took < 30,
+          (exited(connect_events), stream(connect_events), exited(listen_events),
+           stream(listen_events), took))
+    finish(sock, 68, 69)
+
+    # A link out of range is refused, and so is no run.
+    good = linked(70, "listen", "true", 6)
+    bad = [{**good["link"], **fields} for fields in [
+        {"id": "lnk_" + "A" * 32}, {"id": "lnk_" + "a" * 31}, {"id": "a" * 36},
+        {"role": "both"}, {"port": 0}, {"port": 65536}, {"max_connections": 0},
+        {"max_connections": 65}, {"max_bytes": 0}, {"max_bytes": (1 << 30) + 1},
+        {"extra": 1}]]
+    bad.append({k: v for k, v in good["link"].items() if k != "max_bytes"})
+    refused = [call(sock, "POST", "/v1/runs", {**good, "link": link})[0] for link in bad]
+    gone = call(sock, "GET", f"/v1/runs/{run_id(70)}/events")[0]
+    edges = []
+    for i, (role, fields) in enumerate([("listen", {"port": 65535}),
+                                        ("connect", {"max_connections": 64}),
+                                        ("listen", {"max_bytes": 1 << 30}),
+                                        ("connect", {"max_bytes": 1})]):
+        body = linked(71 + i, role, "true", 6 + i, **fields)
+        edges.append(call(sock, "POST", "/v1/runs", body)[0])
+        finish(sock, 71 + i)
+    check("link-invalid", refused == [400] * len(bad) and gone == 404 and edges == [201] * 4,
+          (refused, gone, edges))
+
+    # Two runs of a pair carry the same id and fields, one of each role, and no other run
+    # takes the id until both are deleted. An identical repeat of either is the same run and
+    # takes no other place; a repeat with a different link is a conflict.
+    listen = linked(75, "listen", "sleep 60", 11)
+    connect = linked(76, "connect", "sleep 60", 11)
+    first = call(sock, "POST", "/v1/runs", listen)[0]
+    partner = [call(sock, "POST", "/v1/runs", linked(77, role, "true", 11, **fields))[0]
+               for role, fields in [("connect", {"port": 7001}), ("connect", {"max_bytes": 1}),
+                                    ("connect", {"max_connections": 1}), ("listen", {})]]
+    second = call(sock, "POST", "/v1/runs", connect)[0]
+    repeats = [call(sock, "POST", "/v1/runs", body)[0] for body in (listen, connect)]
+    third = [call(sock, "POST", "/v1/runs", linked(77, role, "true", 11))[0]
+             for role in ("listen", "connect")]
+    changed = call(sock, "POST", "/v1/runs",
+                   {**listen, "link": {**listen["link"], "max_bytes": 1}})[0]
+    finish(sock, 75)
+    after_one = call(sock, "POST", "/v1/runs", linked(78, "listen", "true", 11))[0]
+    finish(sock, 76)
+    if after_one == 201:
+        finish(sock, 78)
+    check("link-pairing", first == 201 and partner == [400] * 4 and second == 201
+          and repeats == [200, 200] and third == [400, 400] and changed == 409,
+          (first, partner, second, repeats, third, changed))
+    check("link-id-taken-until-both-deleted", after_one == 400, after_one)
+
+
 def main():
     work = tempfile.mkdtemp()
     # Each run's workspace server runs as the run's own user, which must reach the state dir.
@@ -82,6 +314,11 @@ def main():
                   "--state", state, "--max-cpus", "2", "--max-memory-mib", "2048",
                   "--max-seconds", "120", "--max-concurrent-runs", "1",
                   "--max-network", "internet", "--workspace-mib", "256"]
+    # A cgroup root and image cache of the check's own keep it apart from an installed serve's.
+    cgroup_root = os.environ.get("PEERSPAN_CGROUP_ROOT", "/sys/fs/cgroup/peerspan-runtime")
+    serve_argv += ["--cgroup-root", cgroup_root]
+    if os.environ.get("PEERSPAN_IMAGE_CACHE"):
+        serve_argv += ["--image-cache", os.environ["PEERSPAN_IMAGE_CACHE"]]
 
     log_path = os.path.join(work, "serve.log")
 
@@ -234,7 +471,7 @@ def main():
         gone, _ = call(sock, "GET", f"/v1/runs/{run_id(8)}/events")
         left = os.listdir(os.path.join(state, "runs"))
         mounted = [line for line in open("/proc/self/mountinfo") if state in line]
-        cgroups = glob.glob("/sys/fs/cgroup/peerspan-runtime/run-*")
+        cgroups = glob.glob(os.path.join(cgroup_root, "run-*"))
         check("restart", status == 201 and gone == 404 and not left and not mounted
               and not cgroups, (status, gone, left, mounted, cgroups))
 
@@ -258,6 +495,8 @@ def main():
             outputs.append(b"".join(base64.b64decode(e["data"]) for e in events
                                     if e["kind"] == "stdout"))
         check("concurrent", outputs == [b"10\n", b"11\n", b"12\n"], outputs)
+
+        check_links(sock)
 
         # A peerfs workspace is refused unless serve names a space.
         status, _ = call(sock, "POST", "/v1/runs",
