@@ -129,6 +129,14 @@ pub struct PeerfsWorkspace {
     pub commit_message: Option<String>,
     /// Discard the workspace once it is committed, or had nothing to commit, keeping its branch.
     pub discard: bool,
+    /// With `fork_from`, a build cache whose current version the fork holds (`ws create
+    /// --cache`). A cache that does not exist is no error.
+    pub cache: Option<String>,
+    /// With `fork_from`, a build cache this run refreshes: see [`finish_refresh`]. The fork is
+    /// then a workspace following `fork_from` itself, and no branch is made for it.
+    pub cache_save: Option<String>,
+    /// Whether this run created the fork's workspace, so that a refresh discards only its own.
+    pub created: AtomicBool,
 }
 
 /// The agent recorded on a peerfs workspace's snapshots when the caller names none.
@@ -167,6 +175,8 @@ pub struct Outcome {
     /// How many processes in the guest its kernel killed for lack of memory. The command
     /// may still have exited, with whatever status its parent gave after losing them.
     pub oom_kills: u64,
+    /// For a refresh run, whether it saved a new version of its build cache.
+    pub cache_saved: bool,
     /// How long setup took and how much memory the run used.
     pub metrics: Metrics,
 }
@@ -1069,7 +1079,11 @@ fn start_peerfs(
 /// Creates `workspace` as a fork of the branch `from`: a branch of the workspace's name at
 /// `from`'s head, then a workspace following it. `list` is `peerfs ws list`'s output, one
 /// workspace per line, name first; a workspace of that name already there is refused before the
-/// branch is made.
+/// branch is made. With `cache`, the workspace holds that build cache's current version.
+///
+/// A refresh (`cache_save`) commits nothing and its branch would go once it ends, so its
+/// workspace follows `from` itself and no branch is made; a branch of the workspace's name is
+/// still refused, as for any fork.
 fn fork(workspace: &PeerfsWorkspace, from: &str, list: &str) -> anyhow::Result<()> {
     let name = &workspace.name;
     if list
@@ -1078,10 +1092,22 @@ fn fork(workspace: &PeerfsWorkspace, from: &str, list: &str) -> anyhow::Result<(
     {
         bail!("peerfs workspace {name} exists already, so it cannot be forked from {from}");
     }
-    for args in [
-        &["fork", name, "--from", from][..],
-        &["ws", "create", name, "--branch", name],
-    ] {
+    let mut create = vec!["ws", "create", name.as_str(), "--branch"];
+    let mut steps = Vec::new();
+    if workspace.cache_save.is_some() {
+        if branch_exists(workspace, name)? {
+            bail!("peerfs branch {name} exists already, so it cannot be forked from {from}");
+        }
+        create.push(from);
+    } else {
+        steps.push(vec!["fork", name.as_str(), "--from", from]);
+        create.push(name.as_str());
+    }
+    if let Some(cache) = &workspace.cache {
+        create.extend(["--cache", cache.as_str()]);
+    }
+    steps.push(create);
+    for args in steps {
         let output = peerfs_command(&workspace.peerfs, &workspace.space)
             .args(args)
             .args(["--agent", &workspace.agent])
@@ -1094,7 +1120,132 @@ fn fork(workspace: &PeerfsWorkspace, from: &str, list: &str) -> anyhow::Result<(
             );
         }
     }
+    workspace.created.store(true, Ordering::Relaxed);
     Ok(())
+}
+
+/// Whether the space has a branch named `name`, from `peerfs branches`: one per line, its head
+/// and then its name.
+fn branch_exists(workspace: &PeerfsWorkspace, name: &str) -> anyhow::Result<bool> {
+    let output = peerfs_command(&workspace.peerfs, &workspace.space)
+        .arg("branches")
+        .output()
+        .with_context(|| format!("starting {}", workspace.peerfs.display()))?;
+    if !output.status.success() {
+        bail!(
+            "peerfs could not list branches: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        line.split_once(' ')
+            .is_some_and(|(_, branch)| branch == name)
+    }))
+}
+
+/// Ends a refresh run (the build cache contract's `peerfs_cache_save`) once the VM is gone and
+/// the workspace given back: when the command exited 0, the result has no `error` and the
+/// command changed no source path, saves the workspace's derived files as the cache's new
+/// current version (`cache save`, which discards the workspace) and sets `cache_saved`;
+/// otherwise saves nothing, leaving the cache as it was, and discards the workspace. A source
+/// change sets `error` to name the first changed path in byte order, and a save that fails sets
+/// it too. A workspace this run did not create, such as one that existed before the fork, is
+/// left alone. No branch was made for the fork (see [`fork`]), so none is left to remove.
+pub fn finish_refresh(workspace: &PeerfsWorkspace, outcome: &mut Outcome) {
+    let Some(cache) = &workspace.cache_save else {
+        return;
+    };
+    if !workspace.created.load(Ordering::Relaxed) {
+        return;
+    }
+    let succeeded = outcome.exit_code == Some(0)
+        && outcome.signal.is_none()
+        && !outcome.timed_out
+        && outcome.error.is_none();
+    if succeeded {
+        let saved = changed_source(workspace).and_then(|changed| match changed {
+            Some(path) => Err(anyhow::anyhow!("the build changed source files: {path}")),
+            None => save_cache(workspace, cache),
+        });
+        match saved {
+            Ok(()) => outcome.cache_saved = true,
+            Err(e) => outcome.error = Some(format!("{e:#}")),
+        }
+    }
+    if !outcome.cache_saved
+        && let Err(e) = discard(workspace)
+    {
+        crate::log::warn(
+            "could not discard the refresh's peerfs workspace",
+            &[("workspace", &workspace.name), ("error", &format!("{e:#}"))],
+        );
+    }
+}
+
+/// The first source path, in byte order, that `workspace` changed since its base, from
+/// `peerfs ws status`: a line `A PATH`, `M PATH` or `D PATH` for each source change. Derived
+/// and secret paths are listed indented, as kept local, and are not changes of the source.
+fn changed_source(workspace: &PeerfsWorkspace) -> anyhow::Result<Option<String>> {
+    let output = peerfs_command(&workspace.peerfs, &workspace.space)
+        .args(["ws", "status", &workspace.name])
+        .output()
+        .with_context(|| format!("starting {}", workspace.peerfs.display()))?;
+    if !output.status.success() {
+        bail!(
+            "peerfs could not read the status of workspace {}: {}",
+            workspace.name,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(first_source_change(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// The least source path `ws status` output lists as changed, by bytes.
+fn first_source_change(status: &str) -> Option<String> {
+    status
+        .lines()
+        .filter_map(|line| {
+            ["A ", "M ", "D "]
+                .iter()
+                .find_map(|prefix| line.strip_prefix(prefix))
+        })
+        .min_by(|a, b| a.as_bytes().cmp(b.as_bytes()))
+        .map(str::to_owned)
+}
+
+/// Saves `workspace`'s derived files as `cache`'s new current version, which also discards the
+/// workspace.
+fn save_cache(workspace: &PeerfsWorkspace, cache: &str) -> anyhow::Result<()> {
+    let output = peerfs_command(&workspace.peerfs, &workspace.space)
+        .args(["cache", "save", cache, "--from", &workspace.name])
+        .output()
+        .with_context(|| format!("starting {}", workspace.peerfs.display()))?;
+    if !output.status.success() {
+        bail!(
+            "peerfs could not save build cache {cache} from workspace {}: {}",
+            workspace.name,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Whether `peerfs` keeps build caches for the space at `space`: `Some(true)` when `cache ls`
+/// answers, `Some(false)` when that peerfs, or the space's server, has no such command or
+/// endpoint, and `None` when it could not tell, such as when the space cannot be reached.
+pub fn peerfs_has_caches(peerfs: &Path, space: &Path) -> Option<bool> {
+    let output = peerfs_command(peerfs, space)
+        .args(["cache", "ls", "--json"])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        return Some(true);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    (stderr.contains("unrecognized subcommand") || stderr.contains("no such endpoint"))
+        .then_some(false)
 }
 
 /// Commits `workspace` to its branch with `message`, returning the commit, or `None` when
@@ -1258,5 +1409,22 @@ impl Drop for ChildGuard {
             let _ = self.0.kill();
         }
         let _ = self.0.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_source_change_takes_the_least_source_path_by_bytes() {
+        let status = "M src/lib.rs\nA README.md\nD b.txt\n  target (kept local: derived)\n  \
+                      .env (kept local: secret)\ncache bc-1 version 2, built from abc\n";
+        assert_eq!(first_source_change(status).as_deref(), Some("README.md"));
+        assert_eq!(first_source_change("M é\nM z\n").as_deref(), Some("z"));
+        assert_eq!(
+            first_source_change("  target (kept local: derived)\nno cache\n"),
+            None
+        );
     }
 }
