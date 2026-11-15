@@ -369,8 +369,8 @@ def main():
         check("events-limit", status == 200 and page == events[1:3] and refused == [400, 400],
               (status, page, refused))
         check("result", result["exit_code"] == 0 and result["signal"] is None
-              and not result["timed_out"] and result["stdout_bytes"] == 17 and result["error"] is None,
-              result)
+              and not result["timed_out"] and result["stdout_bytes"] == 17 and result["error"] is None
+              and result["oom_kills"] == 0, result)
         names = [a["name"] for a in artifacts]
         digests_ok = all(hashlib.sha256(open(a["path"], "rb").read()).hexdigest() == a["sha256"]
                          and os.path.getsize(a["path"]) == a["size"] for a in artifacts)
@@ -380,6 +380,17 @@ def main():
 
         status, _ = call(sock, "POST", "/v1/runs", request(3, ["true"], cpus=3))
         check("too-large", status == 422, status)
+
+        # The guest's kernel kills `tail` for memory in a 512 MiB VM; the shell still exits 0,
+        # and the result counts the kill.
+        hog = "head -c 1500m /dev/zero | tail > /dev/null; echo $?"
+        status, _ = call(sock, "POST", "/v1/runs", request(80, ["sh", "-c", hog]))
+        check("oom-create", status == 201, status)
+        events = follow(sock, run_id(80))
+        result = next(e["result"] for e in events if e["kind"] == "exited")
+        out = b"".join(base64.b64decode(e["data"]) for e in events if e["kind"] == "stdout")
+        check("oom-kills", result["exit_code"] == 0 and result["error"] is None
+              and result["oom_kills"] >= 1 and out == b"137\n", (result, out))
 
         # A run may not ask for more network than the host owner's maximum, nor an unknown level.
         status, _ = call(sock, "POST", "/v1/runs", {**request(90, ["true"]), "network": "internet+lan"})
