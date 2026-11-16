@@ -443,6 +443,34 @@ def check_caches(sock, pf):
           and all(error.startswith(field) for (_, error), field in zip(refused, fields)),
           refused)
 
+    # The caches and branches of the runtime's space (RUN-21): the caches by name, as peerfs
+    # lists them; a delete, which a repeat answers the same; a branch's head, and 404 for none.
+    status, listed = call(sock, "GET", "/v1/caches")
+    expected = sorted(json.loads(pf("cache", "ls", "--json")), key=lambda c: c["name"])
+    check("cache-list", status == 200 and listed == {"caches": expected}
+          and [c["name"] for c in listed["caches"]] == ["bc-1"]
+          and set(listed["caches"][0]) == {"name", "commit", "saved_at", "bytes", "versions"}
+          and listed["caches"][0]["commit"] == main_head
+          and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ",
+                           listed["caches"][0]["saved_at"]), (status, listed, expected))
+    removed = call(sock, "DELETE", "/v1/caches/bc-1")
+    after = call(sock, "GET", "/v1/caches")
+    again = call(sock, "DELETE", "/v1/caches/bc-1")
+    check("cache-delete", removed == (200, {}) and after == (200, {"caches": []})
+          and again == (200, {}) and "bc-1" not in caches(), (removed, after, again))
+    status, body = call(sock, "GET", "/v1/branches/main")
+    missing = call(sock, "GET", "/v1/branches/no-such-branch")
+    check("branch-head", status == 200 and body == {"name": "main", "head": main_head}
+          and missing[0] == 404 and missing[1].get("code") == "not_found",
+          (status, body, missing))
+    refused = [call(sock, method, path)
+               for method, path in [("DELETE", "/v1/caches/Bc-1"), ("DELETE", "/v1/caches/-bc"),
+                                    ("DELETE", "/v1/caches/" + "b" * 129),
+                                    ("DELETE", "/v1/caches/%zz"),
+                                    ("GET", "/v1/branches/a%2Fb"), ("GET", "/v1/branches/%2E%2E")]]
+    check("cache-routes-invalid", all(status == 400 and body.get("code") == "invalid"
+                                      for status, body in refused), refused)
+
 
 def main():
     work = tempfile.mkdtemp()
@@ -649,6 +677,12 @@ def main():
             "peerfs_cache": "bc-1"})
         check("cache-no-caches", info.get("peerfs_caches") is False and status == 400
               and "peerfs_cache needs" in body.get("error", ""), (info, status, body))
+        unavailable = [call(sock, method, path)
+                       for method, path in [("GET", "/v1/caches"),
+                                            ("DELETE", "/v1/caches/bc-1"),
+                                            ("GET", "/v1/branches/main")]]
+        check("cache-routes-unavailable", all(status == 422 and body.get("code") == "unavailable"
+                                              for status, body in unavailable), unavailable)
 
         # With PEERSPAN_PEERFS naming a peerfs binary: a run on a workspace of the space reads
         # its branch's files and its writes land in the workspace, and its result names the
