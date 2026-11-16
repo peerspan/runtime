@@ -24,6 +24,9 @@ import threading
 import time
 
 failures = 0
+# The user that calls each serve socket named here, as the daemon would with --client-uid;
+# others are called as root.
+callers = {}
 
 
 class UnixConnection(http.client.HTTPConnection):
@@ -33,7 +36,16 @@ class UnixConnection(http.client.HTTPConnection):
 
     def connect(self):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.connect(self.path)
+        uid = callers.get(self.path)
+        if uid is None:
+            self.sock.connect(self.path)
+            return
+        # The socket's peer credentials are taken as it connects.
+        os.seteuid(uid)
+        try:
+            self.sock.connect(self.path)
+        finally:
+            os.seteuid(0)
 
 
 def call(sock, method, path, body=None):
@@ -564,6 +576,58 @@ def check_host_ports(sock, work):
             process.wait()
 
 
+def check_host_ports_client(serve_argv, work, cgroup_root):
+    """Host ports with `serve --client-uid` set (credential proxy contract, Runtime: host ports):
+    the listener must be the client user's, so a root listener is refused. A second serve, with
+    its own socket, state, cgroup root and image cache, called as that user, the user it runs
+    for, as the README's --client-uid says."""
+    uid = 65534
+    sock = os.path.join(work, "client.sock")
+    argv = list(serve_argv)
+    for flag, value in [("--socket", sock), ("--state", os.path.join(work, "state-client")),
+                        ("--cgroup-root", cgroup_root + "-client"),
+                        ("--image-cache", os.path.join(work, "images-client"))]:
+        if flag in argv:
+            argv[argv.index(flag) + 1] = value
+        else:
+            argv += [flag, value]
+    argv += ["--client-uid", str(uid)]
+    callers[sock] = uid
+    processes = []
+    server = subprocess.Popen(argv, stderr=open(os.path.join(work, "serve-client.log"), "a"))
+    try:
+        if not wait_until(lambda: os.path.exists(sock), 5):
+            check("host-ports-client-uid", False, "serve --client-uid did not start")
+            return
+        for name, user, greeting in [("client-mine", uid, ""), ("client-root", None, "root\n")]:
+            processes.append(host_listener(work, name, user=user, greeting=greeting))
+        (_, mine, mine_log), (_, root, root_log) = processes
+
+        # The client user's listener is carried both ways: 100 kB go and come back. A root
+        # listener is closed at once with nothing carried either way.
+        script = ("head -c 100000 /dev/urandom > /tmp/d; "
+                  "nc -w 2 127.0.0.1 4100 < /tmp/d > /tmp/r 2> /dev/null; "
+                  "cmp -s /tmp/d /tmp/r && echo same; wc -c < /tmp/r; start=$(date +%s); "
+                  "root=$(echo hello | nc -w 2 127.0.0.1 4101 2> /dev/null); "
+                  "echo \"root:[$root] took:$(( $(date +%s) - start ))\"")
+        info = call(sock, "GET", "/v1/runtime")
+        status, result, out = host_ports_run(sock, 140, script, {4100: mine, 4101: root})
+        took = re.search(r"took:(\d+)", out)
+        received = [line for line in root_log() if line.startswith("closed ")
+                    and line != "closed 0"]
+        check("host-ports-client-uid", status == 201 and result["exit_code"] == 0
+              and out.startswith("same\n100000\nroot:[] took:") and took
+              and int(took.group(1)) <= 1 and mine_log().count("closed 100000") == 1
+              and not received, (info[0], status, result, out, mine_log(), root_log()))
+    finally:
+        for process, _, _ in processes:
+            process.kill()
+            process.wait()
+        server.kill()
+        server.wait()
+        del callers[sock]
+
+
 PACKAGE_ENV = "echo \"$CARGO_HOME|$npm_config_cache|$PIP_CACHE_DIR|$GOMODCACHE|$GOCACHE\""
 
 
@@ -918,6 +982,7 @@ def main():
 
         check_links(sock)
         check_host_ports(sock, work)
+        check_host_ports_client(serve_argv, work, cgroup_root)
 
         # A peerfs workspace is refused unless serve names a space.
         status, _ = call(sock, "POST", "/v1/runs",
