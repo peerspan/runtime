@@ -194,7 +194,23 @@ For runtime agents (the host's runtime agent contract), a run also takes:
   whose fields differ from its partner's, is refused with 400. The `listen` run's VMM may also
   bind, listen on and accept Unix sockets, which its seccomp filter otherwise refuses.
 
-`GET /v1/runtime` reports `max_network`, `images: true`, `links: true` and `peerfs_caches`.
+- `host_ports`, null or 1 to 4 entries `{port, socket}`, carries TCP ports on the guest's
+  loopback to Unix stream sockets on the host (the credential proxy contract's host ports,
+  RUN-24). A connection the guest opens to `127.0.0.1:port` is carried to `socket` as one byte
+  stream each way, which the runtime does not read: guest init listens on each port before the
+  command starts and carries each connection over a vsock port of the entry's own, mapped to a
+  Unix socket in the run's sockets directory, as a linked `connect` run's are. For each one the
+  runtime connects to `socket`, as root, and carries it only when the listener's peer
+  credentials (`SO_PEERCRED`) name the client user (`--client-uid`, root when unset); a socket
+  that is any other user's, or that cannot be connected to at once, closes the guest's
+  connection at once. At most 64 connections are open at once per entry, a further one being
+  closed at once, and no bytes are bounded. The run's exit closes every connection. It works at
+  every `network` level, `none` included, and gives the guest nothing else. `port` is 1 to
+  65,535, distinct within the run and not the run's `link` port; `socket` is an absolute path
+  of at most 107 bytes. Anything else is refused with 400 `invalid`, naming `host_ports`.
+
+`GET /v1/runtime` reports `max_network`, `images: true`, `links: true`, `host_ports: true` and
+`peerfs_caches`.
 
 With `peerfs_caches` true, serve also answers for the caches and branches of its space (the
 build cache contract, RUN-21), so the daemon never reaches the space itself:
