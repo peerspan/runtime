@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 
 failures = 0
@@ -310,6 +311,257 @@ def check_links(sock):
     if again == 201:
         finish(sock, 85)
     check("link-id-free-after-lone-run-deleted", lone == 201 and again == 201, (lone, again))
+
+
+# A host service for host_ports: a Unix socket server, run as the user it is given. It writes
+# "listening" to its log once it listens, then "open" for each connection and, when the
+# connection ends, "closed N" with the bytes it received. It sends its greeting, if it has one,
+# and echoes back what it receives.
+HOST_ECHO = r"""
+import socket, sys, threading
+path, log, greeting = sys.argv[1], open(sys.argv[2], "a", buffering=1), sys.argv[3].encode()
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(path)
+server.listen(256)
+log.write("listening\n")
+
+def serve(conn):
+    log.write("open\n")
+    got = 0
+    try:
+        conn.sendall(greeting)
+        while True:
+            data = conn.recv(65536)
+            if not data:
+                break
+            got += len(data)
+            conn.sendall(data)
+    except OSError:
+        pass
+    log.write(f"closed {got}\n")
+    conn.close()
+
+while True:
+    conn, _ = server.accept()
+    threading.Thread(target=serve, args=(conn,), daemon=True).start()
+"""
+
+
+def host_listener(work, name, user=None, greeting=""):
+    """Starts HOST_ECHO at WORK/hp-NAME/s.sock as `user` (root without one) and returns its
+    process, its socket's path and a function giving its log's lines."""
+    directory = os.path.join(work, "hp-" + name)
+    os.mkdir(directory)
+    as_user = {}
+    if user is not None:
+        os.chown(directory, user, user)
+        as_user = {"user": user, "group": user, "extra_groups": []}
+    path, log = os.path.join(directory, "s.sock"), os.path.join(directory, "log")
+    process = subprocess.Popen([sys.executable, "-I", "-c", HOST_ECHO, path, log, greeting],
+                               **as_user)
+
+    def lines():
+        try:
+            return open(log).read().splitlines()
+        except FileNotFoundError:
+            return []
+    wait_until(lambda: "listening" in lines(), 5)
+    return process, path, lines
+
+
+def wait_until(ready, seconds):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if ready():
+            return True
+        time.sleep(0.1)
+    return ready()
+
+
+def host_address():
+    """The host's own address, as a guest would name it to reach the host."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("192.0.2.1", 9))
+        return probe.getsockname()[0]
+    except OSError:
+        return "10.0.2.2"
+    finally:
+        probe.close()
+
+
+def host_ports_body(n, script, ports, **fields):
+    """A run of `script` with network none and `ports`, {guest port: host socket}."""
+    return {**request(n, ["sh", "-c", script], **fields), "network": "none",
+            "host_ports": [{"port": port, "socket": path} for port, path in ports.items()]}
+
+
+def host_ports_run(sock, n, script, ports):
+    """Runs to its end and deletes it; returns its status, result and stdout (no result and no
+    output when the run is refused)."""
+    status, _ = call(sock, "POST", "/v1/runs", host_ports_body(n, script, ports))
+    if status != 201:
+        return status, None, ""
+    events = follow(sock, run_id(n))
+    call(sock, "DELETE", f"/v1/runs/{run_id(n)}")
+    return status, exited(events), stream(events).decode()
+
+
+def check_host_ports(sock, work):
+    """Host ports (credential proxy contract, Runtime: host ports; RUN-24). serve runs without
+    --client-uid, so its client user is root, and nobody is another user."""
+    info = call(sock, "GET", "/v1/runtime")[1]
+    supported = info.get("host_ports") is True
+    check("host-ports-reported", supported, info)
+
+    # A malformed entry is 400 invalid naming host_ports, on any runtime, and is no run: no
+    # entry or more than 4, a port out of range, a port twice or the run's link port, a socket
+    # path that is relative or longer than 107 bytes, and fields of the wrong type or missing.
+    good = {"port": 4100, "socket": "/run/hp.sock"}
+    bad = [[], [{**good, "port": 4100 + i} for i in range(5)],
+           [{**good, "port": 0}], [{**good, "port": 65536}], [{**good, "port": -1}],
+           [good, {**good, "socket": "/run/hp2.sock"}],
+           [{**good, "socket": "hp.sock"}], [{**good, "socket": ""}],
+           [{**good, "socket": "/" + "a" * 107}],
+           [{**good, "port": "4100"}], [{**good, "port": 4100.5}], [{**good, "port": True}],
+           [{**good, "socket": 7}], [{"port": 4100}], [{"socket": "/run/hp.sock"}],
+           ["4100:/run/hp.sock"], good, "4100"]
+    body = {**request(130, ["true"]), "network": "none"}
+    refused = [call(sock, "POST", "/v1/runs", {**body, "host_ports": entries})
+               for entries in bad]
+    on_link = call(sock, "POST", "/v1/runs", {**linked(131, "listen", "true", 30, port=4100),
+                                              "network": "none", "host_ports": [good]})
+    for n, statuses in [(130, [s for s, _ in refused]), (131, [on_link[0]])]:
+        if 201 in statuses:
+            finish(sock, n)
+    refused.append(on_link)
+    gone = [call(sock, "GET", f"/v1/runs/{run_id(n)}/events")[0] for n in (130, 131)]
+    check("host-ports-invalid", gone == [404, 404] and all(
+        status == 400 and isinstance(body, dict) and body.get("code") == "invalid"
+        and "host_ports" in body.get("error", "") for status, body in refused),
+        (refused, gone))
+
+    # Well-formed at the edges: 4 entries, ports 1 and 65,535, socket paths of 107 bytes that
+    # need not exist yet. A runtime without host_ports refuses them as unavailable.
+    edges = [{"port": 1, "socket": "/" + "a" * 106}, {"port": 65535, "socket": "/" + "b" * 106},
+             {"port": 4100, "socket": "/" + "c" * 106}, {"port": 4101, "socket": "/run/hp.sock"}]
+    status, body = call(sock, "POST", "/v1/runs", {**request(132, ["true"]), "network": "none",
+                                                   "host_ports": edges})
+    if status == 201:
+        finish(sock, 132)
+    if supported:
+        check("host-ports-edges", status == 201, (status, body))
+    else:
+        check("host-ports-unavailable",
+              status == 422 and (body or {}).get("code") == "unavailable", (status, body))
+
+    processes = []
+    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        def listener(name, **kwargs):
+            process, path, lines = host_listener(work, name, **kwargs)
+            processes.append(process)
+            return path, lines
+
+        # A run with network none reaches a host socket through 127.0.0.1:PORT: 100 kB go to
+        # the host's echo server and come back, one ordered stream each way. Guest init listens
+        # before the command starts, so the first try is carried. And nothing else: the port
+        # of a TCP server on the host is closed on the guest's loopback, and the host's own
+        # address is not reached.
+        echo, echo_log = listener("echo")
+        tcp.bind(("0.0.0.0", 0))
+        tcp.listen(8)
+        tcp_port = tcp.getsockname()[1]
+        reached = []
+
+        def accept():
+            while True:
+                try:
+                    conn, address = tcp.accept()
+                except OSError:
+                    return
+                reached.append(address)
+                conn.sendall(b"tcp-hello\n")
+                conn.close()
+        threading.Thread(target=accept, daemon=True).start()
+        script = ("head -c 100000 /dev/urandom > /tmp/d; "
+                  "nc -w 2 127.0.0.1 4100 < /tmp/d > /tmp/r 2> /dev/null; "
+                  "cmp -s /tmp/d /tmp/r && echo same; wc -c < /tmp/r; "
+                  f"other=$(echo x | nc -w 2 127.0.0.1 {tcp_port} 2> /dev/null); "
+                  f"far=$(echo x | nc -w 2 {host_address()} {tcp_port} 2> /dev/null); "
+                  "echo \"other:[$other] far:[$far]\"")
+        status, result, out = host_ports_run(sock, 120, script, {4100: echo})
+        check("host-ports-reach", status == 201 and result["exit_code"] == 0
+              and out == "same\n100000\nother:[] far:[]\n" and not reached
+              and echo_log().count("closed 100000") == 1,
+              (status, result, out, reached, echo_log()))
+
+        # Only a listener of the runtime's client user is carried to: a connection to another
+        # user's server, or to a socket with no server, is closed at once with nothing carried
+        # either way, while the same run's entry for its own user's server is carried.
+        theirs, their_log = listener("nobody", user=65534, greeting="theirs\n")
+        script = ("mine=$(echo hello | nc -w 2 127.0.0.1 4100 2> /dev/null); start=$(date +%s); "
+                  "theirs=$(echo hello | nc -w 2 127.0.0.1 4101 2> /dev/null); "
+                  "missing=$(echo hello | nc -w 2 127.0.0.1 4102 2> /dev/null); "
+                  "echo \"mine:[$mine] theirs:[$theirs] missing:[$missing] "
+                  "took:$(( $(date +%s) - start ))\"")
+        status, result, out = host_ports_run(
+            sock, 121, script, {4100: echo, 4101: theirs,
+                                4102: os.path.join(work, "hp-missing.sock")})
+        took = re.search(r"took:(\d+)", out)
+        received = [line for line in their_log() if line.startswith("closed ")
+                    and line != "closed 0"]
+        check("host-ports-other-user", status == 201 and result["exit_code"] == 0
+              and out.startswith("mine:[hello] theirs:[] missing:[] took:")
+              and took and int(took.group(1)) <= 1 and not received,
+              (status, result, out, their_log()))
+
+        # At most 64 connections are open at once per entry: with 64 held open, each carried,
+        # the 65th is closed at once with nothing carried, and the 64 go on carrying. Each held
+        # connection sends what is appended to its file, and its nc is killed at the end.
+        script = (
+            "for i in $(seq 64); do echo a$i > /tmp/in$i; tail -f /tmp/in$i 2> /dev/null "
+            "| nc 127.0.0.1 4100 > /tmp/o$i 2> /dev/null & pids=\"$pids $!\"; done; "
+            "for t in $(seq 100); do n=$(cat /tmp/o* 2> /dev/null | grep -c '^a'); "
+            "[ $n = 64 ] && break; sleep 0.1; done; "
+            "start=$(date +%s); extra=$(echo x | nc -w 2 127.0.0.1 4100 2> /dev/null); "
+            "took=$(( $(date +%s) - start )); for i in $(seq 64); do echo b$i >> /tmp/in$i; done; "
+            "for t in $(seq 100); do [ $(cat /tmp/o* | grep -c '^b') = 64 ] && break; "
+            "sleep 0.1; done; kept=0; for i in $(seq 64); do "
+            "[ \"$(tr '\\n' ' ' < /tmp/o$i)\" = \"a$i b$i \" ] && kept=$((kept + 1)); done; "
+            "kill $pids; echo \"held:$n extra:[$extra] took:$took kept:$kept\"")
+        status, result, out = host_ports_run(sock, 122, script, {4100: echo})
+        took = re.search(r"took:(\d+)", out)
+        check("host-ports-connections", status == 201 and result["exit_code"] == 0
+              and out.startswith("held:64 extra:[] took:") and out.endswith(" kept:64\n")
+              and took and int(took.group(1)) <= 1, (status, result, out))
+
+        # When the run exits, its connections are closed: a connection the guest still holds
+        # open is open on the host while the run runs, and ends on the host when it exits.
+        held, held_log = listener("held")
+        script = ("mkfifo /tmp/in; exec 3<> /tmp/in; echo hello >&3; "
+                  "nc 127.0.0.1 4100 < /tmp/in > /tmp/c 2> /dev/null & "
+                  "for i in $(seq 50); do grep -q hello /tmp/c && break; sleep 0.1; done; "
+                  "cat /tmp/c; echo held; sleep 3")
+        status, _ = call(sock, "POST", "/v1/runs", host_ports_body(123, script, {4100: held}))
+        up = status == 201 and wait_for_output(sock, run_id(123), b"held")
+        during = held_log()
+        events = follow(sock, run_id(123)) if status == 201 else []
+        closed = wait_until(lambda: "closed 6" in held_log(), 5)
+        call(sock, "DELETE", f"/v1/runs/{run_id(123)}")
+        check("host-ports-closed-at-exit", up and during == ["listening", "open"]
+              and exited(events)["exit_code"] == 0 and stream(events) == b"hello\nheld\n"
+              and closed, (status, during, events and exited(events), stream(events),
+                           held_log()))
+    finally:
+        try:
+            tcp.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        tcp.close()
+        for process in processes:
+            process.kill()
+            process.wait()
 
 
 PACKAGE_ENV = "echo \"$CARGO_HOME|$npm_config_cache|$PIP_CACHE_DIR|$GOMODCACHE|$GOCACHE\""
@@ -665,6 +917,7 @@ def main():
         check("concurrent", outputs == [b"10\n", b"11\n", b"12\n"], outputs)
 
         check_links(sock)
+        check_host_ports(sock, work)
 
         # A peerfs workspace is refused unless serve names a space.
         status, _ = call(sock, "POST", "/v1/runs",
