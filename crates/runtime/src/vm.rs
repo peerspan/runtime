@@ -1127,20 +1127,7 @@ fn fork(workspace: &PeerfsWorkspace, from: &str, list: &str) -> anyhow::Result<(
 /// Whether the space has a branch named `name`, from `peerfs branches`: one per line, its head
 /// and then its name.
 fn branch_exists(workspace: &PeerfsWorkspace, name: &str) -> anyhow::Result<bool> {
-    let output = peerfs_command(&workspace.peerfs, &workspace.space)
-        .arg("branches")
-        .output()
-        .with_context(|| format!("starting {}", workspace.peerfs.display()))?;
-    if !output.status.success() {
-        bail!(
-            "peerfs could not list branches: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
-        line.split_once(' ')
-            .is_some_and(|(_, branch)| branch == name)
-    }))
+    Ok(peerfs_branch_head(&workspace.peerfs, &workspace.space, name)?.is_some())
 }
 
 /// Ends a refresh run (the build cache contract's `peerfs_cache_save`) once the VM is gone and
@@ -1230,6 +1217,96 @@ fn save_cache(workspace: &PeerfsWorkspace, cache: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// The space's build caches, as `peerfs cache ls --json` gives them: each with `name`, and its
+/// current version's `commit`, `saved_at`, `bytes` and `versions` held, sorted by name.
+///
+/// # Errors
+///
+/// Fails if peerfs fails or answers something else.
+pub fn peerfs_caches(peerfs: &Path, space: &Path) -> anyhow::Result<Vec<CacheEntry>> {
+    let output = peerfs_command(peerfs, space)
+        .args(["cache", "ls", "--json"])
+        .output()
+        .with_context(|| format!("starting {}", peerfs.display()))?;
+    if !output.status.success() {
+        bail!(
+            "peerfs could not list build caches: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut caches: Vec<CacheEntry> =
+        serde_json::from_slice(&output.stdout).context("reading peerfs cache ls --json")?;
+    caches.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+    Ok(caches)
+}
+
+/// One build cache of a space, as `peerfs cache ls --json` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct CacheEntry {
+    pub name: String,
+    /// The commit the current version was built from.
+    pub commit: String,
+    /// When the current version was saved, RFC 3339 in UTC.
+    pub saved_at: String,
+    /// The current version's size.
+    pub bytes: u64,
+    /// How many versions are held.
+    pub versions: u64,
+}
+
+/// Removes the build cache `name` (`peerfs cache rm`). A cache that does not exist is no
+/// error: peerfs then says `no cache NAME (not_found)`.
+///
+/// # Errors
+///
+/// Fails if peerfs fails otherwise.
+pub fn peerfs_remove_cache(peerfs: &Path, space: &Path, name: &str) -> anyhow::Result<()> {
+    let output = peerfs_command(peerfs, space)
+        .args(["cache", "rm", name])
+        .output()
+        .with_context(|| format!("starting {}", peerfs.display()))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() || stderr.contains(&format!("no cache {name} (not_found)")) {
+        return Ok(());
+    }
+    bail!(
+        "peerfs could not remove build cache {name}: {}",
+        stderr.trim()
+    )
+}
+
+/// The head commit of the space's branch `name`, or `None` when there is no such branch, from
+/// `peerfs branches`: one per line, its head and then its name.
+///
+/// # Errors
+///
+/// Fails if peerfs fails.
+pub fn peerfs_branch_head(
+    peerfs: &Path,
+    space: &Path,
+    name: &str,
+) -> anyhow::Result<Option<String>> {
+    let output = peerfs_command(peerfs, space)
+        .arg("branches")
+        .output()
+        .with_context(|| format!("starting {}", peerfs.display()))?;
+    if !output.status.success() {
+        bail!(
+            "peerfs could not list branches: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(branch_head(&String::from_utf8_lossy(&output.stdout), name))
+}
+
+/// The head of branch `name` in `peerfs branches` output.
+fn branch_head(branches: &str, name: &str) -> Option<String> {
+    branches.lines().find_map(|line| {
+        let (head, branch) = line.split_once(' ')?;
+        (branch == name).then(|| head.to_owned())
+    })
 }
 
 /// Whether `peerfs` keeps build caches for the space at `space`: `Some(true)` when `cache ls`
@@ -1415,6 +1492,15 @@ impl Drop for ChildGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branch_head_matches_the_whole_name() {
+        let branches = "aa main\nbb main.2\ncc with space\n";
+        assert_eq!(branch_head(branches, "main").as_deref(), Some("aa"));
+        assert_eq!(branch_head(branches, "with space").as_deref(), Some("cc"));
+        assert_eq!(branch_head(branches, "mai"), None);
+        assert_eq!(branch_head("", "main"), None);
+    }
 
     #[test]
     fn first_source_change_takes_the_least_source_path_by_bytes() {

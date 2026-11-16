@@ -473,6 +473,9 @@ fn handle(runtime: &Arc<Runtime>, mut request: Request) {
             None => not_found(),
         },
         (Method::Delete, ["v1", "runs", id]) => delete(runtime, id),
+        (Method::Get, ["v1", "caches"]) => caches(runtime),
+        (Method::Delete, ["v1", "caches", name]) => remove_cache(runtime, name),
+        (Method::Get, ["v1", "branches", name]) => branch(runtime, name),
         _ => not_found(),
     };
     let response = Response::from_data(body.to_string())
@@ -1454,6 +1457,92 @@ fn delete(runtime: &Runtime, id: &str) -> (u16, Value) {
     (200, json!({}))
 }
 
+/// The space's peerfs and its directory, for the cache and branch routes (the build cache
+/// contract's caches and branches of the runtime's space), or the 422 when this runtime's
+/// peerfs keeps no caches.
+fn cache_space(runtime: &Runtime) -> Result<(&Path, &Path), (u16, Value)> {
+    match &runtime.args.peerfs_space {
+        Some(space) if runtime.peerfs_caches() => Ok((&runtime.args.peerfs, space)),
+        _ => Err(error(
+            422,
+            "unavailable",
+            "this runtime's peerfs keeps no build caches",
+        )),
+    }
+}
+
+/// A failure of peerfs itself, which the contract leaves no code for.
+fn peerfs_failed(e: &anyhow::Error) -> (u16, Value) {
+    crate::log::warn("peerfs failed", &[("error", &format!("{e:#}"))]);
+    error(500, "internal", &format!("{e:#}"))
+}
+
+/// `GET /v1/caches`: the space's build caches, by name.
+fn caches(runtime: &Runtime) -> (u16, Value) {
+    let (peerfs, space) = match cache_space(runtime) {
+        Ok(found) => found,
+        Err(refused) => return refused,
+    };
+    match vm::peerfs_caches(peerfs, space) {
+        Ok(caches) => (200, json!({ "caches": caches })),
+        Err(e) => peerfs_failed(&e),
+    }
+}
+
+/// `DELETE /v1/caches/{name}`: removes the cache; one that does not exist is no error.
+fn remove_cache(runtime: &Runtime, name: &str) -> (u16, Value) {
+    let Some(name) = percent_decode(name).filter(|name| is_cache_name(name)) else {
+        return error(400, "invalid", "the name is not a cache's name");
+    };
+    let (peerfs, space) = match cache_space(runtime) {
+        Ok(found) => found,
+        Err(refused) => return refused,
+    };
+    match vm::peerfs_remove_cache(peerfs, space, &name) {
+        Ok(()) => {
+            crate::log::info("cache removed", &[("cache", &name)]);
+            (200, json!({}))
+        }
+        Err(e) => peerfs_failed(&e),
+    }
+}
+
+/// `GET /v1/branches/{name}`: the branch's head.
+fn branch(runtime: &Runtime, name: &str) -> (u16, Value) {
+    let Some(name) = percent_decode(name).filter(|name| is_peerfs_name(name)) else {
+        return error(400, "invalid", "the name is not a branch's name");
+    };
+    let (peerfs, space) = match cache_space(runtime) {
+        Ok(found) => found,
+        Err(refused) => return refused,
+    };
+    match vm::peerfs_branch_head(peerfs, space, &name) {
+        Ok(Some(head)) => (200, json!({"name": name, "head": head})),
+        Ok(None) => error(404, "not_found", "no such branch"),
+        Err(e) => peerfs_failed(&e),
+    }
+}
+
+/// A path segment with its `%XX` escapes decoded, or `None` when an escape is malformed or the
+/// result is not UTF-8.
+fn percent_decode(segment: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(segment.len());
+    let mut rest = segment.as_bytes();
+    while let Some((&b, tail)) = rest.split_first() {
+        if b == b'%' {
+            let hex = tail
+                .get(..2)
+                .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))?;
+            bytes.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
+            rest = &tail[2..];
+        } else {
+            bytes.push(b);
+            rest = tail;
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
 fn find(runtime: &Runtime, id: &str) -> Option<Arc<Run>> {
     runtime
         .runs
@@ -1496,6 +1585,16 @@ mod tests {
             }
         }
         serde_json::from_value(body).expect("a well-formed request")
+    }
+
+    #[test]
+    fn path_segments_are_percent_decoded() {
+        assert_eq!(percent_decode("main").as_deref(), Some("main"));
+        assert_eq!(percent_decode("a%20b%2Fc").as_deref(), Some("a b/c"));
+        assert_eq!(percent_decode("%C3%A9").as_deref(), Some("\u{e9}"));
+        for bad in ["%", "%2", "%zz", "%FF", "%+1"] {
+            assert_eq!(percent_decode(bad), None, "{bad}");
+        }
     }
 
     #[test]
