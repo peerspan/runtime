@@ -196,6 +196,19 @@ For runtime agents (the host's runtime agent contract), a run also takes:
 
 `GET /v1/runtime` reports `max_network`, `images: true`, `links: true` and `peerfs_caches`.
 
+With `peerfs_caches` true, serve also answers for the caches and branches of its space (the
+build cache contract, RUN-21), so the daemon never reaches the space itself:
+- `GET /v1/caches`: `{"caches": [...]}`, by name, each with `name`, and its current version's
+  `commit`, `saved_at` (RFC 3339, UTC), `bytes` and `versions` held, as `peerfs cache ls`
+  gives them.
+- `DELETE /v1/caches/{name}`: `{}` once `peerfs cache rm` has removed it. A cache that does
+  not exist is no error, so a repeated delete answers the same.
+- `GET /v1/branches/{name}`: `{name, head}`, the branch's head commit, or 404 `not_found` when
+  the space has no such branch. The name is percent-decoded.
+
+Each is 422 `unavailable` when `peerfs_caches` is false, and 400 `invalid` for a name that is
+not a cache's or a branch's. A peerfs that fails otherwise is 500 `internal`, with its message.
+
 A run's `exited` result also has `oom_kills`: how many processes the guest's kernel killed for
 lack of memory (its `/proc/vmstat` `oom_kill`), 0 when none. The command may still have exited
 with a status, which is then often the failure those kills caused. A VM that exceeded its own
