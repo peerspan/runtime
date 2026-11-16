@@ -31,7 +31,8 @@ use crate::net::{self, Level, RunFilter};
 use crate::phases;
 use crate::userns::UserNamespace;
 
-use crate::launcher::{AGENT_SOCKET, LINK_SOCKET, LinkSide, WORKSPACE_SOCKET};
+use crate::host_port::{self, Forwarder};
+use crate::launcher::{AGENT_SOCKET, LINK_SOCKET, LinkSide, WORKSPACE_SOCKET, host_port_socket};
 use crate::link::{EndOnDrop, Link, Relay};
 
 /// How long a workspace server that may have failed has to exit, when the guest did not connect.
@@ -97,6 +98,8 @@ pub struct VmSpec {
     /// The run's side of a link and the link it shares with its partner; the command's `link`
     /// names the same side.
     pub link: Option<(LinkSide, Arc<Link>)>,
+    /// Where each of the command's `host_ports` is carried on the host, in the same order.
+    pub host_ports: Vec<host_port::Target>,
 }
 
 /// Where the guest's workspace comes from.
@@ -231,6 +234,9 @@ pub fn run(
     on_event: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
 ) -> anyhow::Result<Outcome> {
     let options = spec;
+    if options.host_ports.len() != options.command.host_ports.len() {
+        bail!("the command's host ports and their targets differ in number");
+    }
     let began = Instant::now();
     let began_ns = phases::monotonic_ns();
     let mut stamps: Vec<(String, u64)> = Vec::new();
@@ -352,6 +358,15 @@ pub fn run(
         }
         Some((LinkSide::Listen, link)) => link_end = Some(EndOnDrop(Arc::clone(link))),
     }
+    // Each host port's connections arrive at a socket of its own, as a `connect` run's do.
+    let mut host_ports = Vec::with_capacity(options.host_ports.len());
+    for (index, target) in options.host_ports.iter().enumerate() {
+        let socket = sockets.join(host_port_socket(index));
+        let listener =
+            UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
+        chown(&socket, id)?;
+        host_ports.push(Forwarder::start(target.clone(), listener)?);
+    }
 
     let (console, console_writer) = CappedLog::create(&console_path, CONSOLE_LIMIT)
         .with_context(|| format!("creating {}", console_path.display()))?;
@@ -407,6 +422,8 @@ pub fn run(
                     .iter()
                     .flat_map(|_| ["--net-fd".to_owned(), NET_FD.to_string()]),
             )
+            .arg("--host-ports")
+            .arg(options.host_ports.len().to_string())
             .args(options.link.iter().flat_map(|(side, _)| {
                 [
                     "--link",
@@ -462,6 +479,7 @@ pub fn run(
     let mut outcome = serve_guest(spec, stream, &cgroup, &progress, cancel, on_event);
     drop(relay);
     drop(link_end);
+    drop(host_ports);
     if cgroup.oom_killed() && outcome.exit_code.is_none() && !outcome.timed_out {
         outcome.error = Some("the VM exceeded its memory limit and was killed".into());
     }

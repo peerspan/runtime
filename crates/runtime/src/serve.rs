@@ -1041,6 +1041,7 @@ fn execute(runtime: &Runtime, run: &Run) {
                             },
                             port: link.port,
                         }),
+                    host_ports: Vec::new(),
                 },
                 link: request
                     .link
@@ -1053,6 +1054,7 @@ fn execute(runtime: &Runtime, run: &Run) {
                         };
                         (side, Arc::clone(link))
                     }),
+                host_ports: Vec::new(),
             };
             if let Some(image) = image {
                 image.mark_used();
