@@ -20,12 +20,13 @@ use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::Args;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::disk::WorkspaceDisk;
+use crate::host_port;
 use crate::launcher::LinkSide;
 use crate::link::Link;
 use crate::net::Level;
@@ -173,6 +174,33 @@ struct RunRequest {
     /// This run's side of a link to one other run (the runtime task contract's Linked runs).
     #[serde(default)]
     link: Option<LinkRequest>,
+    /// TCP ports on the guest's loopback carried to Unix sockets on the host (the credential
+    /// proxy contract's host ports).
+    #[serde(default, deserialize_with = "host_ports")]
+    host_ports: Option<Vec<HostPortRequest>>,
+}
+
+/// One of a run's `host_ports`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostPortRequest {
+    port: u16,
+    socket: PathBuf,
+}
+
+/// Longest `socket` a host port takes: what fits in a Unix socket address with its NUL.
+const MAX_HOST_PORT_SOCKET: usize = 107;
+
+/// Reads `host_ports`, naming the field in the reason when it is malformed.
+fn host_ports<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<HostPortRequest>>, D::Error> {
+    match Option::<Value>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(value) => serde_json::from_value(value)
+            .map(Some)
+            .map_err(|e| serde::de::Error::custom(format_args!("host_ports: {e}"))),
+    }
 }
 
 /// A run's `link`: the two runs of a pair carry the same `id` and fields, one of each role.
@@ -511,6 +539,7 @@ fn runtime_info(runtime: &Runtime) -> Value {
         "max_network": args.max_network.to_string(),
         "images": true,
         "links": true,
+        "host_ports": true,
         "peerfs_caches": runtime.peerfs_caches(),
     })
 }
@@ -659,6 +688,10 @@ fn start(runtime: &Arc<Runtime>, body: &[u8]) -> (u16, Value) {
                 "peerfs_fork_from",
                 &request.peerfs_fork_from.as_deref().unwrap_or("none"),
             ),
+            (
+                "host_ports",
+                &request.host_ports.as_ref().map_or(0, Vec::len),
+            ),
         ],
     );
 
@@ -666,6 +699,38 @@ fn start(runtime: &Arc<Runtime>, body: &[u8]) -> (u16, Value) {
     let runtime = Arc::clone(runtime);
     thread::spawn(move || execute(&runtime, &run));
     (201, record)
+}
+
+/// `host_ports`: 1 to [`MAX_HOST_PORTS`](peerspan_runtime_protocol::MAX_HOST_PORTS) entries,
+/// each a distinct loopback port other than the link's and an absolute socket path that fits a
+/// Unix socket address.
+fn validate_host_ports(entries: &[HostPortRequest], link_port: Option<u16>) -> Result<(), String> {
+    let max = peerspan_runtime_protocol::MAX_HOST_PORTS;
+    if !(1..=max).contains(&entries.len()) {
+        return Err(format!(
+            "host_ports must hold 1 to {max} entries, or be null"
+        ));
+    }
+    let mut ports = HashSet::new();
+    for entry in entries {
+        if entry.port == 0 {
+            return Err("host_ports port must be 1 to 65,535".into());
+        }
+        if !ports.insert(entry.port) {
+            return Err(format!("host_ports names port {} twice", entry.port));
+        }
+        if link_port == Some(entry.port) {
+            return Err(format!("host_ports port {} is the link's port", entry.port));
+        }
+        let path = entry.socket.as_os_str().as_encoded_bytes();
+        if !entry.socket.is_absolute() || path.len() > MAX_HOST_PORT_SOCKET || path.contains(&0) {
+            return Err(format!(
+                "host_ports socket must be an absolute path of at most {MAX_HOST_PORT_SOCKET} \
+                 bytes"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whether `id` has a run id's form: `run_` and 64 lowercase hex digits.
@@ -749,6 +814,9 @@ fn validate(request: &RunRequest) -> Result<(), String> {
         if !(1..=MAX_LINK_BYTES).contains(&link.max_bytes) {
             return Err(format!("link max_bytes must be 1 to {MAX_LINK_BYTES}"));
         }
+    }
+    if let Some(entries) = &request.host_ports {
+        validate_host_ports(entries, request.link.as_ref().map(|link| link.port))?;
     }
     if request.secrets.len() > peerspan_runtime_protocol::MAX_SECRETS {
         return Err(format!(
@@ -1041,6 +1109,12 @@ fn execute(runtime: &Runtime, run: &Run) {
                             },
                             port: link.port,
                         }),
+                    host_ports: request
+                        .host_ports
+                        .iter()
+                        .flatten()
+                        .map(|entry| entry.port)
+                        .collect(),
                 },
                 link: request
                     .link
@@ -1053,6 +1127,15 @@ fn execute(runtime: &Runtime, run: &Run) {
                         };
                         (side, Arc::clone(link))
                     }),
+                host_ports: request
+                    .host_ports
+                    .iter()
+                    .flatten()
+                    .map(|entry| host_port::Target {
+                        socket: entry.socket.clone(),
+                        uid: runtime.args.client_uid,
+                    })
+                    .collect(),
             };
             if let Some(image) = image {
                 image.mark_used();

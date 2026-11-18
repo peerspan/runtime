@@ -10,6 +10,9 @@
 //!   one TCP connection to `127.0.0.1:port`, tells the host with [`LINK_ACCEPTED`], and copies
 //!   bytes both ways. A connection the command is not listening for is closed at once.
 //!
+//! A run's host ports are carried as a `connect` side is, each on its own vsock port
+//! ([`HOST_PORTS_BASE`] and up), to a socket on the host rather than to another run.
+//!
 //! Bounds on connections and bytes are the host's; init only carries what arrives.
 
 use std::fs::File;
@@ -18,7 +21,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::thread;
 
-use peerspan_runtime_protocol::{LINK_ACCEPTED, LINK_PORT, Link, LinkRole};
+use peerspan_runtime_protocol::{HOST_PORTS_BASE, LINK_ACCEPTED, LINK_PORT, Link, LinkRole};
 use rustix::net::{AddressFamily, SocketFlags, SocketType};
 
 /// Starts carrying the link, before the command starts, so the port is ready for it.
@@ -28,18 +31,7 @@ use rustix::net::{AddressFamily, SocketFlags, SocketType};
 /// Fails if the loopback port or the vsock port cannot be bound.
 pub fn start(link: Link) -> io::Result<()> {
     match link.role {
-        LinkRole::Connect => {
-            let listener = TcpListener::bind(("127.0.0.1", link.port))?;
-            thread::spawn(move || {
-                for tcp in listener.incoming().flatten() {
-                    thread::spawn(move || {
-                        if let Ok(vsock) = crate::connect_vsock(libc::VMADDR_CID_HOST, LINK_PORT) {
-                            splice(tcp, vsock);
-                        }
-                    });
-                }
-            });
-        }
+        LinkRole::Connect => carry_out(link.port, LINK_PORT)?,
         LinkRole::Listen => {
             let listener = vsock_listener(LINK_PORT)?;
             let port = link.port;
@@ -58,6 +50,35 @@ pub fn start(link: Link) -> io::Result<()> {
             });
         }
     }
+    Ok(())
+}
+
+/// Starts carrying the run's host ports, before the command starts: `ports[i]` on loopback
+/// over vsock port [`HOST_PORTS_BASE`]` + i`.
+///
+/// # Errors
+///
+/// Fails if a loopback port cannot be bound.
+pub fn start_host_ports(ports: &[u16]) -> io::Result<()> {
+    for (vsock_port, &port) in (HOST_PORTS_BASE..).zip(ports) {
+        carry_out(port, vsock_port)?;
+    }
+    Ok(())
+}
+
+/// Listens on `127.0.0.1:port` and carries each connection over a new vsock stream to the
+/// host's `vsock_port`. A stream the host refuses closes the connection.
+fn carry_out(port: u16, vsock_port: u32) -> io::Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    thread::spawn(move || {
+        for tcp in listener.incoming().flatten() {
+            thread::spawn(move || {
+                if let Ok(vsock) = crate::connect_vsock(libc::VMADDR_CID_HOST, vsock_port) {
+                    splice(tcp, vsock);
+                }
+            });
+        }
+    });
     Ok(())
 }
 

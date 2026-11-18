@@ -26,6 +26,14 @@ pub const LINK_PORT: u32 = 1025;
 /// nothing, before it: a stream that closes without it was refused.
 pub const LINK_ACCEPTED: u8 = 1;
 
+/// The first of the vsock ports that carry a run's host ports ([`Command::host_ports`]): entry
+/// `i` is carried on `HOST_PORTS_BASE + i`. The guest connects out on it, once per connection,
+/// to the supervisor's socket for that entry.
+pub const HOST_PORTS_BASE: u32 = 1026;
+
+/// Most host ports one run may have.
+pub const MAX_HOST_PORTS: usize = 4;
+
 /// virtio-fs tag of the read-only root filesystem.
 pub const ROOTFS_TAG: &str = "rootfs";
 
@@ -144,6 +152,10 @@ pub struct Command {
     pub harness: bool,
     /// The run's side of a link to another run, if any.
     pub link: Option<Link>,
+    /// TCP ports on the guest's loopback carried to the host, at most [`MAX_HOST_PORTS`]: init
+    /// listens on `127.0.0.1:host_ports[i]` and carries each connection over vsock port
+    /// [`HOST_PORTS_BASE`]` + i`.
+    pub host_ports: Vec<u16>,
 }
 
 /// One side of a link between two runs: a TCP port on loopback in each guest, joined through
@@ -390,6 +402,10 @@ fn encode_command(command: &Command) -> Vec<u8> {
     };
     out.push(role);
     out.extend_from_slice(&port.to_be_bytes());
+    out.push(u8::try_from(command.host_ports.len()).expect("at most MAX_HOST_PORTS"));
+    for port in &command.host_ports {
+        out.extend_from_slice(&port.to_be_bytes());
+    }
     out
 }
 
@@ -421,20 +437,37 @@ fn decode_command(payload: &[u8]) -> io::Result<Command> {
             Ok(Secret { name, value })
         })
         .collect::<io::Result<Vec<_>>>()?;
-    let [
-        archive,
-        collect_changes,
-        network,
-        stdin,
-        combined_output,
-        harness,
-        role,
-        port_high,
-        port_low,
-    ] = *cursor.rest
+    let Some((
+        &[
+            archive,
+            collect_changes,
+            network,
+            stdin,
+            combined_output,
+            harness,
+            role,
+            port_high,
+            port_low,
+            host_port_count,
+        ],
+        host_ports,
+    )) = cursor.rest.split_first_chunk::<10>()
     else {
-        return Err(invalid("command flags and link are not 9 bytes"));
+        return Err(invalid("command flags, link and host ports are truncated"));
     };
+    let host_port_count = usize::from(host_port_count);
+    if host_port_count > MAX_HOST_PORTS || host_ports.len() != 2 * host_port_count {
+        return Err(invalid("invalid host ports"));
+    }
+    let host_ports: Vec<u16> = host_ports
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_be_bytes(*pair))
+        .collect();
+    if host_ports.contains(&0) {
+        return Err(invalid("invalid host ports"));
+    }
     let port = u16::from_be_bytes([port_high, port_low]);
     let link = match (role, port) {
         (0, 0) => None,
@@ -465,6 +498,7 @@ fn decode_command(payload: &[u8]) -> io::Result<Command> {
         combined_output: flag(combined_output)?,
         harness: flag(harness)?,
         link,
+        host_ports,
     })
 }
 
@@ -565,6 +599,7 @@ mod tests {
                     role: LinkRole::Listen,
                     port: 25_565,
                 }),
+                host_ports: Vec::new(),
             }),
             Message::Run(Command {
                 link: Some(Link {

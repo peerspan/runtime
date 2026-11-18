@@ -8,6 +8,7 @@ mod caplog;
 mod cgroup;
 mod disk;
 mod doctor;
+mod host_port;
 mod image;
 mod jail;
 mod krun;
@@ -399,8 +400,10 @@ fn run(args: RunArgs) -> anyhow::Result<i32> {
             combined_output: args.combined_output,
             harness: false,
             link: None,
+            host_ports: Vec::new(),
         },
         link: None,
+        host_ports: Vec::new(),
     };
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();

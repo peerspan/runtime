@@ -203,6 +203,9 @@ fn run(mut phases: Phases) -> io::Result<()> {
     {
         return fail(&mut reader, &format!("setting up the link: {e}"));
     }
+    if let Err(e) = link::start_host_ports(&command.host_ports) {
+        return fail(&mut reader, &format!("setting up the host ports: {e}"));
+    }
     if command.network {
         if let Err(e) = net::configure() {
             return fail(&mut reader, &format!("setting up the network: {e}"));

@@ -8,7 +8,9 @@ use std::convert::Infallible;
 use std::path::PathBuf;
 
 use clap::Args;
-use peerspan_runtime_protocol::{AGENT_PORT, HARNESS_TAG, LINK_PORT, ROOTFS_TAG, WORKSPACE_TAG};
+use peerspan_runtime_protocol::{
+    AGENT_PORT, HARNESS_TAG, HOST_PORTS_BASE, LINK_PORT, MAX_HOST_PORTS, ROOTFS_TAG, WORKSPACE_TAG,
+};
 
 use crate::jail::{self, Jail};
 use crate::krun::{Libkrun, VmConfig};
@@ -22,6 +24,12 @@ pub const KERNEL_CMDLINE: &str = "console=hvc0 rdinit=/init panic=-1 reboot=k qu
 pub const WORKSPACE_SOCKET: &str = "workspace.sock";
 pub const AGENT_SOCKET: &str = "agent.sock";
 pub const LINK_SOCKET: &str = "link.sock";
+
+/// The name of the socket in the sockets directory that carries host port `index`.
+#[must_use]
+pub fn host_port_socket(index: usize) -> String {
+    format!("host-port-{index}.sock")
+}
 
 /// Which side of a link a run's VM is, for the launcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -69,6 +77,10 @@ pub struct LaunchArgs {
     /// The run's side of a link, carried on the link socket in the sockets directory.
     #[arg(long, value_enum)]
     pub link: Option<LinkSide>,
+    /// How many host ports the run has, each carried on its socket in the sockets directory.
+    #[arg(long, default_value_t = 0,
+          value_parser = clap::value_parser!(u8).range(..=MAX_HOST_PORTS as i64))]
+    pub host_ports: u8,
 }
 
 /// Confines this process and boots the VM described by `args`.
@@ -104,6 +116,15 @@ pub fn launch(args: &LaunchArgs) -> anyhow::Result<Infallible> {
     let workspace_socket = format!("{}/{WORKSPACE_SOCKET}", jail::SOCKETS);
     let agent_socket = format!("{}/{AGENT_SOCKET}", jail::SOCKETS);
     let link_socket = format!("{}/{LINK_SOCKET}", jail::SOCKETS);
+    let host_ports: Vec<(u32, String)> = (HOST_PORTS_BASE..)
+        .zip(0..usize::from(args.host_ports))
+        .map(|(port, index)| {
+            (
+                port,
+                format!("{}/{}", jail::SOCKETS, host_port_socket(index)),
+            )
+        })
+        .collect();
     libkrun.boot(
         &VmConfig {
             cpus: args.cpus,
@@ -124,6 +145,7 @@ pub fn launch(args: &LaunchArgs) -> anyhow::Result<Infallible> {
             link: args
                 .link
                 .map(|side| (LINK_PORT, link_socket.as_str(), side == LinkSide::Listen)),
+            host_ports: &host_ports,
             net_fd: args.net_fd,
         },
         &mut || phases.mark("vm_built"),
